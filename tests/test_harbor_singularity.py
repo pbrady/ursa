@@ -282,6 +282,31 @@ def test_host_ca_certificates_are_staged_and_exported(
     )
 
 
+@pytest.mark.parametrize(
+    ("name", "version", "prefix"),
+    [
+        ("singularity", "singularity-ce version 3.6.2", "SINGULARITYENV_"),
+        ("singularity", "apptainer version 1.3.4", "APPTAINERENV_"),
+        ("apptainer", "", "APPTAINERENV_"),
+    ],
+)
+def test_runtime_environment_prefix_follows_the_runtime(
+    tmp_path: Path, name: str, version: str, prefix: str
+):
+    environment = _environment(tmp_path)
+    runtime = tmp_path / "bin" / name
+    runtime.parent.mkdir()
+    runtime.write_text(f"#!/bin/sh\necho '{version}'\n")
+    runtime.chmod(0o755)
+    environment._runtime_path = str(runtime)
+
+    runtime_env = environment._runtime_environment({"TASK_VALUE": "1"})
+
+    assert runtime_env[f"{prefix}TASK_VALUE"] == "1"
+    other = "SINGULARITYENV_" if prefix == "APPTAINERENV_" else "APPTAINERENV_"
+    assert f"{other}TASK_VALUE" not in runtime_env
+
+
 async def test_network_policy_change_restarts_with_existing_overlay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

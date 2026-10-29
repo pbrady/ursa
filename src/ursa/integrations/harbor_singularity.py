@@ -21,7 +21,7 @@ import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from copy import deepcopy
-from functools import partial
+from functools import cache, partial
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, ClassVar, NoReturn, override
 
@@ -70,6 +70,24 @@ _FAKEROOT_FAILURE_MARKERS = (
     "newuidmap",
     "newgidmap",
 )
+
+
+@cache
+def _runtime_is_apptainer(runtime: str) -> bool:
+    """Detect Apptainer, including through a ``singularity`` alias."""
+    if Path(runtime).name == "apptainer":
+        return True
+    try:
+        result = subprocess.run(
+            [runtime, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.stdout.strip().lower().startswith("apptainer")
 
 
 def _host_ca_certificates_pem() -> str:
@@ -2773,9 +2791,11 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             for key, value in os.environ.items()
             if not key.startswith(("SINGULARITYENV_", "APPTAINERENV_"))
         }
+        # Apptainer accepts SINGULARITYENV_ only with a deprecation warning
+        # on every command's stderr.
         prefix = (
             "APPTAINERENV_"
-            if Path(self._instance_runtime()).name == "apptainer"
+            if _runtime_is_apptainer(self._instance_runtime())
             else "SINGULARITYENV_"
         )
         merged = self._merge_env(env) if merge_persistent else env

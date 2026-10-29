@@ -146,6 +146,31 @@ To run tasks that do not need container root on a host without fakeroot:
 --ek singularity_fakeroot=false
 ```
 
+### Apptainer
+
+The adapter works with SingularityCE 3.6 and Apptainer 1.1 or later, and
+prefers `apptainer` when both are on `PATH`. It detects Apptainer behind a
+`singularity` alias from `--version`, so task variables use the
+`APPTAINERENV_` prefix and avoid Apptainer's deprecation warning on every
+command. Image pulls, `--fakeroot`, and instance commands use the same syntax
+on both runtimes.
+
+An unprivileged (user-space) Apptainer installation has extra requirements:
+
+- `squashfuse` mounts SIF images; without it, Apptainer extracts the image to
+  a temporary sandbox on every start, which is slow and uses scratch space.
+- The writable overlay needs `fuse2fs` and `fuse-overlayfs`. Without them,
+  set `singularity_overlay=false`; the image root filesystem is then
+  read-only and network-policy phases cannot change.
+- Without an `/etc/subuid` entry, Apptainer 1.1 and later implement
+  `--fakeroot` with a root-mapped user namespace, helped by the host's
+  `fakeroot` command when it is installed. Only root is mapped, so tasks that
+  ask for a non-root container user fail to switch to it, and package
+  managers can fail to drop privileges; check an `apt-get install` early.
+- Bridge networking is unavailable, so Compose projects with sidecars or
+  published ports cannot start. Main-only Compose projects, such as SciCode,
+  and `no-network` phases still work.
+
 ### Multi-container tasks
 
 Add Harbor's standard `environment/docker-compose.yaml` to start sidecars with
