@@ -6,7 +6,8 @@ benchmark asks the agent to install GPAW, Parthenon, and PyTorch.
 
 ## Run one task
 
-Install Python 3.12 or newer, [uv](https://docs.astral.sh/uv/), and Docker. Set
+Install Python 3.12 or newer, [uv](https://docs.astral.sh/uv/), and Docker. The
+`ursa-ai[harbor]` extra installs Harbor 0.25. Set
 the credential for your inference provider, then run from this directory:
 
 ```bash

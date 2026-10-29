@@ -30,11 +30,29 @@ Secret references are resolved on the host, including keyring references. The
 adapter passes generated environment references only to the URSA runner; it
 does not copy host config or keyring files into the task container.
 
+Harbor selects the model credential from `--ae`, then the host environment, or
+from the variable named by `--api-key-name`. The adapter moves that key and any
+`<PROVIDER>_BASE_URL` endpoint into the URSA inference provider, again as a
+generated environment reference. Provider extras such as `AZURE_API_VERSION`
+and the AWS variables for Bedrock and SageMaker are passed through unchanged.
+The text before the first `/` in `--model` always names the URSA inference
+provider, including custom providers that LiteLLM does not know. Harbor's
+`--base-url` flag is not supported; set `base_url` in `ursa.yaml` or export
+`<PROVIDER>_BASE_URL` instead.
+
+Harbor MCP servers are forwarded to URSA. Servers that declare HTTP `headers`
+are rejected, because the adapter does not forward MCP request headers.
+
 Each trial renders human-readable agent and tool progress to `agent/ursa.log`
 and writes structured chat, tool, agent, and chain lifecycle records to
 `agent/ursa.jsonl`. Each JSONL record has a monotonic nanosecond timestamp;
 chat end records include token usage. The formatted final result is written to
 `agent/ursa_result.out`.
+
+Harbor copies these files to the host after the agent finishes. The adapter
+downloads `ursa.jsonl` itself to report token usage. Pass
+`--ek auto_mounting=true` to bind the trial's log directories to the host while
+the agent runs, for example to follow `ursa.log` live.
 
 ## Singularity
 
@@ -129,10 +147,12 @@ its writable overlay and Harbor bind mounts, so files installed or changed
 during setup remain available in later phases.
 
 The effective Harbor policy is also projected into URSA's `use_web` setting
-for each agent phase: `public` enables web tools, while `no-network` disables
-them. Harbor still enforces the actual network boundary. Keep the writable
-overlay enabled (the default); setting the `singularity_overlay` environment
-kwarg to `false` disables runtime policy changes.
+for each agent phase: `public` enables web tools, while `no-network` and
+`allowlist` disable them, as for Harbor's built-in agents. Harbor still
+enforces the actual network boundary. Keep the writable overlay enabled (the
+default); setting the `singularity_overlay` environment kwarg to `false`
+disables runtime policy changes, and Harbor then rejects tasks whose phases
+use different policies.
 
 `no-network` starts the task as a named Singularity instance with an isolated
 `none` network. Phase switching is supported for single-container tasks and
