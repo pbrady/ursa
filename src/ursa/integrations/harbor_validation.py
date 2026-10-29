@@ -168,10 +168,15 @@ def validate_harbor_task(task_dir: Path | str) -> None:
 async def prebuild_harbor_task(
     task_dir: Path | str,
     *,
-    force_build: bool = False,
+    refresh: bool = False,
     image_cache_dir: Path | str | None = None,
 ) -> list[Path]:
-    """Build or pull main, Compose, and separate-verifier SIFs for one task."""
+    """Build or pull main, Compose, and separate-verifier SIFs for one task.
+
+    The SIFs are the ones a trial without ``--force-build`` uses, so
+    ``refresh`` rebuilds or re-pulls them without switching a prebuilt-image
+    task to a Dockerfile build.
+    """
     environments = _task_environments(
         Task(task_dir),
         purpose="prebuild",
@@ -179,7 +184,7 @@ async def prebuild_harbor_task(
     )
     paths: list[Path] = []
     for environment in environments:
-        for path in await environment.build_sifs(force_build=force_build):
+        for path in await environment.build_sifs(refresh=refresh):
             if path not in paths:
                 paths.append(path)
     return paths

@@ -1743,10 +1743,12 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 return image
         return self._prebuilt_image(force_build)
 
-    async def _build_main_sif(self, force_build: bool) -> Path:
-        # ``singularity_force_pull`` refreshes the cached SIF but never turns
-        # a prebuilt-image task into a Dockerfile build.
-        refresh = force_build or self._force_pull
+    async def _build_main_sif(
+        self, force_build: bool, *, refresh: bool = False
+    ) -> Path:
+        # ``refresh`` and ``singularity_force_pull`` refresh the cached SIF
+        # but never turn a prebuilt-image task into a Dockerfile build.
+        refresh = force_build or refresh or self._force_pull
         image = self._main_image(force_build)
         if image is not None:
             return await self._pull_image_sif(image, refresh)
@@ -1762,19 +1764,23 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             target=target,
         )
 
-    async def build_sifs(self, force_build: bool = False) -> list[Path]:
+    async def build_sifs(
+        self, force_build: bool = False, *, refresh: bool = False
+    ) -> list[Path]:
         """Build or pull every SIF without starting an instance.
 
         This includes the main environment and each Compose sidecar. Images
         named by ``docker_image`` or a Compose ``image`` are pulled into the
         SIF cache, so a login node can prepare compute nodes without registry
-        access.
+        access. ``force_build`` has Harbor's meaning and can switch a
+        prebuilt-image task to a build; ``refresh`` only rebuilds or re-pulls
+        the SIFs a trial without ``--force-build`` would use.
         """
-        paths = [await self._build_main_sif(force_build)]
+        paths = [await self._build_main_sif(force_build, refresh=refresh)]
         if not self._uses_compose:
             return paths
 
-        refresh = force_build or self._force_pull
+        refresh = force_build or refresh or self._force_pull
         compose_config = self._load_compose_config()
         seen_builds = set()
         if self._main_image(force_build) is None:

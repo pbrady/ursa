@@ -105,6 +105,10 @@ When compute nodes cannot reach a registry, prepare the cache on a login node:
 uv run -m ursa.integrations.harbor prebuild path/to/tasks
 ```
 
+It prepares the SIFs a trial without `--force-build` uses. Its `--force`
+option rebuilds or re-pulls them, like `singularity_force_pull`, and never
+switches a `docker_image` task to a Dockerfile build.
+
 For a direct run, add:
 
 ```bash

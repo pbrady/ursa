@@ -136,11 +136,15 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
     async def build(
         self: DockerfileSingularityEnvironment,
         force_build: bool = False,
+        *,
+        refresh: bool = False,
     ) -> list[Path]:
+        # A refresh never becomes Harbor's force_build.
+        assert not force_build
         observed.append((
             self.environment_dir,
             self._image_cache_dir,
-            force_build,
+            refresh,
             self._enable_environment_dir_upload,
         ))
         return [cache / f"{self.environment_dir.name}.sif"]
@@ -148,7 +152,7 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
     monkeypatch.setattr(DockerfileSingularityEnvironment, "build_sifs", build)
 
     paths = await prebuild_harbor_task(
-        task, force_build=True, image_cache_dir=cache
+        task, refresh=True, image_cache_dir=cache
     )
 
     assert observed == [
@@ -185,10 +189,10 @@ def test_harbor_prebuild_command_reports_built_sifs(tmp_path, monkeypatch):
     async def build(
         task_dir: Path,
         *,
-        force_build: bool,
+        refresh: bool,
         image_cache_dir: Path | None,
     ) -> list[Path]:
-        observed.append((task_dir, force_build, image_cache_dir))
+        observed.append((task_dir, refresh, image_cache_dir))
         return [cache / "agent.sif", cache / "verifier.sif"]
 
     monkeypatch.setattr(

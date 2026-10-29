@@ -1194,7 +1194,7 @@ def prebuild_sifs(
             try:
                 built = await prebuild_harbor_task(
                     task,
-                    force_build=force,
+                    refresh=force,
                     image_cache_dir=image_cache_dir,
                 )
             except Exception as exc:
