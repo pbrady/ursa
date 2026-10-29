@@ -19,6 +19,7 @@ from ursa.integrations.harbor_dockerfile import (  # noqa: E402
     ContextSource,
     Definition,
     DockerfileUnsupported,
+    DockerIgnore,
     ScriptSource,
     UrlSource,
     dockerfile_workdir,
@@ -207,6 +208,36 @@ def test_env_wins_over_arg_of_the_same_name(tmp_path: Path):
     assert _steps(definition) == (
         "export MODE=env\n_ursa_workdir /env\n_ursa_save_env MODE\n"
     )
+
+
+def test_variables_expand_against_the_base_image_environment(
+    tmp_path: Path,
+):
+    config = {
+        "WorkingDir": "",
+        "Env": ["PATH=/usr/local/bin:/usr/bin", "PYTHON_VERSION=3.11.9"],
+    }
+    dockerfile = (
+        "FROM python:3.11-slim\n"
+        "ARG PYTHON_VERSION\n"
+        "ENV V=py$PYTHON_VERSION H=$HOME/bin PATH=$HOME/.cargo/bin:$PATH\n"
+    )
+
+    known = _translate(
+        tmp_path, dockerfile, image_config=lambda image, machine: config
+    )
+    unknown = _translate(tmp_path, dockerfile)
+
+    # As in Docker, an ARG without a value leaves the image's value, and
+    # HOME, which images seldom set, is empty rather than the build's.
+    assert _steps(known) == dedent("""\
+        export V=py3.11.9 H=/bin PATH=/.cargo/bin:/usr/local/bin:/usr/bin
+        _ursa_save_env V H PATH
+        """)
+    assert _steps(unknown) == dedent("""\
+        export V=py"${PYTHON_VERSION}" H="${HOME}"/bin PATH="${HOME}"/.cargo/bin:"${PATH}"
+        _ursa_save_env V H PATH
+        """)  # noqa: E501
 
 
 def test_proxy_args_come_from_build_args_or_the_host(tmp_path: Path):
@@ -520,10 +551,41 @@ def test_registry_redirect_drops_the_token_for_another_host():
             "/one/rel",
         ),
         ("FROM a\nRUN <<EOF\nWORKDIR /no\nEOF\n", {}, "/"),
+        ("FROM a\nENV D=/env\nARG D=/arg\nWORKDIR $D\n", {}, "/env"),
+        ("FROM a\nWORKDIR sub\n", {}, "/sub"),
     ],
 )
 def test_dockerfile_workdir(dockerfile: str, kwargs: dict, expected: str):
     assert dockerfile_workdir(dockerfile, **kwargs) == expected
+
+
+def test_dockerfile_workdir_starts_in_the_base_image_workdir():
+    config = {"WorkingDir": "/app", "Env": ["HOME=/home/app", "V=base"]}
+    lookups = []
+
+    def lookup(image: str, machine: str) -> dict | None:
+        lookups.append(image)
+        return config if image == "a" else None
+
+    def workdir(dockerfile: str, warnings: list[str] | None = None) -> str:
+        return dockerfile_workdir(
+            dockerfile, image_config=lookup, warnings=warnings
+        )
+
+    assert workdir("FROM a\nWORKDIR /abs\nWORKDIR rel\n") == "/abs/rel"
+    assert workdir("FROM a\nRUN true\n") == "/"
+    assert not lookups
+    assert workdir("FROM a\nWORKDIR sub\n") == "/app/sub"
+    assert workdir("FROM a\nWORKDIR $HOME/x\n") == "/home/app/x"
+    assert workdir("FROM a\nARG V\nWORKDIR /$V\n") == "/base"
+    warnings: list[str] = []
+    assert workdir("FROM b\nWORKDIR sub\n", warnings) == "/sub"
+    assert warnings == [
+        "cannot read the config of b; its relative WORKDIR starts in / "
+        "instead of the image's WORKDIR"
+    ]
+    with pytest.raises(ValueError, match="WORKDIR: \\$HOME"):
+        workdir("FROM b\nWORKDIR $HOME\n")
 
 
 def test_dockerfile_workdir_rejects_base_image_variables():
@@ -601,6 +663,63 @@ def test_write_stages_context_files(tmp_path: Path):
     assert single.read_text() == "target"
 
 
+@pytest.mark.parametrize(
+    ("patterns", "path", "ignored"),
+    [
+        ("*.json", "config.json", True),
+        ("*.json", "src/config.json", False),
+        ("**/*.json", "src/deep/config.json", True),
+        ("/data", "data/x/y", True),
+        ("data", "src/data", False),
+        ("src/*", "src/a/b", True),
+        ("a?c", "abc", True),
+        ("a?c", "a/c", False),
+        ("**", "anything/at/all", True),
+        ("data\n!data/keep", "data/keep", False),
+        ("data\n!data/keep", "data/drop", True),
+        ("!x\nx", "x", True),
+        ("# x\nx/../y", "y", True),
+        ("file.(1)", "file.(1)", True),
+    ],
+)
+def test_dockerignore_matches_as_docker_does(
+    patterns: str, path: str, ignored: bool
+):
+    assert DockerIgnore(patterns.splitlines()).ignored(path) is ignored
+
+
+def test_copy_applies_dockerignore_as_docker_does(tmp_path: Path):
+    definition = _translate(
+        tmp_path,
+        "FROM ubuntu\nCOPY . /app/\nCOPY data /data/\n",
+        files={
+            "top.json": "",
+            "src/config.json": "",
+            "data/drop.txt": "",
+            "data/sub/keep.txt": "",
+            ".dockerignore": "*.json\ndata\n!data/sub/keep.txt\n",
+        },
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    definition.write(staging)
+
+    copied = staging / "s0" / "copy-2" / "0" / "context"
+    files = sorted(
+        path.relative_to(copied).as_posix()
+        for path in copied.rglob("*")
+        if path.is_file()
+    )
+    assert files == [
+        ".dockerignore",
+        "Dockerfile",
+        "data/sub/keep.txt",
+        "src/config.json",
+    ]
+    data = staging / "s0" / "copy-3" / "0" / "data"
+    assert [p.name for p in data.rglob("*") if p.is_file()] == ["keep.txt"]
+
+
 def test_add_extracts_local_archives_and_downloads_urls(tmp_path: Path):
     context = tmp_path / "context"
     content = tmp_path / "content"
@@ -638,6 +757,76 @@ def test_add_extracts_local_archives_and_downloads_urls(tmp_path: Path):
     downloaded = staging / "s0" / "add-3" / "0" / "tool.sh"
     assert downloaded.stat().st_mode & 0o777 == 0o600
     assert downloads == ["https://example.com/files/tool.sh"]
+
+
+def test_add_keeps_archive_owners_and_modes(tmp_path: Path):
+    context = tmp_path / "context"
+    context.mkdir()
+    with tarfile.open(context / "tree.tar.gz", "w:gz") as archive:
+        for name, kind, mode, owner in [
+            ("shared", tarfile.DIRTYPE, 0o2775, 1000),
+            ("shared/helper", tarfile.REGTYPE, 0o4755, 0),
+        ]:
+            info = tarfile.TarInfo(name)
+            info.type, info.mode, info.uid, info.gid = kind, mode, owner, owner
+            archive.addfile(info, io.BytesIO(b""))
+    definition = _translate(tmp_path, "FROM ubuntu\nADD tree.tar.gz /opt/\n")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    definition.write(staging)
+
+    staged = staging / "s0" / "add-2" / "0" / "tree.tar.gz"
+    assert (staged / "shared" / "helper").stat().st_mode & 0o7777 == 0o4755
+    assert Path(f"{staged}.ursa-members").read_text() == (
+        "_ursa_member 1000:1000 2775 ./shared\n"
+        "_ursa_member 0:0 4755 ./shared/helper\n"
+    )
+
+
+def test_build_script_copy_sets_owners_as_docker_does(tmp_path: Path):
+    staged = tmp_path / "staged"
+    (staged / "tree").mkdir(parents=True)
+    (staged / "tree" / "tool").write_text("")
+    (tmp_path / "staged" / "tree.ursa-members").write_text(
+        "_ursa_member 7:8 4750 ./tool\n"
+    )
+    (staged / "file").write_text("")
+    log = tmp_path / "chown.log"
+    copies = [
+        ("''", "file"),
+        ("1000", "file"),
+        ("agent", "file"),
+        ("agent:staff", "file"),
+        ("-", "file"),
+        ("''", "tree"),
+        ("9:9", "tree"),
+    ]
+
+    result = _shell(
+        f"""
+        chown() {{ echo "$*" >> {log}; }}
+        id() {{ [ "$2" = agent ] && echo 1234; }}
+        """
+        + "".join(
+            f"_ursa_copy {owner} '' {tmp_path}/out/ {staged}/{source}\n"
+            for owner, source in copies
+        ),
+        tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert log.read_text().splitlines() == [
+        f"-hR 0:0 {staged}/file",
+        # A user without a group also names the group, by the user's UID.
+        f"-hR 1000:1000 {staged}/file",
+        f"-hR agent:1234 {staged}/file",
+        f"-hR agent:staff {staged}/file",
+        # An archive's members keep their owners unless --chown is given.
+        f"-hR 0:0 {staged}/tree",
+        "-h 7:8 ./tool",
+        f"-hR 9:9 {staged}/tree",
+    ]
+    assert (tmp_path / "out" / "tool").stat().st_mode & 0o7777 == 0o4750
 
 
 def test_multi_stage_copies_from_stages_and_images(tmp_path: Path):
@@ -694,9 +883,9 @@ def test_multi_stage_copies_from_stages_and_images(tmp_path: Path):
             rm -rf /.ursa-build
         """)
     assert _steps(definition) == dedent("""\
-        _ursa_copy '' '' /usr/local/bin/ /.ursa-build/copy-6/0/app
-        _ursa_copy '' '' /opt/out /.ursa-build/copy-7/0/out
-        _ursa_copy '' '' /bin/ /.ursa-build/copy-8/0/uv /.ursa-build/copy-8/1/uvx
+        _ursa_copy - '' /usr/local/bin/ /.ursa-build/copy-6/0/app
+        _ursa_copy - '' /opt/out /.ursa-build/copy-7/0/out
+        _ursa_copy - '' /bin/ /.ursa-build/copy-8/0/uv /.ursa-build/copy-8/1/uvx
         """)  # noqa: E501
     # Only the target stage records ENV for run time.
     assert "_ursa_save_env" not in (definition.stages[0].body or "")

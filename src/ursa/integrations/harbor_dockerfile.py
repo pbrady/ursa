@@ -29,16 +29,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from http.client import HTTPException
 from pathlib import Path
 from typing import Any, NoReturn
 
-from pathspec import GitIgnoreSpec
-
 # Part of the SIF cache key for definition builds; bump it whenever the
 # generated definition or build script changes.
-DOCKERFILE_TRANSLATOR_VERSION = 2
+DOCKERFILE_TRANSLATOR_VERSION = 3
 
 _STAGING = "/.ursa-build"
 _DEFAULT_SHELL = ("/bin/sh", "-c")
@@ -645,11 +644,80 @@ def image_config(image: str, machine: str) -> Mapping[str, Any] | None:
     return config
 
 
-def dockerignore_spec(context_dir: Path) -> GitIgnoreSpec | None:
+class DockerIgnore:
+    """``.dockerignore`` patterns, matched as Docker's patternmatcher does.
+
+    Unlike ``.gitignore`` patterns, each one is anchored at the context
+    root, so ``*.json`` leaves ``src/config.json`` in; a pattern that
+    matches a directory also matches everything under it, and ``!``
+    exceptions apply in order.
+    """
+
+    def __init__(self, lines: Sequence[str]) -> None:
+        self.patterns: list[tuple[bool, re.Pattern[str]]] = []
+        for line in lines:
+            if line.startswith("#"):
+                continue
+            pattern = line.strip()
+            exclusion = pattern.startswith("!")
+            if exclusion:
+                pattern = pattern[1:].strip()
+            if not pattern:
+                continue
+            # Go's filepath.Clean, then relative to the context root.
+            pattern = posixpath.normpath(pattern)
+            pattern = pattern.lstrip("/") or pattern[:1]
+            with suppress(re.error):
+                self.patterns.append((exclusion, _ignore_regex(pattern)))
+        self.has_exceptions = any(exclusion for exclusion, _ in self.patterns)
+
+    def ignored(self, relative: str) -> bool:
+        parents = relative.split("/")[:-1]
+        matched = False
+        for exclusion, regex in self.patterns:
+            # An exception only matters once a path is ignored, and an
+            # ignore pattern only until then.
+            if exclusion != matched:
+                continue
+            if regex.fullmatch(relative) or any(
+                regex.fullmatch("/".join(parents[: index + 1]))
+                for index in range(len(parents))
+            ):
+                matched = not exclusion
+        return matched
+
+
+def _ignore_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a pattern as moby/patternmatcher does."""
+    regex = []
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        index += 1
+        if character == "*" and pattern.startswith("*", index):
+            index += 1
+            if pattern.startswith("/", index):
+                index += 1
+            regex.append(".*" if index == len(pattern) else "(.*/)?")
+        elif character == "*":
+            regex.append("[^/]*")
+        elif character == "?":
+            regex.append("[^/]")
+        elif character == "\\" and index < len(pattern):
+            regex.append(re.escape(pattern[index]))
+            index += 1
+        elif character in ".+()|{}$\\":
+            regex.append(re.escape(character))
+        else:
+            regex.append(character)
+    return re.compile("".join(regex))
+
+
+def dockerignore(context_dir: Path) -> DockerIgnore | None:
     path = context_dir / ".dockerignore"
     if not path.is_file():
         return None
-    return GitIgnoreSpec.from_lines(path.read_text().splitlines())
+    return DockerIgnore(path.read_text().splitlines())
 
 
 @dataclass(frozen=True)
@@ -769,83 +837,159 @@ def _check_platform(
             )
 
 
+def _base_scope(config: Mapping[str, Any]) -> _Scope:
+    """Return a base image's environment, which Docker expands against."""
+    scope: _Scope = {}
+    for entry in config.get("Env") or []:
+        name, separator, value = str(entry).partition("=")
+        if separator:
+            scope[name] = (value,)
+    return scope
+
+
+def _stage_workdir(
+    stage: _Stage,
+    escape: str,
+    workdir: str,
+    scope: _Scope,
+    arguments: Mapping[str, str],
+    global_scope: _Scope,
+    *,
+    defer: bool,
+) -> tuple[str, bool]:
+    """Return a stage's final ``WORKDIR``, as the translation sets it.
+
+    The flag is true when the result depends on the starting directory,
+    which is the base image's ``WorkingDir``.
+    """
+    env_names: set[str] = set()
+    relative = absolute = False
+    for instruction in stage.instructions:
+        words = _raw_words(instruction.args, escape)
+        if instruction.keyword == "ARG":
+            for word in words:
+                name, separator, default = word.partition("=")
+                if name in env_names:
+                    continue
+                if name in arguments:
+                    value: _Value | None = (arguments[name],)
+                elif separator:
+                    try:
+                        value = _resolve(
+                            _Lexer(default, escape).word(), scope, defer=defer
+                        )
+                    except _LexError:
+                        value = (_Ref(name),)
+                else:
+                    value = global_scope.get(name)
+                if value is not None:
+                    scope[name] = value
+        elif instruction.keyword == "ENV":
+            for name, raw in _env_pairs(instruction, escape):
+                env_names.add(name)
+                try:
+                    scope[name] = _resolve(
+                        _Lexer(raw, escape).word(), scope, defer=defer
+                    )
+                except _LexError:
+                    scope[name] = (_Ref(name),)
+        elif instruction.keyword == "WORKDIR":
+            try:
+                value = _resolve(
+                    _Lexer(instruction.args, escape).word(), scope, defer=defer
+                )
+            except _LexError:
+                value = (_Ref("?"),)
+            if not _is_static(value):
+                raise ValueError(
+                    "Singularity cannot resolve variables in Dockerfile "
+                    f"WORKDIR: {instruction.args}"
+                )
+            path = _text(value)
+            relative = relative or not (absolute or path.startswith("/"))
+            absolute = absolute or path.startswith("/")
+            workdir = posixpath.normpath(posixpath.join(workdir, path))
+    return workdir, relative
+
+
 def dockerfile_workdir(
     text: str,
     build_args: Sequence[str] = (),
     target: str | None = None,
     machine: str | None = None,
+    *,
+    image_config: ImageConfig | None = None,
+    warnings: list[str] | None = None,
 ) -> str:
     """Return the final ``WORKDIR`` of a stage without building it.
 
     Variables defined by the Dockerfile and its build arguments are
-    resolved; anything set only by the base image raises ``ValueError``.
-    Constructs that only a build would reject are ignored here.
+    resolved. ``image_config`` looks up the base image's config only when
+    the result depends on it: a relative first ``WORKDIR`` starts in its
+    ``WorkingDir``, and variables can come from its environment. Anything
+    still unresolved raises ``ValueError``; a relative ``WORKDIR`` whose
+    base config cannot be read starts in ``/``, as the translation does,
+    and adds to ``warnings``. Constructs that only a build would reject are
+    ignored here.
     """
     parsed = parse_dockerfile(text)
     arguments = _parse_build_args(build_args)
+    machine = machine or platform.machine()
     global_scope, stages = _split_stages(
-        parsed, arguments, machine or platform.machine(), strict=False
+        parsed, arguments, machine, strict=False
     )
-    workdirs: dict[int, str] = {}
-    names: dict[str, int] = {}
-    for stage in stages:
-        inherited = names.get(stage.image.lower())
-        workdir = workdirs[inherited] if inherited is not None else "/"
-        scope: _Scope = {}
-        for instruction in stage.instructions:
-            words = _raw_words(instruction.args, parsed.escape)
-            if instruction.keyword == "ARG":
-                for word in words:
-                    name, separator, default = word.partition("=")
-                    if name in arguments:
-                        scope[name] = (arguments[name],)
-                    elif separator:
-                        try:
-                            scope[name] = _resolve(
-                                _Lexer(default, parsed.escape).word(),
-                                scope,
-                                defer=True,
-                            )
-                        except _LexError:
-                            scope[name] = (_Ref(name),)
-                    else:
-                        scope[name] = global_scope.get(name)
-            elif instruction.keyword == "ENV":
-                for name, raw in _env_pairs(instruction, parsed.escape):
-                    try:
-                        scope[name] = _resolve(
-                            _Lexer(raw, parsed.escape).word(),
-                            scope,
-                            defer=True,
-                        )
-                    except _LexError:
-                        scope[name] = (_Ref(name),)
-            elif instruction.keyword == "WORKDIR":
-                try:
-                    value = _resolve(
-                        _Lexer(instruction.args, parsed.escape).word(),
-                        scope,
-                        defer=True,
-                    )
-                except _LexError:
-                    value = (_Ref("?"),)
-                if not _is_static(value):
-                    raise ValueError(
-                        "Singularity cannot resolve variables in Dockerfile "
-                        f"WORKDIR: {instruction.args}"
-                    )
-                workdir = posixpath.normpath(
-                    posixpath.join(workdir, _text(value))
-                )
-        workdirs[stage.index] = workdir
-        if stage.name is not None:
-            names[stage.name] = stage.index
     if not stages:
         return "/"
+    parents: dict[int, _Stage | None] = {}
+    names: dict[str, _Stage] = {}
+    for stage in stages:
+        parents[stage.index] = names.get(stage.image.lower())
+        if stage.name is not None:
+            names[stage.name] = stage
     if target is None:
-        return workdirs[stages[-1].index]
-    index = names.get(target.lower())
-    return workdirs[index] if index is not None else "/"
+        final = stages[-1]
+    elif target.lower() in names:
+        final = names[target.lower()]
+    else:
+        return "/"
+
+    def workdir(stage: _Stage) -> str:
+        parent = parents[stage.index]
+        common = (stage, parsed.escape)
+        inputs = (arguments, global_scope)
+        if parent is not None:
+            return _stage_workdir(
+                *common, workdir(parent), {}, *inputs, defer=True
+            )[0]
+        try:
+            result, relative = _stage_workdir(
+                *common, "/", {}, *inputs, defer=True
+            )
+        except ValueError as exc:
+            # Variables from the base image's environment.
+            result, relative, error = "/", True, exc
+        else:
+            error = None
+        config = (
+            image_config(stage.image, machine)
+            if relative and image_config is not None
+            else None
+        )
+        if config is None:
+            if error is not None:
+                raise error
+            if relative and image_config is not None and warnings is not None:
+                warnings.append(
+                    f"cannot read the config of {stage.image}; its relative "
+                    "WORKDIR starts in / instead of the image's WORKDIR"
+                )
+            return result
+        start = config.get("WorkingDir") or "/"
+        return _stage_workdir(
+            *common, start, _base_scope(config), *inputs, defer=False
+        )[0]
+
+    return workdir(final)
 
 
 def _env_pairs(instruction: Instruction, escape: str) -> list[tuple[str, str]]:
@@ -927,6 +1071,9 @@ class Definition:
     # Constructs the translation ignores or approximates.
     notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Base images whose config could not be read, so the build differs
+    # from one that could; the SIF is cached apart.
+    unread_configs: list[str] = field(default_factory=list)
 
     def render(self, staging_dir: Path) -> str:
         """Return the definition file text for staging under ``staging_dir``."""
@@ -970,7 +1117,7 @@ class Definition:
     ) -> Path:
         """Stage the build scripts and sources and write the definition."""
         download = download or _download
-        ignore = dockerignore_spec(self.context_dir)
+        ignore = dockerignore(self.context_dir)
         for stage in self.stages:
             if stage.body is None:
                 continue
@@ -987,11 +1134,7 @@ class Definition:
                         self.context_dir, source.path, target, ignore
                     )
                 elif isinstance(source, ArchiveSource):
-                    target.mkdir()
-                    with tarfile.open(
-                        self.context_dir / source.path, "r:*"
-                    ) as archive:
-                        archive.extractall(target, filter="tar")
+                    _extract_archive(self.context_dir / source.path, target)
                 elif isinstance(source, UrlSource):
                     download(source.url, target)
                     target.chmod(0o600)
@@ -1003,6 +1146,33 @@ class Definition:
         return path
 
 
+def _extract_archive(archive_path: Path, target: Path) -> None:
+    """Extract a local archive for ``ADD``, with its members' metadata.
+
+    The host user cannot set the members' owners, so a sibling
+    ``.ursa-members`` script restores them, and their modes, in ``%post``.
+    """
+    # By name: extractall filters a directory again to set its mode.
+    members: dict[str, tarfile.TarInfo] = {}
+
+    def keep(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo:
+        # The "tar" filter's path checks, without its mode changes.
+        checked = tarfile.tar_filter(member, path)
+        checked = checked.replace(mode=member.mode, deep=False)
+        members.setdefault(checked.name, checked)
+        return checked
+
+    target.mkdir()
+    with tarfile.open(archive_path, "r:*") as archive:
+        archive.extractall(target, filter=keep)
+    lines = [
+        f"_ursa_member {member.uid}:{member.gid} {member.mode & 0o7777:o} "
+        f"{shlex.quote('./' + member.name)}\n"
+        for member in members.values()
+    ]
+    target.with_name(f"{target.name}.ursa-members").write_text("".join(lines))
+
+
 def _download(url: str, target: Path) -> None:
     with (
         urllib.request.urlopen(url, timeout=300) as response,  # noqa: S310
@@ -1011,19 +1181,34 @@ def _download(url: str, target: Path) -> None:
         shutil.copyfileobj(response, output)
 
 
-def _ignored(ignore: GitIgnoreSpec | None, relative: str, is_dir: bool) -> bool:
-    if ignore is None or not relative:
+def _ignored(ignore: DockerIgnore | None, relative: str) -> bool:
+    return ignore is not None and bool(relative) and ignore.ignored(relative)
+
+
+def _in_context(
+    context_dir: Path, relative: str, ignore: DockerIgnore | None
+) -> bool:
+    """Whether Docker would send a context path, ignored or not."""
+    if not _ignored(ignore, relative):
+        return True
+    # An exception can re-include something inside an ignored directory,
+    # which Docker then sends along with its parents.
+    path = context_dir / relative
+    if ignore is None or not ignore.has_exceptions or path.is_symlink():
         return False
-    return ignore.match_file(relative) or (
-        is_dir and ignore.match_file(f"{relative}/")
-    )
+    for directory, dirnames, filenames in os.walk(path):
+        prefix = Path(directory).relative_to(context_dir).as_posix()
+        for name in [*dirnames, *filenames]:
+            if not ignore.ignored(f"{prefix}/{name}"):
+                return True
+    return False
 
 
 def _copy_context_path(
     context_dir: Path,
     relative: str,
     target: Path,
-    ignore: GitIgnoreSpec | None,
+    ignore: DockerIgnore | None,
 ) -> None:
     """Copy a context path, following only a top-level symlink as Docker does."""
     source = (context_dir / relative).resolve() if relative else context_dir
@@ -1032,27 +1217,41 @@ def _copy_context_path(
         return
     target.mkdir()
     directories = [(source, target)]
+
+    def parent(prefix: Path) -> Path:
+        # Create the ignored parents of a path that an exception re-includes.
+        missing = []
+        while not (target / prefix).is_dir():
+            missing.append(prefix)
+            prefix = prefix.parent
+        for path in reversed(missing):
+            (target / path).mkdir()
+            directories.append((source / path, target / path))
+        return target / (missing[0] if missing else prefix)
+
     for directory, dirnames, filenames in os.walk(source):
         current = Path(directory)
         prefix = current.relative_to(source)
         for name in list(dirnames):
             path = current / name
             rel = posixpath.join(relative, (prefix / name).as_posix())
-            if _ignored(ignore, rel, True):
-                dirnames.remove(name)
-            elif path.is_symlink():
+            ignored = _ignored(ignore, rel)
+            if path.is_symlink():
                 # os.walk lists links to directories here; keep the link.
                 dirnames.remove(name)
-                os.symlink(os.readlink(path), target / prefix / name)
-            else:
-                (target / prefix / name).mkdir()
+                if not ignored:
+                    os.symlink(os.readlink(path), parent(prefix) / name)
+            elif not ignored:
+                (parent(prefix) / name).mkdir()
                 directories.append((path, target / prefix / name))
+            elif ignore is None or not ignore.has_exceptions:
+                dirnames.remove(name)
         for name in filenames:
             rel = posixpath.join(relative, (prefix / name).as_posix())
-            if not _ignored(ignore, rel, False):
+            if not _ignored(ignore, rel):
                 shutil.copy2(
                     current / name,
-                    target / prefix / name,
+                    parent(prefix) / name,
                     follow_symlinks=False,
                 )
     # Copy directory modes last, so read-only directories can be filled.
@@ -1080,7 +1279,7 @@ def _go_glob(segment: str) -> str:
 
 
 def _glob_context(
-    context_dir: Path, pattern: str, ignore: GitIgnoreSpec | None
+    context_dir: Path, pattern: str, ignore: DockerIgnore | None
 ) -> list[str]:
     def walk(base: str, segments: list[str]) -> Iterator[str]:
         directory = context_dir / base
@@ -1100,7 +1299,7 @@ def _glob_context(
         for name in names:
             relative = posixpath.join(base, name) if base else name
             path = context_dir / relative
-            if _ignored(ignore, relative, path.is_dir()):
+            if not _in_context(context_dir, relative, ignore):
                 continue
             if len(segments) == 1:
                 yield relative
@@ -1126,7 +1325,7 @@ class _Translator:
         self.machine = machine
         self.environ = environ
         self.image_config = image_config
-        self.ignore = dockerignore_spec(context_dir)
+        self.ignore = dockerignore(context_dir)
         self.global_scope, self.stages = _split_stages(
             parsed, build_args, machine, strict=True
         )
@@ -1135,6 +1334,7 @@ class _Translator:
         self.order: list[DefinitionStage] = []
         self.notes: list[str] = []
         self.warnings: list[str] = []
+        self.unread_configs: list[str] = []
 
     def stage_by_reference(self, reference: str, before: int) -> _Stage | None:
         if reference.isdigit():
@@ -1159,7 +1359,11 @@ class _Translator:
             final = found[0]
         self.ensure(final, final=True)
         return Definition(
-            self.order, self.context_dir, self.notes, self.warnings
+            self.order,
+            self.context_dir,
+            self.notes,
+            self.warnings,
+            self.unread_configs,
         )
 
     def ensure(self, stage: _Stage, *, final: bool = False) -> DefinitionStage:
@@ -1207,6 +1411,9 @@ class _StageScript:
         self.escape = translator.parsed.escape
         self.plan = DefinitionStage(f"s{stage.index}", stage.image, "")
         self.scope: _Scope = {}
+        # Without the base image's environment, variables it may set are
+        # left for the build script to expand.
+        self.defer = True
         self.env_names: list[str] = []
         self.shell: list[str] = list(_DEFAULT_SHELL)
         self.user: _Value = ()
@@ -1214,7 +1421,12 @@ class _StageScript:
         self.steps = 0
 
     def base_image(self) -> None:
-        """Start in the base image's ``WorkingDir`` as its ``User``."""
+        """Start in the base image's ``WorkingDir`` as its ``User``.
+
+        Variables also expand against the image's environment, as in
+        Docker, rather than against the build shell's, which has Apptainer's
+        own variables and a ``HOME``.
+        """
         lookup = self.translator.image_config
         if lookup is None:
             return
@@ -1225,7 +1437,10 @@ class _StageScript:
                 f"of {self.stage.image}; build steps start in / as root "
                 "instead of its WORKDIR and USER"
             )
+            self.translator.unread_configs.append(self.stage.image)
             return
+        self.scope.update(_base_scope(config))
+        self.defer = False
         workdir = config.get("WorkingDir") or ""
         if workdir not in {"", "/"}:
             self.lines.append(f"_ursa_workdir {shlex.quote(workdir)}")
@@ -1292,7 +1507,7 @@ class _StageScript:
 
     def lex(self, text: str) -> _Value:
         return _resolve(
-            _Lexer(text, self.escape).word(), self.scope, defer=True
+            _Lexer(text, self.escape).word(), self.scope, defer=self.defer
         )
 
     def static(self, value: _Value, instruction: Instruction, what: str) -> str:
@@ -1322,12 +1537,12 @@ class _StageScript:
                 value = self.translator.global_scope[name]
             else:
                 value = None
-            # ENV wins over an ARG of the same name, as in Docker.
-            if name in self.env_names:
+            # ENV wins over an ARG of the same name, as in Docker. An ARG
+            # without a value leaves the name to the base image.
+            if name in self.env_names or value is None:
                 continue
             self.scope[name] = value
-            if value is not None:
-                exports.append(f"{name}={_shell_word(value)}")
+            exports.append(f"{name}={_shell_word(value)}")
         self.emit(
             instruction, *([f"export {' '.join(exports)}"] if exports else [])
         )
@@ -1448,7 +1663,7 @@ class _StageScript:
             if exec_form is not None
             else _Lexer(rest, self.escape).words()
         )
-        words = [_resolve(word, self.scope, defer=True) for word in words]
+        words = [_resolve(word, self.scope, defer=self.defer) for word in words]
         if len(words) < 2:
             _fail(instruction, f"{keyword} needs a source and a destination")
         *sources, destination = words
@@ -1468,7 +1683,12 @@ class _StageScript:
                 f"{keyword} with several sources needs a destination ending "
                 "in /",
             )
-        owner_word = _shell_word(self.lex(owner)) if owner else "''"
+        if owner:
+            owner_word = _shell_word(self.lex(owner))
+        else:
+            # Like BuildKit, COPY --from keeps the source's owners, which
+            # %files from copies when the build runs as (fake) root.
+            owner_word = "''" if source_stage is None else "-"
         mode_text = ""
         if mode:
             mode_text = self.static(self.lex(mode), instruction, "--chmod")
@@ -1554,8 +1774,8 @@ class _StageScript:
                 matches = [""]
             elif _GLOB_CHARACTERS.isdisjoint(relative):
                 path = translator.context_dir / relative
-                if not os.path.lexists(path) or _ignored(
-                    translator.ignore, relative, path.is_dir()
+                if not os.path.lexists(path) or not _in_context(
+                    translator.context_dir, relative, translator.ignore
                 ):
                     _fail(
                         instruction,
@@ -1703,9 +1923,32 @@ _ursa_workdir() {
     mkdir -p "$_ursa_wd"
 }
 
+# _ursa_member OWNER MODE PATH: restore an archive member's owner and mode,
+# which ADD keeps; the mode goes last, since chown clears setuid bits.
+_ursa_member() {
+    if [ -z "$_ursa_given" ] && ! chown -h "$1" "$3"; then
+        echo "ursa: warning: cannot chown $3 to $1" >&2
+    fi
+    [ -L "$3" ] || chmod "$2" "$3"
+}
+
 # _ursa_copy OWNER MODE DEST SOURCE...: copy staged sources as COPY does.
+# Build context files belong to root unless OWNER is given; "-" keeps the
+# owners of files from another stage. A user without a group also names
+# the group, by the user's UID.
 _ursa_copy() {
-    _ursa_owner=${1:-0:0}
+    _ursa_owner=$1
+    _ursa_given=$1
+    case $_ursa_owner in
+    '') _ursa_owner=0:0 ;;
+    - | *:*) ;;
+    *[!0-9]*)
+        if _ursa_uid=$(id -u "$_ursa_owner" 2>/dev/null); then
+            _ursa_owner=$_ursa_owner:$_ursa_uid
+        fi
+        ;;
+    *) _ursa_owner=$_ursa_owner:$_ursa_owner ;;
+    esac
     _ursa_mode=$2
     _ursa_dest=$3
     shift 3
@@ -1718,8 +1961,13 @@ _ursa_copy() {
     *) _ursa_into= ;;
     esac
     for _ursa_src do
-        if ! chown -hR "$_ursa_owner" "$_ursa_src"; then
+        if [ "$_ursa_owner" != - ] && ! chown -hR "$_ursa_owner" "$_ursa_src"
+        then
             echo "ursa: warning: cannot chown to $_ursa_owner" >&2
+        fi
+        # An extracted archive keeps its members' owners and modes.
+        if [ -f "$_ursa_src.ursa-members" ]; then
+            (cd "$_ursa_src" && . "$_ursa_src.ursa-members")
         fi
         [ -z "$_ursa_mode" ] || chmod -R "$_ursa_mode" "$_ursa_src"
         if [ -d "$_ursa_src" ] && [ ! -L "$_ursa_src" ]; then
