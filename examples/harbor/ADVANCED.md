@@ -138,7 +138,8 @@ directory. Tools such as `pip install --user`, `uv`, and
 `source $HOME/.local/bin/env` then work. A `HOME` passed in a command's
 environment takes precedence. With fakeroot, `HOME` is `/root`, which is
 writable through the overlay; with `singularity_overlay=false` the image root
-filesystem, including `/root`, is read-only.
+filesystem, including `/root`, is read-only, so fakeroot containers get the
+private `/harbor-home` as well.
 
 To run tasks that do not need container root on a host without fakeroot:
 

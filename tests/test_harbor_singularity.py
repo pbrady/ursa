@@ -642,9 +642,12 @@ def test_log_dirs_bind_host_trial_only_with_auto_mounting(
     environment._cleanup_staging()
 
 
-@pytest.mark.parametrize("fakeroot", [False, True])
-def test_instance_home_is_private_and_writable_without_fakeroot(
-    tmp_path: Path, fakeroot: bool
+@pytest.mark.parametrize(
+    ("fakeroot", "overlay"),
+    [(False, False), (False, True), (True, True), (True, False)],
+)
+def test_instance_home_is_private_unless_fakeroot_has_an_overlay(
+    tmp_path: Path, fakeroot: bool, overlay: bool
 ):
     environment = _environment(tmp_path, fakeroot=fakeroot)
     environment._prepare_runtime_workdir()
@@ -652,11 +655,13 @@ def test_instance_home_is_private_and_writable_without_fakeroot(
     staging.mkdir()
     environment._staging_dir = staging
     environment._sif_path = tmp_path / "image.sif"
+    if overlay:
+        environment._overlay_path = tmp_path / "overlay.img"
 
     start = environment._instance_start_command()
 
     home = staging / "harbor-home" / "main"
-    if fakeroot:
+    if fakeroot and overlay:
         # Fakeroot runs as root with a writable /root in the overlay.
         assert "--no-home" in start
         assert "--home" not in start
@@ -670,23 +675,27 @@ def test_instance_home_is_private_and_writable_without_fakeroot(
 
 
 @pytest.mark.parametrize(
-    ("fakeroot", "env", "expected"),
+    ("fakeroot", "overlay", "env", "expected"),
     [
-        (False, None, "/harbor-home"),
-        (False, {"HOME": "/custom"}, "/custom"),
-        (True, None, None),
-        (True, {"HOME": "/custom"}, "/custom"),
+        (False, False, None, "/harbor-home"),
+        (False, False, {"HOME": "/custom"}, "/custom"),
+        (True, True, None, None),
+        (True, True, {"HOME": "/custom"}, "/custom"),
+        (True, False, None, "/harbor-home"),
     ],
 )
 async def test_exec_exports_home_instead_of_runtime_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fakeroot: bool,
+    overlay: bool,
     env: dict[str, str] | None,
     expected: str | None,
 ):
     environment = _environment(tmp_path, fakeroot=fakeroot)
     _prepare_started_environment(environment, tmp_path)
+    if not overlay:
+        environment._overlay_path = None
     observed: dict[str, object] = {}
 
     class Process:

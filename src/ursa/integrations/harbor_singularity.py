@@ -57,6 +57,7 @@ _HOST_CA_CERTIFICATES_FILENAME = "host-ca-certificates.crt"
 _COMPOSE_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Without fakeroot, Singularity keeps the host's HOME path but does not mount
 # it under --containall, so commands get a private writable home here instead.
+# Fakeroot without a disk overlay uses it too, since /root is read-only then.
 _CONTAINER_HOME = "/harbor-home"
 # Runtime diagnostics that mean ``--fakeroot`` itself is unusable, as opposed
 # to an unrelated probe failure such as a pull error or a broken image.
@@ -925,7 +926,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         if singularity_no_mount is not None:
             raise ValueError(
                 "singularity_no_mount is not configurable; this environment "
-                "always isolates mounts with --containall and --no-home"
+                "always isolates mounts with --containall and a private home"
             )
 
         self._image_cache_dir = (
@@ -1881,7 +1882,11 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             main_overlay=self._overlay_path,
             service_workdirs=service_workdirs,
             interpolation_environment=self._compose_interpolation_environment(),
-            home_root=None if self._fakeroot else self._staging / "harbor-home",
+            home_root=(
+                self._staging / "harbor-home"
+                if self._uses_private_home
+                else None
+            ),
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -2031,9 +2036,14 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         command.extend([str(self._sif_path), self._instance_name])
         return command
 
+    @property
+    def _uses_private_home(self) -> bool:
+        # Fakeroot's /root is writable only through the disk overlay; without
+        # one it sits on the read-only image root filesystem.
+        return not self._fakeroot or self._overlay_path is None
+
     def _home_options(self) -> list[str]:
-        # Fakeroot already provides a writable /root through the overlay.
-        if self._fakeroot:
+        if not self._uses_private_home:
             return ["--no-home"]
         home = self._staging / "harbor-home" / "main"
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2045,7 +2055,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         merged = self._merge_env(env) if merge_persistent else env
         if merged and "HOME" in merged:
             return merged["HOME"]
-        return None if self._fakeroot else _CONTAINER_HOME
+        return _CONTAINER_HOME if self._uses_private_home else None
 
     def _prepare_host_ca_certificates(self) -> Path | None:
         """Materialize the host OpenSSL trust store in the staging mount."""
