@@ -169,7 +169,11 @@ An unprivileged (user-space) Apptainer installation has extra requirements:
   a temporary sandbox on every start, which is slow and uses scratch space.
 - The writable overlay needs `fuse2fs` and `fuse-overlayfs`. Without them,
   set `singularity_overlay=false`; the image root filesystem is then
-  read-only and network-policy phases cannot change.
+  read-only and network-policy phases cannot change. For Apptainer the
+  overlay is a bare ext3 image, and Apptainer creates `upper/` and `work/` in
+  it: under root-mapped fakeroot it rejects pre-made ones, such as those from
+  `apptainer overlay create`, as not writable. SingularityCE 3.6 still gets
+  them pre-created, owned by the invoking user, as it requires.
 - Without an `/etc/subuid` entry, Apptainer 1.1 and later implement
   `--fakeroot` with a root-mapped user namespace, helped by the host's
   `fakeroot` command when it is installed. Only root is mapped, so tasks that

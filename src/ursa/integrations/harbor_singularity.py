@@ -2256,7 +2256,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 placeholder.touch(exist_ok=True)
 
     def _prepare_disk_overlay(self) -> None:
-        """Create a sparse ext3 overlay compatible with Singularity 3.6."""
+        """Create a sparse ext3 overlay for the detected runtime."""
         if self._scratch_dir is None:
             raise RuntimeError("Singularity scratch directory is not prepared")
         mkfs_ext3 = shutil.which("mkfs.ext3")
@@ -2267,10 +2267,15 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             )
 
         storage_mb = self.task_env_config.storage_mb or 1024
-        layout = self._scratch_dir / "overlay-layout"
-        for directory in (layout / "upper", layout / "work"):
-            directory.mkdir(parents=True)
-            directory.chmod(0o777)
+        # SingularityCE 3.6 needs upper/ and work/ in the image, owned by the
+        # invoking user. Apptainer creates them itself, and under root-mapped
+        # fakeroot rejects pre-made ones as "upper dir is not writable".
+        layout = None
+        if not _runtime_is_apptainer(self._instance_runtime()):
+            layout = self._scratch_dir / "overlay-layout"
+            for directory in (layout / "upper", layout / "work"):
+                directory.mkdir(parents=True)
+                directory.chmod(0o777)
         overlay = self._scratch_dir / "overlay.img"
         overlay.touch(mode=0o600)
         os.truncate(overlay, storage_mb * 1024 * 1024)
@@ -2278,7 +2283,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             command = [mkfs, "-q"]
             if mkfs_ext3 is None:
                 command.extend(["-t", "ext3"])
-            command.extend(["-d", str(layout), str(overlay)])
+            if layout is not None:
+                command.extend(["-d", str(layout)])
+            command.append(str(overlay))
             subprocess.run(
                 command,
                 check=True,
@@ -2292,7 +2299,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 f"Could not create Singularity writable overlay: {detail}"
             ) from exc
         finally:
-            shutil.rmtree(layout, ignore_errors=True)
+            if layout is not None:
+                shutil.rmtree(layout, ignore_errors=True)
         self._overlay_path = overlay
 
     def _main_seed_image(self) -> str:

@@ -359,6 +359,93 @@ def test_runtime_environment_prefix_follows_the_runtime(
     assert f"{other}TASK_VALUE" not in runtime_env
 
 
+@pytest.mark.parametrize(
+    ("name", "version", "layout"),
+    [
+        ("singularity", "singularity-ce version 3.6.2", True),
+        ("singularity", "apptainer version 1.5.5", False),
+        ("apptainer", "", False),
+    ],
+)
+def test_disk_overlay_layout_follows_the_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    version: str,
+    layout: bool,
+):
+    environment = _environment(tmp_path, overlay=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    runtime = bin_dir / name
+    runtime.write_text(f"#!/bin/sh\necho '{version}'\n")
+    runtime.chmod(0o755)
+    environment._runtime_path = str(runtime)
+    # The fake mkfs records its argv and the layout it was handed, which the
+    # environment removes once the image is made.
+    record = tmp_path / "mkfs.log"
+    mkfs = bin_dir / "mkfs.ext3"
+    mkfs.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" > {record}\n'
+        'if [ "$2" = -d ]; then ls "$3" >> ' + str(record) + "; fi\n"
+    )
+    mkfs.chmod(0o755)
+    monkeypatch.setattr(
+        harbor_singularity.shutil,
+        "which",
+        lambda command: str(mkfs) if command == "mkfs.ext3" else None,
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    environment._scratch_dir = scratch
+
+    environment._prepare_disk_overlay()
+
+    overlay = scratch / "overlay.img"
+    assert environment._overlay_path == overlay
+    assert overlay.stat().st_size == 1024 * 1024 * 1024
+    argv, *listing = record.read_text().splitlines()
+    if layout:
+        assert argv == f"-q -d {scratch / 'overlay-layout'} {overlay}"
+        assert listing == ["upper", "work"]
+    else:
+        assert argv == f"-q {overlay}"
+        assert listing == []
+    assert not (scratch / "overlay-layout").exists()
+
+
+def test_disk_overlay_uses_mke2fs_ext3_without_mkfs_ext3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path, overlay=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    runtime = bin_dir / "apptainer"
+    runtime.write_text("#!/bin/sh\n")
+    runtime.chmod(0o755)
+    environment._runtime_path = str(runtime)
+    record = tmp_path / "mkfs.log"
+    mke2fs = bin_dir / "mke2fs"
+    mke2fs.write_text(f'#!/bin/sh\necho "$@" > {record}\n')
+    mke2fs.chmod(0o755)
+    monkeypatch.setattr(
+        harbor_singularity.shutil,
+        "which",
+        lambda command: str(mke2fs) if command == "mke2fs" else None,
+    )
+    environment._scratch_dir = tmp_path
+
+    environment._prepare_disk_overlay()
+
+    assert record.read_text().split() == [
+        "-q",
+        "-t",
+        "ext3",
+        str(tmp_path / "overlay.img"),
+    ]
+
+
 async def test_network_policy_change_restarts_with_existing_overlay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
