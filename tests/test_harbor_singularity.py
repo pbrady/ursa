@@ -253,6 +253,56 @@ def test_compose_network_policy_is_rewritten(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize(
+    ("instances", "up", "aliases"),
+    [
+        ({"main": {}}, ["up", "--read_only", "--no-resolv"], False),
+        ({"main": {}, "helper": {}}, ["up", "--read_only"], True),
+    ],
+)
+async def test_lone_main_compose_keeps_host_resolver_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    instances: dict[str, dict[str, object]],
+    up: list[str],
+    aliases: bool,
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    environment._compose_file = tmp_path / "singularity-compose.yml"
+    environment._compose_file.write_text(
+        yaml.safe_dump({"instances": instances})
+    )
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    calls: list[tuple[str, ...]] = []
+    alias_calls: list[bool] = []
+
+    async def run_compose(*arguments: str) -> None:
+        calls.append(arguments)
+
+    async def run(*_command: str, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(environment, "_run_compose", run_compose)
+    monkeypatch.setattr(environment, "_run", run)
+    monkeypatch.setattr(
+        environment,
+        "_add_compose_service_aliases",
+        lambda: alias_calls.append(True),
+    )
+    monkeypatch.setattr(
+        type(environment), "_uses_compose", property(lambda _self: True)
+    )
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    assert calls == [tuple(up)]
+    assert bool(alias_calls) is aliases
+    environment._cleanup_staging()
+
+
 def test_host_ca_certificates_are_staged_and_exported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -964,6 +964,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._compose_file: Path | None = None
         self._compose_instances: dict[str, list[str]] = {}
         self._compose_uses_sudo = False
+        self._compose_host_network = False
         self._sif_use_token = f"{os.getpid()}-{secrets.token_hex(16)}"
         self._sifs_in_use: set[Path] = set()
 
@@ -1906,6 +1907,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         host_network = len(instances) == 1 and not any(
             instance.get("ports") for instance in instances
         )
+        self._compose_host_network = host_network
         for instance in instances:
             network = instance.setdefault("network", {})
             network["allocate_ip"] = not isolated
@@ -1981,6 +1983,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._compose_file = None
         self._compose_instances = {}
         self._compose_uses_sudo = False
+        self._compose_host_network = False
 
     def _instance_exec_prefix(
         self,
@@ -2518,9 +2521,18 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 compose_arguments = ["up"]
                 if self._overlay_path is not None:
                     compose_arguments.append("--read_only")
+                if self._compose_host_network:
+                    # Its generated /etc/hosts maps the instance to a bridge
+                    # address it never gets, and its resolv.conf lists only
+                    # public resolvers. Keep the host's files, as without
+                    # Compose.
+                    compose_arguments.append("--no-resolv")
                 self._instance_start_attempted = True
                 await self._run_compose(*compose_arguments)
-            if network_policy.network_mode != NetworkMode.NO_NETWORK:
+            if (
+                network_policy.network_mode != NetworkMode.NO_NETWORK
+                and not self._compose_host_network
+            ):
                 self._add_compose_service_aliases()
         else:
             self._instance_start_attempted = True

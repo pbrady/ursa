@@ -254,8 +254,9 @@ the adapter maps that command to the selected runtime inside its private
 project directory. An Apptainer installation therefore does not need a
 system-wide `singularity` alias. The `ursa-ai[harbor]` extra installs
 `singularity-compose`. A project whose only service is `main`, without
-published ports, uses host networking as a task without Compose does. Projects
-with sidecars or ports need bridge networking, which requires the host runtime
+published ports, uses host networking as a task without Compose does, including
+the host's `/etc/hosts` and `/etc/resolv.conf` instead of the files
+`singularity-compose` generates for its bridge. Projects with sidecars or ports need bridge networking, which requires the host runtime
 to provide fakeroot CNI networking.
 
 The adapter supports Harbor's `public` and `no-network` modes on
