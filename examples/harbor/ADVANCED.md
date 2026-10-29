@@ -397,9 +397,10 @@ runtime's setuid starter: it reads `LIBEXECDIR` from `apptainer buildcfg` (or
 relocated binary, and fails at once when it finds `starter` but no
 root-owned setuid `starter-suid`, the layout of an unprivileged installation.
 The answer is cached per runtime. The check never rejects root, a setuid
-installation, or a project whose published ports make `singularity-compose`
-use `sudo` (`singularity_fakeroot=false`); when the layout is unrecognised it
-does not decide. A setuid installation can still lack networking, for example
+installation, or a trial with `singularity_fakeroot=false`, for which
+`singularity-compose` uses `sudo` for published ports and otherwise starts
+every instance with `--network none`; when the layout is unrecognised it does
+not decide. A setuid installation can still lack networking, for example
 when `allow setuid = no` or the user has no `/etc/subuid` entry, so after
 `singularity-compose up` the adapter also lists the running instances with
 `apptainer instance list --json`. `singularity-compose` 0.1.19 reports a

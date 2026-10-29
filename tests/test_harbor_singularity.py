@@ -3335,6 +3335,28 @@ async def test_compose_up_that_exits_zero_without_instances_fails(
     environment._cleanup_staging()
 
 
+async def test_compose_up_keeps_its_output_when_instances_cannot_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _compose_up_environment(tmp_path, monkeypatch, running=[])
+
+    async def failing_list() -> set[str]:
+        raise RuntimeError("Could not list Singularity instances: denied")
+
+    monkeypatch.setattr(environment, "_list_instances", failing_list)
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment._start_prepared_runtime(
+            NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+        )
+
+    message = str(raised.value)
+    assert "Could not list Singularity instances: denied" in message
+    assert NETWORK_FATAL in message
+    assert not environment._instance_started
+    environment._cleanup_staging()
+
+
 async def test_compose_up_checks_every_instance_is_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -3469,7 +3491,7 @@ def test_user_owned_starter_suid_is_not_setuid(tmp_path: Path):
 async def test_start_fails_before_building_without_bridge_networking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    environment = _environment(tmp_path, compose=True)
+    environment = _environment(tmp_path, compose=True, fakeroot=True)
     checked: list[str] = []
 
     def unprivileged(runtime: str) -> bool:
@@ -3507,8 +3529,10 @@ async def test_start_fails_before_building_without_bridge_networking(
         # A lone main uses host networking; no-network uses --network none.
         ("main", 1000, True, NetworkMode.PUBLIC, True),
         ("ports-main", 1000, True, NetworkMode.NO_NETWORK, True),
-        # Published ports without fakeroot make singularity-compose use sudo.
+        # Without fakeroot, singularity-compose uses sudo for published ports
+        # and otherwise --network none, so it never asks for a bridge.
         ("ports-main", 1000, True, NetworkMode.PUBLIC, False),
+        ("sidecar", 1000, True, NetworkMode.PUBLIC, False),
     ],
 )
 def test_bridge_check_allows_projects_that_can_start(

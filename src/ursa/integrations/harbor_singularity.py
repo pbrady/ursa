@@ -2408,11 +2408,17 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         ]
         if not expected:
             return
-        running = await self._list_instances()
+        output = compose_output.strip()
+        try:
+            running = await self._list_instances()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}\nsingularity-compose output:\n"
+                + (output or "<no output>")
+            ) from exc
         missing = [instance for instance in expected if instance not in running]
         if not missing:
             return
-        output = compose_output.strip()
         fatal = [
             line.strip() for line in output.splitlines() if "FATAL" in line
         ]
@@ -2439,17 +2445,18 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
     def _raise_if_compose_bridge_unavailable(self) -> None:
         """Fail before building when the runtime offers only --network none.
 
-        Detection is conservative: root, singularity-compose's sudo mode, and
+        Detection is conservative: root, ``singularity_fakeroot=false``, and
         any installation with a setuid starter are never rejected here; an
         undetected failure is still caught after ``up``.
         """
-        if not self._uses_compose or os.geteuid() == 0:
-            return
-        config = self._load_compose_config()
-        if not self._fakeroot_setting and any(
-            service.get("ports") for service in config["services"].values()
+        if (
+            not self._uses_compose
+            or not self._fakeroot_setting
+            or os.geteuid() == 0
         ):
-            # singularity-compose then starts instances with sudo.
+            # Without fakeroot, singularity-compose never asks the runtime for
+            # a bridge: it uses sudo for published ports and otherwise adds
+            # ``--network none``.
             return
         if not self._compose_needs_bridge():
             return
