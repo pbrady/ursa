@@ -60,6 +60,7 @@ def _make_environment(
     suffix: str,
     purpose: str,
     image_cache_dir: Path | str | None = None,
+    builder: str | None = None,
     enable_environment_dir_upload: bool = True,
 ) -> DockerfileSingularityEnvironment:
     trial_directory = (
@@ -75,6 +76,7 @@ def _make_environment(
         phase_network_policies=phase_network_policies,
         enable_environment_dir_upload=enable_environment_dir_upload,
         singularity_image_cache_dir=image_cache_dir,
+        singularity_builder=builder,
     )
 
 
@@ -83,6 +85,7 @@ def _task_environments(
     *,
     purpose: str,
     image_cache_dir: Path | str | None = None,
+    builder: str | None = None,
 ) -> list[DockerfileSingularityEnvironment]:
     trial_agent = AgentConfig()
     trial_environment = TrialEnvironmentConfig()
@@ -136,6 +139,7 @@ def _task_environments(
             suffix="agent",
             purpose=purpose,
             image_cache_dir=image_cache_dir,
+            builder=builder,
         )
     )
 
@@ -154,6 +158,7 @@ def _task_environments(
                 suffix=f"verifier-{index}",
                 purpose=purpose,
                 image_cache_dir=image_cache_dir,
+                builder=builder,
                 enable_environment_dir_upload=not definition.bundled_tests,
             )
         )
@@ -170,17 +175,20 @@ async def prebuild_harbor_task(
     *,
     refresh: bool = False,
     image_cache_dir: Path | str | None = None,
+    builder: str | None = None,
 ) -> list[Path]:
     """Build or pull main, Compose, and separate-verifier SIFs for one task.
 
     The SIFs are the ones a trial without ``--force-build`` uses, so
     ``refresh`` rebuilds or re-pulls them without switching a prebuilt-image
-    task to a Dockerfile build.
+    task to a Dockerfile build. ``builder`` has the meaning of the
+    ``singularity_builder`` environment kwarg.
     """
     environments = _task_environments(
         Task(task_dir),
         purpose="prebuild",
         image_cache_dir=image_cache_dir,
+        builder=builder,
     )
     paths: list[Path] = []
     for environment in environments:

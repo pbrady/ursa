@@ -1178,6 +1178,16 @@ def prebuild_sifs(
             help="Override the URSA Harbor SIF cache directory",
         ),
     ] = None,
+    builder: Annotated[
+        str | None,
+        typer.Option(
+            "--builder",
+            help=(
+                "Dockerfile builder: auto, apptainer, buildah, podman, or "
+                "docker (default: URSA_HARBOR_SIF_BUILDER or auto)"
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Build or pull the SIF files for Harbor tasks ahead of a run."""
     from ursa.integrations.harbor_validation import (
@@ -1196,6 +1206,7 @@ def prebuild_sifs(
                     task,
                     refresh=force,
                     image_cache_dir=image_cache_dir,
+                    builder=builder,
                 )
             except Exception as exc:
                 failures += 1

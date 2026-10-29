@@ -131,7 +131,7 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
 ):
     task = _task(tmp_path)
     cache = tmp_path / "sif-cache"
-    observed: list[tuple[Path, Path, bool, bool]] = []
+    observed: list[tuple[Path, Path, bool, bool, str]] = []
 
     async def build(
         self: DockerfileSingularityEnvironment,
@@ -146,19 +146,20 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
             self._image_cache_dir,
             refresh,
             self._enable_environment_dir_upload,
+            self._builder_setting,
         ))
         return [cache / f"{self.environment_dir.name}.sif"]
 
     monkeypatch.setattr(DockerfileSingularityEnvironment, "build_sifs", build)
 
     paths = await prebuild_harbor_task(
-        task, refresh=True, image_cache_dir=cache
+        task, refresh=True, image_cache_dir=cache, builder="apptainer"
     )
 
     assert observed == [
-        (task / "environment", cache, True, True),
+        (task / "environment", cache, True, True, "apptainer"),
         # The tests image bundles its own files, as in a Harbor trial.
-        (task / "tests", cache, True, False),
+        (task / "tests", cache, True, False, "apptainer"),
     ]
     assert paths == [cache / "environment.sif", cache / "tests.sif"]
 
@@ -191,8 +192,9 @@ def test_harbor_prebuild_command_reports_built_sifs(tmp_path, monkeypatch):
         *,
         refresh: bool,
         image_cache_dir: Path | None,
+        builder: str | None,
     ) -> list[Path]:
-        observed.append((task_dir, refresh, image_cache_dir))
+        observed.append((task_dir, refresh, image_cache_dir, builder))
         return [cache / "agent.sif", cache / "verifier.sif"]
 
     monkeypatch.setattr(
@@ -206,12 +208,14 @@ def test_harbor_prebuild_command_reports_built_sifs(tmp_path, monkeypatch):
             "--force",
             "--image-cache-dir",
             str(cache),
+            "--builder",
+            "apptainer",
             str(task),
         ],
     )
 
     assert result.exit_code == 0
-    assert observed == [(task, True, cache)]
+    assert observed == [(task, True, cache, "apptainer")]
     assert f"OK   {task}: 2 SIF file(s)" in result.stdout
     assert "Pre-built 2 SIF file(s) for 1 Harbor task(s)." in result.stdout
 
