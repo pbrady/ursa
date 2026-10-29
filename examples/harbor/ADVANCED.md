@@ -84,27 +84,28 @@ For a direct run, add:
 
 ### Fakeroot
 
-The `singularity_fakeroot` environment kwarg controls whether containers run
-with `--fakeroot`, which makes the invoking user root inside the container so
-the adapter can switch to the container user that Harbor requests:
+Most tasks need root inside the container at run time, for example to
+`apt-get install` packages in a verifier script. The adapter therefore runs
+containers with `--fakeroot`, which makes the invoking user root inside the
+container and lets the adapter switch to the container user that Harbor
+requests. The `singularity_fakeroot` environment kwarg controls this:
 
-- `auto` (default): before the first container command, the adapter checks
+- `true` (default): before the first container command, the adapter checks
   that `<runtime> exec --fakeroot <image> true` succeeds. If it fails, for
-  example because the user has no `/etc/subuid` entry, the adapter logs one
-  warning with the runtime's error and continues without fakeroot. The result
-  is reused for later environments in the same process, so the warning
-  appears once. A check that fails for another reason, such as an image pull
-  error, fails the trial instead of disabling fakeroot.
-- `true` (or `1`): fakeroot is required. If the check fails, the trial fails
-  before the container starts, with the runtime's error.
-- `false` (or `0`): never use fakeroot and skip the check.
+  example because the user has no `/etc/subuid` entry, the trial fails with
+  the runtime's error. The result is reused by later environments in the same
+  process, such as a separate verifier, which then fail before building or
+  pulling an image. A check that fails for another reason, such as an image
+  pull error, reports that error instead.
+- `false` (or `0`): never use fakeroot and skip the check. Commands run as the
+  invoking host user even when the task requests `root` or another container
+  user, so root-owned files in the image stay read-only and tasks that install
+  system packages fail. The adapter logs one warning per process.
 
-Without fakeroot, commands run as the invoking host user even when the task
-requests `root` or another container user. With `false`, the adapter logs a
-warning the first time this happens. To require fakeroot:
+To run tasks that do not need container root on a host without fakeroot:
 
 ```bash
---ek singularity_fakeroot=true
+--ek singularity_fakeroot=false
 ```
 
 ### Multi-container tasks

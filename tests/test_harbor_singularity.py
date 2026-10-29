@@ -655,10 +655,10 @@ def _write_fake_runtime(
     environment._sif_path = tmp_path / "image.sif"
 
 
-def test_fakeroot_defaults_to_auto():
+def test_fakeroot_is_required_by_default():
     signature = inspect.signature(DockerfileSingularityEnvironment.__init__)
 
-    assert signature.parameters["singularity_fakeroot"].default == "auto"
+    assert signature.parameters["singularity_fakeroot"].default is True
 
 
 @pytest.mark.parametrize(
@@ -666,9 +666,8 @@ def test_fakeroot_defaults_to_auto():
     [
         (True, True),
         (False, False),
-        ("auto", "auto"),
-        (" Auto ", "auto"),
         ("true", True),
+        (" True ", True),
         ("false", False),
         ("1", True),
         ("no", False),
@@ -677,9 +676,9 @@ def test_fakeroot_defaults_to_auto():
     ],
 )
 def test_fakeroot_setting_accepts_cli_values(
-    value: bool | int | str, expected: bool | str
+    value: bool | int | str, expected: bool
 ):
-    assert DockerfileSingularityEnvironment._parse_fakeroot(value) == expected
+    assert DockerfileSingularityEnvironment._parse_fakeroot(value) is expected
 
 
 def test_fakeroot_setting_accepts_harbor_cli_ints():
@@ -691,132 +690,18 @@ def test_fakeroot_setting_accepts_harbor_cli_ints():
     assert not DockerfileSingularityEnvironment._parse_fakeroot(parsed["other"])
 
 
-@pytest.mark.parametrize("value", ["sometimes", 2, -1, None])
+@pytest.mark.parametrize("value", ["auto", "sometimes", 2, -1, None])
 def test_fakeroot_setting_rejects_unknown_values(value: object):
     with pytest.raises(ValueError, match="singularity_fakeroot"):
         DockerfileSingularityEnvironment._parse_fakeroot(value)
 
 
-async def test_auto_fakeroot_falls_back_with_warning_when_unavailable(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-):
-    environment = _environment(tmp_path, fakeroot="auto")
-    _write_fake_runtime(
-        environment,
-        tmp_path,
-        f'echo "{FAKEROOT_FATAL}" >&2; exit 255',
-    )
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    environment._staging_dir = staging
-
-    with caplog.at_level("WARNING"):
-        await environment._resolve_fakeroot()
-
-    assert not environment._fakeroot
-    warnings = [
-        record.getMessage()
-        for record in caplog.records
-        if record.levelname == "WARNING"
-    ]
-    assert len(warnings) == 1
-    assert "fakeroot is unavailable" in warnings[0]
-    assert FAKEROOT_FATAL in warnings[0]
-    assert "--fakeroot" not in environment._instance_start_command()
-    environment._cleanup_staging()
-
-
-async def test_auto_fakeroot_reraises_unrelated_probe_failures(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-):
-    environment = _environment(tmp_path, fakeroot="auto")
-    _write_fake_runtime(
-        environment,
-        tmp_path,
-        'echo "FATAL:   Unable to handle docker://example/image: '
-        'registry unavailable" >&2; exit 255',
-    )
-
-    with (
-        caplog.at_level("WARNING"),
-        pytest.raises(RuntimeError, match="registry unavailable"),
-    ):
-        await environment._resolve_fakeroot()
-
-    assert not any("fakeroot" in r.getMessage() for r in caplog.records)
-    assert (
-        environment._instance_runtime()
-        not in environment._fakeroot_unavailable_reasons
-    )
-    environment._cleanup_runtime_workdir()
-
-
-async def test_auto_fakeroot_fallback_warns_once_per_runtime(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+async def test_fakeroot_reports_cause_when_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(
         DockerfileSingularityEnvironment, "_fakeroot_unavailable_reasons", {}
     )
-    probes: list[str] = []
-
-    async def probe() -> str:
-        probes.append("probe")
-        return FAKEROOT_FATAL
-
-    for name in ("agent", "verifier"):
-        (tmp_path / name).mkdir()
-    environments = [
-        _environment(tmp_path / name, fakeroot="auto")
-        for name in ("agent", "verifier")
-    ]
-    with caplog.at_level("DEBUG"):
-        for environment in environments:
-            monkeypatch.setattr(
-                environment, "_runtime_path", "/fake/singularity"
-            )
-            monkeypatch.setattr(environment, "_fakeroot_probe_error", probe)
-            await environment._resolve_fakeroot()
-            environment._exec_shell_command("true", None, "root", "/tmp/pid")
-
-    assert probes == ["probe"]
-    assert all(not environment._fakeroot for environment in environments)
-    warnings = [
-        record.getMessage()
-        for record in caplog.records
-        if record.levelname == "WARNING"
-    ]
-    assert len(warnings) == 1
-    assert "fakeroot is unavailable" in warnings[0]
-
-
-async def test_auto_fakeroot_is_enabled_when_probe_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    environment = _environment(tmp_path, fakeroot="auto")
-    environment._prepare_runtime_workdir()
-    environment._sif_path = tmp_path / "image.sif"
-    probes: list[tuple[str, ...]] = []
-
-    async def run(*command: str, **_kwargs: object) -> None:
-        probes.append(command)
-
-    monkeypatch.setattr(environment, "_run", run)
-    assert not environment._fakeroot
-
-    await environment._resolve_fakeroot()
-
-    assert environment._fakeroot
-    assert len(probes) == 1
-    assert "--fakeroot" in probes[0]
-    assert probes[0][-2:] == (str(tmp_path / "image.sif"), "true")
-    environment._cleanup_runtime_workdir()
-
-
-async def test_required_fakeroot_reports_cause_when_unavailable(
-    tmp_path: Path,
-):
     environment = _environment(tmp_path, fakeroot=True)
     _write_fake_runtime(
         environment,
@@ -830,31 +715,161 @@ async def test_required_fakeroot_reports_cause_when_unavailable(
     message = str(raised.value)
     assert "singularity_fakeroot=true" in message
     assert FAKEROOT_FATAL in message
-    assert "singularity_fakeroot=auto" in message
+    assert "singularity_fakeroot=false" in message
+    assert "auto" not in message
     assert "Command failed" not in message
     assert not environment._fakeroot
+    assert environment._fakeroot_unavailable_reasons == {
+        environment._instance_runtime(): FAKEROOT_FATAL
+    }
     environment._cleanup_runtime_workdir()
 
 
-async def test_disabled_fakeroot_skips_probe(
+async def test_fakeroot_reraises_unrelated_probe_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_fakeroot_unavailable_reasons", {}
+    )
+    environment = _environment(tmp_path, fakeroot=True)
+    _write_fake_runtime(
+        environment,
+        tmp_path,
+        'echo "FATAL:   Unable to handle docker://example/image: '
+        'registry unavailable" >&2; exit 255',
+    )
+
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(RuntimeError, match="registry unavailable") as raised,
+    ):
+        await environment._resolve_fakeroot()
+
+    assert "singularity_fakeroot" not in str(raised.value)
+    assert not any("fakeroot" in r.getMessage() for r in caplog.records)
+    assert not environment._fakeroot_unavailable_reasons
+    environment._cleanup_runtime_workdir()
+
+
+async def test_fakeroot_failure_is_cached_per_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    environment = _environment(tmp_path, fakeroot="false")
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_fakeroot_unavailable_reasons", {}
+    )
+    probes: list[str] = []
+
+    async def probe() -> str:
+        probes.append("probe")
+        return FAKEROOT_FATAL
+
+    for name in ("agent", "verifier"):
+        (tmp_path / name).mkdir()
+    environments = [
+        _environment(tmp_path / name, fakeroot=True)
+        for name in ("agent", "verifier")
+    ]
+    for environment in environments:
+        monkeypatch.setattr(environment, "_runtime_path", "/fake/singularity")
+        monkeypatch.setattr(environment, "_fakeroot_probe_error", probe)
+        with pytest.raises(RuntimeError, match="no mapping entry"):
+            await environment._resolve_fakeroot()
+
+    assert probes == ["probe"]
+    assert all(not environment._fakeroot for environment in environments)
+
+
+async def test_start_fails_before_building_when_fakeroot_is_known_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path, fakeroot=True)
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment,
+        "_fakeroot_unavailable_reasons",
+        {environment._instance_runtime(): FAKEROOT_FATAL},
+    )
+
+    async def unexpected(*_args: object, **_kwargs: object) -> Path:
+        pytest.fail("the image must not be built without usable fakeroot")
+
+    monkeypatch.setattr(environment, "_build_main_sif", unexpected)
+
+    with pytest.raises(RuntimeError, match="no mapping entry"):
+        await environment.start(force_build=False)
+
+    assert environment._runtime_workdir_root is None
+
+
+async def test_fakeroot_is_enabled_when_probe_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_fakeroot_unavailable_reasons", {}
+    )
+    environment = _environment(tmp_path, fakeroot=True)
+    environment._prepare_runtime_workdir()
+    environment._sif_path = tmp_path / "image.sif"
+    probes: list[tuple[str, ...]] = []
+
+    async def run(*command: str, **_kwargs: object) -> None:
+        probes.append(command)
+
+    monkeypatch.setattr(environment, "_run", run)
+
+    await environment._resolve_fakeroot()
+
+    assert environment._fakeroot
+    assert len(probes) == 1
+    assert "--fakeroot" in probes[0]
+    assert probes[0][-2:] == (str(tmp_path / "image.sif"), "true")
+    environment._cleanup_runtime_workdir()
+
+
+async def test_disabled_fakeroot_skips_probe_and_warns_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_fakeroot_disabled_warned", False
+    )
 
     async def unexpected(*_command: str, **_kwargs: object) -> None:
         pytest.fail("fakeroot probe should not run when disabled")
 
-    monkeypatch.setattr(environment, "_run", unexpected)
+    for name in ("agent", "verifier"):
+        (tmp_path / name).mkdir()
+    environments = [
+        _environment(tmp_path / name, fakeroot="false")
+        for name in ("agent", "verifier")
+    ]
+    with caplog.at_level("DEBUG"):
+        for environment in environments:
+            monkeypatch.setattr(environment, "_run", unexpected)
+            await environment._resolve_fakeroot()
+            environment._exec_shell_command("true", None, "root", "/tmp/pid")
 
-    await environment._resolve_fakeroot()
-
-    assert not environment._fakeroot
+    assert all(not environment._fakeroot for environment in environments)
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "singularity_fakeroot=false" in warnings[0]
+    assert "read-only" in warnings[0]
 
 
 async def test_start_resolves_fakeroot_before_seed_and_compose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    environment = _environment(tmp_path, compose=True, fakeroot="auto")
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_fakeroot_unavailable_reasons", {}
+    )
+    environment = _environment(tmp_path, compose=True, fakeroot=True)
+    environment._fakeroot = False
     observed: list[object] = []
 
     async def build(_force_build: bool) -> Path:
@@ -863,9 +878,8 @@ async def test_start_resolves_fakeroot_before_seed_and_compose(
     async def mark(_path: Path) -> None:
         pass
 
-    async def probe() -> str:
+    async def probe() -> None:
         observed.append("probe")
-        return FAKEROOT_FATAL
 
     async def seed() -> None:
         observed.append(("seed", environment._fakeroot))
@@ -889,7 +903,7 @@ async def test_start_resolves_fakeroot_before_seed_and_compose(
     with pytest.raises(RuntimeError, match="stop after compose preparation"):
         await environment.start(force_build=False)
 
-    assert observed == ["probe", ("seed", False), ("compose", False)]
+    assert observed == ["probe", ("seed", True), ("compose", True)]
 
 
 async def test_compose_services_get_distinct_host_workdirs(tmp_path: Path):
