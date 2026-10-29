@@ -10,6 +10,7 @@ import yaml
 
 pytest.importorskip("harbor")
 
+from harbor.cli.utils import parse_kwargs  # noqa: E402
 from harbor.models.task.config import (  # noqa: E402
     EnvironmentConfig,
     NetworkMode,
@@ -671,15 +672,26 @@ def test_fakeroot_defaults_to_auto():
         ("false", False),
         ("1", True),
         ("no", False),
+        (1, True),
+        (0, False),
     ],
 )
 def test_fakeroot_setting_accepts_cli_values(
-    value: bool | str, expected: bool | str
+    value: bool | int | str, expected: bool | str
 ):
     assert DockerfileSingularityEnvironment._parse_fakeroot(value) == expected
 
 
-@pytest.mark.parametrize("value", ["sometimes", 1, None])
+def test_fakeroot_setting_accepts_harbor_cli_ints():
+    parsed = parse_kwargs(["singularity_fakeroot=1", "other=0"])
+
+    assert DockerfileSingularityEnvironment._parse_fakeroot(
+        parsed["singularity_fakeroot"]
+    )
+    assert not DockerfileSingularityEnvironment._parse_fakeroot(parsed["other"])
+
+
+@pytest.mark.parametrize("value", ["sometimes", 2, -1, None])
 def test_fakeroot_setting_rejects_unknown_values(value: object):
     with pytest.raises(ValueError, match="singularity_fakeroot"):
         DockerfileSingularityEnvironment._parse_fakeroot(value)
@@ -712,6 +724,71 @@ async def test_auto_fakeroot_falls_back_with_warning_when_unavailable(
     assert FAKEROOT_FATAL in warnings[0]
     assert "--fakeroot" not in environment._instance_start_command()
     environment._cleanup_staging()
+
+
+async def test_auto_fakeroot_reraises_unrelated_probe_failures(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    environment = _environment(tmp_path, fakeroot="auto")
+    _write_fake_runtime(
+        environment,
+        tmp_path,
+        'echo "FATAL:   Unable to handle docker://example/image: '
+        'registry unavailable" >&2; exit 255',
+    )
+
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(RuntimeError, match="registry unavailable"),
+    ):
+        await environment._resolve_fakeroot()
+
+    assert not any("fakeroot" in r.getMessage() for r in caplog.records)
+    assert (
+        environment._instance_runtime()
+        not in environment._fakeroot_unavailable_reasons
+    )
+    environment._cleanup_runtime_workdir()
+
+
+async def test_auto_fakeroot_fallback_warns_once_per_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_fakeroot_unavailable_reasons", {}
+    )
+    probes: list[str] = []
+
+    async def probe() -> str:
+        probes.append("probe")
+        return FAKEROOT_FATAL
+
+    for name in ("agent", "verifier"):
+        (tmp_path / name).mkdir()
+    environments = [
+        _environment(tmp_path / name, fakeroot="auto")
+        for name in ("agent", "verifier")
+    ]
+    with caplog.at_level("DEBUG"):
+        for environment in environments:
+            monkeypatch.setattr(
+                environment, "_runtime_path", "/fake/singularity"
+            )
+            monkeypatch.setattr(environment, "_fakeroot_probe_error", probe)
+            await environment._resolve_fakeroot()
+            environment._exec_shell_command("true", None, "root", "/tmp/pid")
+
+    assert probes == ["probe"]
+    assert all(not environment._fakeroot for environment in environments)
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "fakeroot is unavailable" in warnings[0]
 
 
 async def test_auto_fakeroot_is_enabled_when_probe_succeeds(

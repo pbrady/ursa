@@ -91,14 +91,17 @@ the adapter can switch to the container user that Harbor requests:
 - `auto` (default): before the first container command, the adapter checks
   that `<runtime> exec --fakeroot <image> true` succeeds. If it fails, for
   example because the user has no `/etc/subuid` entry, the adapter logs one
-  warning with the runtime's error and continues without fakeroot.
-- `true`: fakeroot is required. If the check fails, the trial fails before
-  the container starts, with the runtime's error.
-- `false`: never use fakeroot and skip the check.
+  warning with the runtime's error and continues without fakeroot. The result
+  is reused for later environments in the same process, so the warning
+  appears once. A check that fails for another reason, such as an image pull
+  error, fails the trial instead of disabling fakeroot.
+- `true` (or `1`): fakeroot is required. If the check fails, the trial fails
+  before the container starts, with the runtime's error.
+- `false` (or `0`): never use fakeroot and skip the check.
 
 Without fakeroot, commands run as the invoking host user even when the task
-requests `root` or another container user, and the adapter logs a warning the
-first time this happens. To require fakeroot:
+requests `root` or another container user. With `false`, the adapter logs a
+warning the first time this happens. To require fakeroot:
 
 ```bash
 --ek singularity_fakeroot=true

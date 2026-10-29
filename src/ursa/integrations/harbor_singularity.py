@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import platform
@@ -22,7 +23,7 @@ from contextlib import suppress
 from copy import deepcopy
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Literal, override
+from typing import Any, BinaryIO, ClassVar, Literal, override
 
 import archspec.cpu
 import yaml
@@ -52,6 +53,18 @@ _COMPOSE_SERVICE_FIELDS = frozenset({
 })
 _COMPOSE_BUILD_FIELDS = frozenset({"args", "context", "dockerfile", "target"})
 _HOST_CA_CERTIFICATES_FILENAME = "host-ca-certificates.crt"
+# Runtime diagnostics that mean ``--fakeroot`` itself is unusable, as opposed
+# to an unrelated probe failure such as a pull error or a broken image.
+_FAKEROOT_FAILURE_MARKERS = (
+    "fakeroot",
+    "subuid",
+    "subgid",
+    "user namespace",
+    "uid map",
+    "gid map",
+    "newuidmap",
+    "newgidmap",
+)
 
 
 def _host_ca_certificates_pem() -> str:
@@ -681,6 +694,10 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
     """Run Dockerfile and supported Compose tasks with Singularity or Apptainer."""
 
     _compose_filename = "docker-compose.yaml"
+    # Fakeroot availability is a property of the host and runtime, so the
+    # first failed probe in a process is reused by later environments (for
+    # example a separate verifier) instead of probing and warning again.
+    _fakeroot_unavailable_reasons: ClassVar[dict[str, str]] = {}
 
     def __init__(
         self,
@@ -736,6 +753,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._instance_started = False
         self._instance_start_attempted = False
         self._warned_user_switch_without_fakeroot = False
+        self._fakeroot_fallback_explained = False
         self._compose_project_dir: Path | None = None
         self._compose_file: Path | None = None
         self._compose_instances: dict[str, list[str]] = {}
@@ -744,9 +762,12 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._sifs_in_use: set[Path] = set()
 
     @staticmethod
-    def _parse_fakeroot(value: bool | str) -> bool | Literal["auto"]:
+    def _parse_fakeroot(value: bool | int | str) -> bool | Literal["auto"]:
         if isinstance(value, bool):
             return value
+        # Harbor's CLI JSON-decodes ``--ek`` values, so ``=1`` arrives as int.
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
         if isinstance(value, str):
             normalized = value.strip().lower()
             if normalized == "auto":
@@ -1870,10 +1891,18 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             # Report the runtime's own diagnosis, e.g. SingularityCE's
             # "FATAL: could not use fakeroot: no mapping entry found in
             # /etc/subuid", rather than the whole command line.
-            return next(
+            reason = next(
                 (line for line in reversed(lines) if "FATAL" in line),
                 lines[-1] if lines else type(exc).__name__,
             )
+            lowered = reason.lower()
+            if not any(
+                marker in lowered for marker in _FAKEROOT_FAILURE_MARKERS
+            ):
+                # A pull, image, or I/O failure says nothing about fakeroot;
+                # fail the start rather than silently dropping container root.
+                raise
+            return reason
         return None
 
     async def _resolve_fakeroot(self) -> None:
@@ -1886,12 +1915,16 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         if self._fakeroot_setting is False:
             self._fakeroot = False
             return
-        reason = await self._fakeroot_probe_error()
+        runtime = self._instance_runtime()
+        cached = self._fakeroot_unavailable_reasons.get(runtime)
+        reason = cached or await self._fakeroot_probe_error()
         self._fakeroot = reason is None
         if reason is not None:
-            self._fakeroot_unavailable(reason)
+            first = runtime not in self._fakeroot_unavailable_reasons
+            self._fakeroot_unavailable_reasons.setdefault(runtime, reason)
+            self._fakeroot_unavailable(reason, warn=first)
 
-    def _fakeroot_unavailable(self, reason: str) -> None:
+    def _fakeroot_unavailable(self, reason: str, *, warn: bool = True) -> None:
         """Apply the policy for a host without usable fakeroot.
 
         ``true`` requires fakeroot and fails here; ``auto`` degrades to the
@@ -1907,7 +1940,10 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 "singularity_fakeroot=auto to continue without it, or false "
                 "to skip this check."
             )
-        self.logger.warning(
+        # The fallback warning already covers the user switch it disables.
+        self._fakeroot_fallback_explained = True
+        self.logger.log(
+            logging.WARNING if warn else logging.DEBUG,
             "Singularity fakeroot is unavailable, so commands will run as the "
             "invoking host user instead of container root: %s. Set "
             "singularity_fakeroot=false to skip this check, or true to "
@@ -2368,7 +2404,10 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             if requested_user is not None and not getattr(
                 self, "_warned_user_switch_without_fakeroot", False
             ):
-                self.logger.warning(
+                self.logger.log(
+                    logging.DEBUG
+                    if getattr(self, "_fakeroot_fallback_explained", False)
+                    else logging.WARNING,
                     "Singularity fakeroot is disabled; cannot switch to "
                     "requested container user %r, so commands will run as "
                     "the invoking host user",
