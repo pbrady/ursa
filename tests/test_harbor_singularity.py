@@ -432,6 +432,54 @@ async def test_build_surfaces_log_after_all_builders_fail(
     assert "builder failed" in captured.err
 
 
+async def test_build_failure_names_shared_log_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    output = tmp_path / "cached-image.sif"
+
+    async def cache_path(*_args: object, **_kwargs: object) -> Path:
+        return output
+
+    async def invalid(_path: Path) -> bool:
+        return False
+
+    async def fail_build(
+        builder: str,
+        _output: Path,
+        _temporary: Path,
+        _force_build: bool,
+        _dockerfile_path: Path,
+        _context_dir: Path,
+        _build_args: tuple[str, ...],
+        _target: str | None,
+        build_log_path: Path,
+    ) -> None:
+        log_note = environment._record_command_failure(
+            build_log_path, (builder, "build"), return_code=1
+        )
+        raise RuntimeError(f"{Path(builder).name} build failed{log_note}")
+
+    monkeypatch.setattr(environment, "_dockerfile_cache_path", cache_path)
+    monkeypatch.setattr(environment, "_is_valid_sif", invalid)
+    monkeypatch.setattr(environment, "_build_with", fail_build)
+    monkeypatch.setattr(
+        harbor_singularity.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name != "buildah" else None,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment._build_dockerfile_sif(False)
+
+    message = str(raised.value)
+    build_log = output.with_suffix(".build.log").absolute()
+    assert "podman build failed" in message
+    assert "docker build failed" in message
+    assert message.count(f"Build log: {build_log}") == 1
+    assert message.endswith(f"Build log: {build_log}")
+
+
 async def test_build_discards_failed_attempt_log_after_fallback_succeeds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1342,6 +1342,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             build_log_path = output.with_suffix(".build.log")
             build_log_path.unlink(missing_ok=True)
             failures = []
+            # Every attempt appends to the same log; name it once at the end.
+            attempt_log_note = f"\nBuild log: {build_log_path.absolute()}"
             for builder in builders:
                 try:
                     await self._build_with(
@@ -1358,7 +1360,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     build_log_path.unlink(missing_ok=True)
                     return output
                 except RuntimeError as exc:
-                    failures.append(str(exc))
+                    failures.append(str(exc).replace(attempt_log_note, ""))
             log_note = (
                 f" Build log: {build_log_path.absolute()}"
                 if build_log_path.is_file()
