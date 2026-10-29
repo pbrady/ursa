@@ -146,7 +146,9 @@ build to find out whether `RUN` steps work. On a host where Buildah does
 work, `singularity_builder=buildah` keeps Docker's own build semantics.
 Definition builds and OCI builds are cached under different keys, and the
 definition key includes the translator version, so changing the builder
-rebuilds once; under `auto` a cached SIF from either builder is reused.
+rebuilds once; under `auto` a cached SIF from either builder is reused. The
+cache is checked before any builder is looked up, so a SIF built on a login
+node also serves compute nodes that have no builder.
 
 The translation replays the Dockerfile from a generated script in `%post`,
 so `COPY` and `RUN` steps keep their order even though Apptainer copies
@@ -161,25 +163,35 @@ It supports:
   BuildKit's platform arguments such as `TARGETARCH`, and the predefined
   proxy arguments. Host `*_proxy` variables are passed to `RUN` when no
   proxy build argument is set, as Buildah does.
-- `ENV` in both forms; values that use variables set only by the base image,
-  such as `$PATH`, are evaluated during the build. The final values are
-  recorded in the image for run time.
+- `ENV` in both forms. As in Docker, variables expand against the base
+  image's environment, read from its config, so `$HOME` is empty unless the
+  image sets it, and an `ARG` without a value leaves the image's value of
+  that name. When the config cannot be read, such variables are evaluated
+  by the build shell instead. The final values are recorded in the image
+  for run time.
 - `FROM <image>[:tag|@digest] [AS <name>]` and a `--platform` that matches
   the host; `RUN` in shell form (through `SHELL`) and exec form; `WORKDIR`;
   and `USER` for later build steps. As in Docker, build steps start in the
   base image's `WORKDIR` and as its `USER`. Apptainer does not keep these,
   so the adapter reads the base image's config from its registry, without
   credentials; if it cannot, it warns and the steps start in `/` as root.
+  Such a build is cached under its own key, so it is reused only while the
+  config stays unreadable and is rebuilt once the registry answers.
   A stage with no build steps, such as one that only names an image for
   `COPY --from`, runs nothing in that image.
-- `COPY` and `ADD` from the build context, honoring `.dockerignore`, with
-  globs, several sources, Docker's trailing-slash rules for the
-  destination, `--chown`, and `--chmod`. `ADD` extracts local tar archives
-  (on the host, so the image needs no `bzip2` or `xz`) and downloads
-  `http` and `https` URLs.
+- `COPY` and `ADD` from the build context, honoring `.dockerignore` as
+  Docker matches it (patterns are anchored at the context root, so `*.json`
+  leaves `src/config.json` in; use `**/*.json`), with globs, several
+  sources, Docker's trailing-slash rules for the destination, `--chown`
+  (a user without a group also sets the group to the user's UID), and
+  `--chmod`. Context files belong to root unless `--chown` is given.
+  `ADD` extracts local tar archives (on the host, so the image needs no
+  `bzip2` or `xz`), keeping their members' owners and modes, setuid bits
+  included, and downloads `http` and `https` URLs.
 - Multi-stage builds: only the stages the target needs are built, and
   `COPY --from` takes files from an earlier stage, by name or index, or
-  from another image, such as `ghcr.io/astral-sh/uv`.
+  from another image, such as `ghcr.io/astral-sh/uv`. Without `--chown`
+  the files keep their owners from that stage, as with BuildKit.
 - `CMD`, `ENTRYPOINT`, `LABEL`, `EXPOSE`, `VOLUME`, `HEALTHCHECK`,
   `STOPSIGNAL`, and `ONBUILD` are ignored. Harbor runs its own commands, and
   the base image's own `ONBUILD` triggers do not run either.
@@ -414,11 +426,14 @@ Harbor's
 and Singularity's
 [networking guide](https://docs.sylabs.io/guides/3.6/user-guide/networking.html).
 
-Set `[environment].workdir` in `task.toml` when a Dockerfile computes
-`WORKDIR` from a variable that only its base image sets, or inherits a
-non-root workdir from its base image. Variables from the Dockerfile's own
-`ARG` and `ENV` lines and Compose build `args` are resolved, for the Compose
-build `target` when one is set. The task setting takes precedence over image
+Set `[environment].workdir` in `task.toml` when a Dockerfile inherits a
+non-root workdir from its base image without a `WORKDIR` of its own.
+Variables from the Dockerfile's own `ARG` and `ENV` lines and Compose build
+`args` are resolved, for the Compose build `target` when one is set. A
+relative first `WORKDIR`, or one that uses a variable only the base image
+sets, is resolved against the base image's config, read from its registry
+as for definition builds; when that config cannot be read, a relative
+`WORKDIR` starts in `/` with a warning. The task setting takes precedence over image
 metadata; the Singularity adapter rejects variable workdirs it cannot resolve
 before launch.
 

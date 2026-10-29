@@ -46,6 +46,7 @@ from ursa.integrations.harbor_dockerfile import (
     DOCKERFILE_TRANSLATOR_VERSION,
     Definition,
     DockerfileUnsupported,
+    DockerIgnore,
     dockerfile_workdir,
     image_config,
     translate_dockerfile,
@@ -1270,10 +1271,19 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             return "/"
         elif not dockerfile_path.is_file():
             return "/"
-        # Both builders apply the same WORKDIR rules as this resolution.
-        return dockerfile_workdir(
-            dockerfile_path.read_text(), build_args=build_args, target=target
+        # Every builder starts in the base image's WORKDIR, which matters
+        # for a relative WORKDIR and is looked up only then.
+        warnings: list[str] = []
+        workdir = dockerfile_workdir(
+            dockerfile_path.read_text(),
+            build_args=build_args,
+            target=target,
+            image_config=image_config,
+            warnings=warnings,
         )
+        for warning in warnings:
+            self.logger.warning("%s: %s", dockerfile_path, warning)
+        return workdir
 
     def _dockerfile_cache_path_sync(
         self,
@@ -1282,6 +1292,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         build_args: tuple[str, ...],
         target: str | None,
         builder: str | None = None,
+        unread_configs: tuple[str, ...] = (),
     ) -> Path:
         dockerfile_path = dockerfile_path.resolve()
         context_dir = context_dir.resolve()
@@ -1294,18 +1305,27 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         }
         # Definition builds are keyed apart from OCI builds, whose existing
         # keys stay valid, and by the translator so its fixes rebuild.
+        # A build without a base image's config is keyed apart, so it never
+        # stands in for one with it.
         if builder == "apptainer":
             key["builder"] = builder
             key["translator"] = DOCKERFILE_TRANSLATOR_VERSION
+            if unread_configs:
+                key["unread_configs"] = unread_configs
         digest.update(
             json.dumps(key, separators=(",", ":"), sort_keys=True).encode()
         )
         ignore_path = context_dir / ".dockerignore"
-        ignore = (
-            GitIgnoreSpec.from_lines(ignore_path.read_text().splitlines())
-            if ignore_path.is_file()
-            else None
-        )
+        # The translation copies exactly what Docker's matching keeps; OCI
+        # keys keep the gitignore matching they were made with.
+        ignored: Callable[[str], bool] | None = None
+        if ignore_path.is_file():
+            lines = ignore_path.read_text().splitlines()
+            ignored = (
+                DockerIgnore(lines).ignored
+                if builder == "apptainer"
+                else GitIgnoreSpec.from_lines(lines).match_file
+            )
         dockerfile_in_context = None
         with suppress(ValueError):
             dockerfile_in_context = dockerfile_path.relative_to(
@@ -1314,9 +1334,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         for path in sorted(context_dir.rglob("*")):
             relative = path.relative_to(context_dir).as_posix()
             if (
-                ignore is not None
+                ignored is not None
                 and relative not in {dockerfile_in_context, ".dockerignore"}
-                and ignore.match_file(relative)
+                and ignored(relative)
             ):
                 continue
             digest.update(relative.encode())
@@ -1339,6 +1359,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         build_args: tuple[str, ...] = (),
         target: str | None = None,
         builder: str | None = None,
+        unread_configs: tuple[str, ...] = (),
     ) -> Path:
         return await asyncio.to_thread(
             self._dockerfile_cache_path_sync,
@@ -1347,6 +1368,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             build_args,
             target,
             builder,
+            unread_configs,
         )
 
     @staticmethod
@@ -1888,30 +1910,25 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
     ) -> Path:
         dockerfile_path = dockerfile_path or self._dockerfile_path
         context_dir = context_dir or self.environment_dir
-        builders = self._dockerfile_builders()
-        oci_builders = [b for b in builders if b != "apptainer"]
-        # Definition and OCI builds are cached apart; either one is reused
-        # before anything is built.
-        groups: list[tuple[Path, list[str]]] = []
-        if "apptainer" in builders:
-            path = await self._dockerfile_cache_path(
-                dockerfile_path,
-                context_dir,
-                build_args,
-                target,
-                builder="apptainer",
+        inputs = (dockerfile_path, context_dir, build_args, target)
+        setting = self._builder_setting
+        # Definition and OCI builds are cached apart. Either one is reused
+        # before any builder is looked up, so a SIF built elsewhere, say on
+        # a login node, also serves a node without that builder.
+        apptainer_path = oci_path = None
+        if setting in {"auto", "apptainer"}:
+            apptainer_path = await self._dockerfile_cache_path(
+                *inputs, builder="apptainer"
             )
-            groups.append((path, ["apptainer"]))
-        if oci_builders:
-            path = await self._dockerfile_cache_path(
-                dockerfile_path, context_dir, build_args, target
-            )
-            groups.append((path, oci_builders))
+        if setting != "apptainer":
+            oci_path = await self._dockerfile_cache_path(*inputs)
         self._image_cache_dir.mkdir(parents=True, exist_ok=True)
         if not force_build:
-            for output, _ in groups:
-                if await self._is_valid_sif(output):
+            for output in (apptainer_path, oci_path):
+                if output is not None and await self._is_valid_sif(output):
                     return output
+        builders = self._dockerfile_builders()
+        oci_builders = [b for b in builders if b != "apptainer"]
         definition = None
         if "apptainer" in builders:
             # Translate first, so an unsupported Dockerfile fails or falls
@@ -1934,7 +1951,18 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     "Building with an OCI builder instead of Apptainer: %s",
                     exc,
                 )
-                groups = groups[1:]
+            else:
+                if definition.unread_configs:
+                    apptainer_path = await self._dockerfile_cache_path(
+                        *inputs,
+                        builder="apptainer",
+                        unread_configs=tuple(definition.unread_configs),
+                    )
+        groups: list[tuple[Path, list[str]]] = []
+        if definition is not None and apptainer_path is not None:
+            groups.append((apptainer_path, ["apptainer"]))
+        if oci_builders and oci_path is not None:
+            groups.append((oci_path, oci_builders))
         failures = []
         failed_logs: list[Path] = []
         for output, group in groups:

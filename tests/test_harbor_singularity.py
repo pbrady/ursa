@@ -912,6 +912,99 @@ async def test_auto_reuses_cached_oci_build(
     assert not _builds(calls)
 
 
+async def test_cached_sif_is_reused_without_its_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A SIF prebuilt on a login node serves a node with no builder at all.
+    environment = _environment(tmp_path)
+    _fake_apptainer(
+        environment,
+        tmp_path,
+        name="singularity",
+        version="singularity-ce version 3.6.2",
+    )
+    _oci_builders(monkeypatch)
+    cached = await environment._dockerfile_cache_path()
+    cached.parent.mkdir(parents=True)
+    cached.write_text("sif")
+
+    assert await environment._build_dockerfile_sif(False) == cached
+
+    # Apptainer with no OCI builder reuses an OCI build too ...
+    calls = _fake_apptainer(environment, tmp_path)
+    assert await environment._build_dockerfile_sif(False) == cached
+    assert not _builds(calls)
+
+    # ... and an explicit Apptainer builder its own build, even after the
+    # runtime failed for a host reason.
+    environment._builder_setting = "apptainer"
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment,
+        "_unusable_builders",
+        {environment._runtime_path: "FATAL:   no fakeroot"},
+    )
+    definition = await environment._dockerfile_cache_path(builder="apptainer")
+    definition.write_text("sif")
+    assert await environment._build_dockerfile_sif(False) == definition
+    assert not _builds(calls)
+
+
+async def test_build_without_base_config_is_cached_apart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    (environment.environment_dir / "Dockerfile").write_text(
+        "FROM swebench/sweb.eval:latest\nRUN git add -A\n"
+    )
+    calls = _fake_apptainer(environment, tmp_path)
+    _oci_builders(monkeypatch)
+    configs: list[dict[str, str] | None] = [None]
+    monkeypatch.setattr(
+        harbor_singularity, "image_config", lambda image, machine: configs[0]
+    )
+
+    degraded = await environment._build_dockerfile_sif(False)
+
+    assert degraded != await environment._dockerfile_cache_path(
+        builder="apptainer"
+    )
+    # The same failure reuses that build ...
+    assert await environment._build_dockerfile_sif(False) == degraded
+    assert len(_builds(calls)) == 1
+
+    # ... but once the config can be read, the build is redone with it.
+    configs[0] = {"WorkingDir": "/testbed"}
+    output = await environment._build_dockerfile_sif(False)
+
+    assert output == await environment._dockerfile_cache_path(
+        builder="apptainer"
+    )
+    assert len(_builds(calls)) == 2
+    script = (tmp_path / "last-staging" / "s0" / "build.sh").read_text()
+    assert "_ursa_workdir /testbed\n" in script
+
+
+async def test_definition_cache_key_uses_docker_ignore_matching(
+    tmp_path: Path,
+):
+    environment = _environment(tmp_path)
+    (environment.environment_dir / ".dockerignore").write_text("*.json\n")
+    nested = environment.environment_dir / "src" / "config.json"
+    nested.parent.mkdir()
+    nested.write_text("1")
+    oci = await environment._dockerfile_cache_path()
+    definition = await environment._dockerfile_cache_path(builder="apptainer")
+
+    nested.write_text("2")
+
+    # Docker copies src/config.json, so the definition build depends on it.
+    assert await environment._dockerfile_cache_path() == oci
+    assert (
+        await environment._dockerfile_cache_path(builder="apptainer")
+        != definition
+    )
+
+
 async def test_auto_builds_unsupported_dockerfile_with_oci_builder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1213,6 +1306,38 @@ def test_workdir_uses_compose_build_target_and_args(tmp_path: Path):
     )
 
     assert environment._workdir == "/from-compose"
+
+
+def test_relative_workdir_starts_in_base_image_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("FROM base\nWORKDIR sub\n")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    configs: list[dict[str, str] | None] = [{"WorkingDir": "/app"}]
+    monkeypatch.setattr(
+        harbor_singularity, "image_config", lambda image, machine: configs[0]
+    )
+
+    def workdir() -> str:
+        return DockerfileSingularityEnvironment(
+            environment_dir=environment_dir,
+            environment_name="unit-test",
+            session_id=f"{tmp_path.name}__env",
+            trial_paths=trial_paths,
+            task_env_config=EnvironmentConfig(),
+            network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+            persistent_env={},
+        )._workdir
+
+    assert workdir() == "/app/sub"
+    configs[0] = None
+    assert workdir() == "/sub"
+    assert "cannot read the config of base" in caplog.text
 
 
 @pytest.mark.parametrize("auto_mounting", [False, True])
