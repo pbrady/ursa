@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -124,6 +125,75 @@ def _runtime_is_apptainer(runtime: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return result.stdout.strip().lower().startswith("apptainer")
+
+
+_COMPOSE_BRIDGE_REQUIREMENT = (
+    "Multi-container tasks need a setuid Apptainer installation with "
+    "/etc/subuid and /etc/subgid entries for the invoking user, or root (or "
+    "Docker): an unprivileged Apptainer gives non-root users only "
+    "--network none."
+)
+
+
+@cache
+def _runtime_lacks_setuid_starter(runtime: str) -> bool:
+    """Whether ``runtime`` is certainly an unprivileged (non-setuid) install.
+
+    A setuid installation ships a root-owned setuid ``starter-suid`` next to
+    ``starter`` in ``$LIBEXECDIR/{apptainer,singularity}/bin``; SingularityCE
+    3.6 and Apptainer 1.x both report ``LIBEXECDIR`` from ``buildcfg``.
+    Without that starter, Apptainer runs in a user namespace and gives non-root
+    users only ``--network none``. The answer is ``True`` only when a
+    ``starter`` is found without a setuid ``starter-suid`` beside it, so an
+    unexpected layout or a failing ``buildcfg`` never rejects a setuid
+    installation.
+    """
+    libexec_dirs = []
+    try:
+        result = subprocess.run(
+            [runtime, "buildcfg"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is not None and not result.returncode:
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "LIBEXECDIR" and value.strip():
+                libexec_dirs.append(Path(value.strip()))
+    # Relocated unprivileged installs keep libexec beside bin.
+    try:
+        libexec_dirs.append(Path(runtime).resolve().parent.parent / "libexec")
+    except OSError:
+        pass
+    found_starter = False
+    for libexec in libexec_dirs:
+        for name in ("apptainer", "singularity"):
+            bin_dir = libexec / name / "bin"
+            try:
+                starter_suid = (bin_dir / "starter-suid").stat()
+            except OSError:
+                pass
+            else:
+                if starter_suid.st_uid == 0 and (
+                    starter_suid.st_mode & stat.S_ISUID
+                ):
+                    return False
+            found_starter = found_starter or (bin_dir / "starter").is_file()
+    return found_starter
+
+
+def _compose_uses_host_network(config: Mapping[str, Any]) -> bool:
+    """Whether a Compose project is a lone ``main`` that skips the bridge."""
+    services = config["services"]
+    return (
+        list(services) == ["main"]
+        and not services["main"].get("ports")
+        and services["main"].get("deploy", {}).get("replicas", 1) == 1
+    )
 
 
 def _host_ca_certificates_pem() -> str:
@@ -848,11 +918,7 @@ async def docker_compose_to_singularity_compose(
     }
     # A lone main service needs no bridge: host networking matches the
     # non-Compose path and avoids fakeroot CNI, which many hosts lack.
-    host_network = (
-        list(config["services"]) == ["main"]
-        and not config["services"]["main"].get("ports")
-        and replicas_by_service["main"] == 1
-    )
+    host_network = _compose_uses_host_network(config)
     instance_keys = {
         name: (
             [service_keys[name]]
@@ -1567,7 +1633,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         failure_log_path: Path | None = None,
-    ) -> None:
+    ) -> str:
+        """Run a host command; return its stdout and stderr unless logged."""
         captured = (
             tempfile.NamedTemporaryFile(
                 mode="w+b",
@@ -1644,6 +1711,12 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     f"Command failed ({shlex.join(command)}) with exit code "
                     f"{process.returncode}:{detail}{log_note}"
                 )
+            if captured is not None:
+                return ""
+            stdout, stderr = result
+            return stdout.decode(errors="replace") + stderr.decode(
+                errors="replace"
+            )
         finally:
             if captured is not None:
                 captured.close()
@@ -2292,7 +2365,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 network.pop("type", None)
         self._compose_file.write_text(yaml.safe_dump(compose, sort_keys=False))
 
-    async def _run_compose(self, *arguments: str) -> None:
+    async def _run_compose(self, *arguments: str) -> str:
         if self._compose_file is None or self._compose_project_dir is None:
             raise RuntimeError("Singularity Compose project is not prepared")
         executable = shutil.which("singularity-compose")
@@ -2310,7 +2383,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         environment["PATH"] = os.pathsep.join(
             part for part in (str(runtime_bin), environment.get("PATH")) if part
         )
-        await self._run(
+        return await self._run(
             executable,
             "--file",
             str(self._compose_file),
@@ -2320,6 +2393,74 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             cwd=self._compose_project_dir,
             env=environment,
         )
+
+    async def _verify_compose_instances(self, compose_output: str) -> None:
+        """Fail when ``singularity-compose up`` left an instance unstarted.
+
+        singularity-compose 0.1.19 reports a failed ``instance start`` as an
+        ERROR line and still exits 0, so the first exec would otherwise fail
+        with "no instance found".
+        """
+        expected = [
+            instance
+            for instances in self._compose_instances.values()
+            for instance in instances
+        ]
+        if not expected:
+            return
+        running = await self._list_instances()
+        missing = [instance for instance in expected if instance not in running]
+        if not missing:
+            return
+        output = compose_output.strip()
+        fatal = [
+            line.strip() for line in output.splitlines() if "FATAL" in line
+        ]
+        message = (
+            "singularity-compose up exited successfully but did not start "
+            f"instance(s): {', '.join(missing)}"
+        )
+        if fatal:
+            message += "\n" + "\n".join(fatal)
+        if "--network=none" in output or "network requires root" in output:
+            message += f"\n{_COMPOSE_BRIDGE_REQUIREMENT}"
+        message += "\nsingularity-compose output:\n" + (output or "<no output>")
+        raise RuntimeError(message)
+
+    def _compose_needs_bridge(self) -> bool:
+        """Whether this Compose project starts instances on a bridge."""
+        if _compose_uses_host_network(self._load_compose_config()):
+            return False
+        return any(
+            policy.network_mode != NetworkMode.NO_NETWORK
+            for policy in (self._network_policy, *self._phase_network_policies)
+        )
+
+    def _raise_if_compose_bridge_unavailable(self) -> None:
+        """Fail before building when the runtime offers only --network none.
+
+        Detection is conservative: root, singularity-compose's sudo mode, and
+        any installation with a setuid starter are never rejected here; an
+        undetected failure is still caught after ``up``.
+        """
+        if not self._uses_compose or os.geteuid() == 0:
+            return
+        config = self._load_compose_config()
+        if not self._fakeroot_setting and any(
+            service.get("ports") for service in config["services"].values()
+        ):
+            # singularity-compose then starts instances with sudo.
+            return
+        if not self._compose_needs_bridge():
+            return
+        runtime = self._instance_runtime()
+        if _runtime_lacks_setuid_starter(runtime):
+            raise RuntimeError(
+                "This task's Compose project needs bridge networking for its "
+                f"sidecars or published ports, but {runtime} is an "
+                "unprivileged installation without a setuid starter. "
+                f"{_COMPOSE_BRIDGE_REQUIREMENT}"
+            )
 
     def _add_compose_service_aliases(self) -> None:
         if self._compose_project_dir is None:
@@ -2914,7 +3055,11 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     # Compose.
                     compose_arguments.append("--no-resolv")
                 self._instance_start_attempted = True
-                await self._run_compose(*compose_arguments)
+                compose_output = await self._run_compose(*compose_arguments)
+            if not self._compose_uses_sudo:
+                # Instances started through sudo belong to root and are not
+                # listed for the invoking user.
+                await self._verify_compose_instances(compose_output or "")
             if (
                 network_policy.network_mode != NetworkMode.NO_NETWORK
                 and not self._compose_host_network
@@ -3017,6 +3162,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             raise RuntimeError("Singularity is unavailable on Windows")
         try:
             self._raise_if_fakeroot_known_unavailable()
+            self._raise_if_compose_bridge_unavailable()
             self._sif_path = await self._build_main_sif(force_build)
             await self._mark_sif_in_use(self._sif_path)
             self._prepare_runtime_workdir()

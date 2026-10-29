@@ -3248,3 +3248,316 @@ def test_instance_list_parser_returns_instance_names():
     assert DockerfileSingularityEnvironment._parse_instance_list(output) == {
         "first"
     }
+
+
+NETWORK_FATAL = (
+    "FATAL:   container creation failed: network requires root or a suid "
+    "installation with /etc/subuid --fakeroot; non-root users can only use "
+    "--network=none unless permitted by the administrator"
+)
+
+
+def _compose_up_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, running: list[str]
+) -> DockerfileSingularityEnvironment:
+    """Prepare a sidecar project whose singularity-compose hides a FATAL."""
+    environment = _environment(tmp_path, compose=True)
+    _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
+    environment._instance_start_attempted = False
+    project = tmp_path / "project"
+    (project / "bin").mkdir(parents=True)
+    environment._compose_project_dir = project
+    environment._compose_file = project / "singularity-compose.yml"
+    environment._compose_file.write_text(
+        yaml.safe_dump({
+            "instances": {
+                "unitmain": {"network": {}},
+                "unithelper": {"network": {}},
+            }
+        })
+    )
+    environment._compose_instances = {
+        "main": ["unitmain1"],
+        "helper": ["unithelper1"],
+    }
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    # singularity-compose 0.1.19 logs the failed instance start and exits 0.
+    compose = tools / "singularity-compose"
+    compose.write_text(
+        "#!/bin/sh\n"
+        f"echo '{NETWORK_FATAL}' >&2\n"
+        'echo \'ERROR ["singularity", "instance", "start"] '
+        "return code 255'\n"
+        "exit 0\n"
+    )
+    compose.chmod(0o755)
+    listed = ", ".join(f'{{"instance": "{name}"}}' for name in running)
+    runtime = tmp_path / "fake-singularity"
+    runtime.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "instance list" ]; then\n'
+        f"  echo '{{\"instances\": [{listed}]}}'\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    runtime.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{Path(sys.executable).parent}")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        environment, "_add_compose_service_aliases", lambda: None
+    )
+    return environment
+
+
+async def test_compose_up_that_exits_zero_without_instances_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _compose_up_environment(
+        tmp_path, monkeypatch, running=["unitmain1"]
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment._start_prepared_runtime(
+            NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+        )
+
+    message = str(raised.value)
+    assert "did not start instance(s): unithelper1" in message
+    assert "unitmain1" not in message.split("\n")[0]
+    assert NETWORK_FATAL in message
+    assert "return code 255" in message
+    assert "setuid Apptainer" in message
+    assert "/etc/subuid" in message
+    assert not environment._instance_started
+    assert environment._instance_start_attempted
+    environment._cleanup_staging()
+
+
+async def test_compose_up_checks_every_instance_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _compose_up_environment(
+        tmp_path, monkeypatch, running=["unitmain1", "unithelper1", "other"]
+    )
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    assert environment._instance_started
+    environment._cleanup_staging()
+
+
+async def test_compose_up_through_sudo_skips_the_user_instance_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _compose_up_environment(tmp_path, monkeypatch, running=[])
+    environment._compose_uses_sudo = True
+
+    async def unexpected_list() -> set[str]:
+        pytest.fail("root's instances are not listed for the invoking user")
+
+    monkeypatch.setattr(environment, "_list_instances", unexpected_list)
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    assert environment._instance_started
+    environment._cleanup_staging()
+
+
+async def test_run_returns_successful_output(tmp_path: Path):
+    environment = _environment(tmp_path)
+
+    output = await environment._run(
+        sys.executable,
+        "-c",
+        "import sys; print('out'); print('err', file=sys.stderr)",
+    )
+
+    assert output == "out\nerr\n"
+
+
+def _fake_install(
+    tmp_path: Path, *, buildcfg: bool = True, starter: bool = True
+) -> str:
+    libexec = tmp_path / "install" / "libexec"
+    if starter:
+        (libexec / "apptainer" / "bin").mkdir(parents=True)
+        (libexec / "apptainer" / "bin" / "starter").write_text("")
+    runtime = tmp_path / "install" / "bin" / "apptainer"
+    runtime.parent.mkdir(parents=True)
+    script = "exit 1"
+    if buildcfg:
+        script = (
+            'if [ "$1" = buildcfg ]; then\n'
+            "  echo PREFIX=/usr\n"
+            f"  echo LIBEXECDIR={libexec}\n"
+            "fi"
+        )
+    runtime.write_text(f"#!/bin/sh\n{script}\n")
+    runtime.chmod(0o755)
+    harbor_singularity._runtime_lacks_setuid_starter.cache_clear()
+    return str(runtime)
+
+
+def test_unprivileged_runtime_is_detected_from_buildcfg(tmp_path: Path):
+    runtime = _fake_install(tmp_path)
+
+    assert harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+def test_relocated_unprivileged_runtime_is_detected_beside_its_binary(
+    tmp_path: Path,
+):
+    runtime = _fake_install(tmp_path, buildcfg=False)
+
+    assert harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+def test_runtime_without_a_known_layout_is_not_called_unprivileged(
+    tmp_path: Path,
+):
+    runtime = _fake_install(tmp_path, buildcfg=False, starter=False)
+
+    assert not harbor_singularity._runtime_lacks_setuid_starter(runtime)
+    assert not harbor_singularity._runtime_lacks_setuid_starter(
+        str(tmp_path / "missing" / "apptainer")
+    )
+
+
+@pytest.mark.parametrize("name", ["apptainer", "singularity"])
+def test_setuid_starter_marks_the_runtime_privileged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+):
+    runtime = _fake_install(tmp_path)
+    bin_dir = tmp_path / "install" / "libexec" / name / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "starter").write_text("")
+    starter_suid = bin_dir / "starter-suid"
+    starter_suid.write_text("")
+    real_stat = Path.stat
+
+    class RootSetuid:
+        st_uid = 0
+        st_mode = 0o104755
+
+    def fake_stat(path: Path, **kwargs: object):
+        if path == starter_suid:
+            return RootSetuid()
+        return real_stat(path, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+    assert not harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+def test_user_owned_starter_suid_is_not_setuid(tmp_path: Path):
+    runtime = _fake_install(tmp_path)
+    starter_suid = (
+        tmp_path / "install" / "libexec" / "apptainer" / "bin" / "starter-suid"
+    )
+    starter_suid.write_text("")
+    starter_suid.chmod(0o4755)
+
+    assert harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+async def test_start_fails_before_building_without_bridge_networking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path, compose=True)
+    checked: list[str] = []
+
+    def unprivileged(runtime: str) -> bool:
+        checked.append(runtime)
+        return True
+
+    async def unexpected(*_args: object, **_kwargs: object) -> Path:
+        pytest.fail("the image must not be built without bridge networking")
+
+    monkeypatch.setattr(harbor_singularity.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        harbor_singularity, "_runtime_lacks_setuid_starter", unprivileged
+    )
+    monkeypatch.setattr(environment, "_build_main_sif", unexpected)
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment.start(force_build=False)
+
+    message = str(raised.value)
+    assert "bridge networking" in message
+    assert "setuid Apptainer" in message
+    assert "/etc/subuid" in message
+    assert "root" in message
+    assert "Docker" in message
+    assert checked == [environment._instance_runtime()]
+    assert environment._runtime_workdir_root is None
+
+
+@pytest.mark.parametrize(
+    ("compose", "euid", "unprivileged", "network_mode", "fakeroot"),
+    [
+        # Root and setuid installations are never rejected.
+        ("sidecar", 0, True, NetworkMode.PUBLIC, True),
+        ("sidecar", 1000, False, NetworkMode.PUBLIC, True),
+        # A lone main uses host networking; no-network uses --network none.
+        ("main", 1000, True, NetworkMode.PUBLIC, True),
+        ("ports-main", 1000, True, NetworkMode.NO_NETWORK, True),
+        # Published ports without fakeroot make singularity-compose use sudo.
+        ("ports-main", 1000, True, NetworkMode.PUBLIC, False),
+    ],
+)
+def test_bridge_check_allows_projects_that_can_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compose: str,
+    euid: int,
+    unprivileged: bool,
+    network_mode: NetworkMode,
+    fakeroot: bool,
+):
+    environment = _environment(
+        tmp_path, network_mode=network_mode, fakeroot=fakeroot
+    )
+    services = {
+        "sidecar": "  main: {}\n  helper:\n    image: redis:7\n",
+        "main": "  main: {}\n",
+        "ports-main": "  main:\n    ports:\n      - '8080:80'\n",
+    }[compose]
+    (environment.environment_dir / "docker-compose.yaml").write_text(
+        f"services:\n{services}"
+    )
+    monkeypatch.setattr(harbor_singularity.os, "geteuid", lambda: euid)
+    monkeypatch.setattr(
+        harbor_singularity,
+        "_runtime_lacks_setuid_starter",
+        lambda _runtime: unprivileged,
+    )
+
+    environment._raise_if_compose_bridge_unavailable()
+
+
+def test_bridge_check_covers_public_phases_and_published_ports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(
+        tmp_path,
+        network_mode=NetworkMode.NO_NETWORK,
+        phase_network_modes=(NetworkMode.PUBLIC,),
+        overlay=True,
+        fakeroot=True,
+    )
+    (environment.environment_dir / "docker-compose.yaml").write_text(
+        "services:\n  main:\n    ports:\n      - '8080:80'\n"
+    )
+    monkeypatch.setattr(harbor_singularity.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        harbor_singularity, "_runtime_lacks_setuid_starter", lambda _r: True
+    )
+
+    with pytest.raises(RuntimeError, match="setuid Apptainer"):
+        environment._raise_if_compose_bridge_unavailable()

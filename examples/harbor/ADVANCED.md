@@ -285,9 +285,14 @@ An unprivileged (user-space) Apptainer installation has extra requirements:
   `fakeroot` command when it is installed. Only root is mapped, so tasks that
   ask for a non-root container user fail to switch to it, and package
   managers can fail to drop privileges; check an `apt-get install` early.
-- Bridge networking is unavailable, so Compose projects with sidecars or
-  published ports cannot start. Main-only Compose projects, such as SciCode,
-  and `no-network` phases still work.
+- Non-root users get only `--network none`, so Compose projects with sidecars
+  or published ports cannot start: Apptainer refuses `--net` with "network
+  requires root or a suid installation with /etc/subuid --fakeroot".
+  Multi-container tasks need a setuid Apptainer with `/etc/subuid` and
+  `/etc/subgid` entries, or root (or Docker). The trial fails before any image
+  is built when the runtime has no setuid `starter-suid` (see
+  [Multi-container tasks](#multi-container-tasks)). Main-only Compose
+  projects, such as SciCode, and `no-network` phases still work.
 
 ### Multi-container tasks
 
@@ -381,8 +386,28 @@ system-wide `singularity` alias. The `ursa-ai[harbor]` extra installs
 `singularity-compose`. A project whose only service is `main`, without
 published ports, uses host networking as a task without Compose does, including
 the host's `/etc/hosts` and `/etc/resolv.conf` instead of the files
-`singularity-compose` generates for its bridge. Projects with sidecars or ports need bridge networking, which requires the host runtime
-to provide fakeroot CNI networking.
+`singularity-compose` generates for its bridge. Projects with sidecars or
+ports need bridge networking, which requires root or a setuid Apptainer
+installation whose fakeroot CNI networking works for the invoking user, that
+is, one with `/etc/subuid` and `/etc/subgid` entries.
+
+Before building any image for such a project, a non-root trial looks for the
+runtime's setuid starter: it reads `LIBEXECDIR` from `apptainer buildcfg` (or
+`singularity buildcfg`), also checks the `libexec` directory beside a
+relocated binary, and fails at once when it finds `starter` but no
+root-owned setuid `starter-suid`, the layout of an unprivileged installation.
+The answer is cached per runtime. The check never rejects root, a setuid
+installation, or a project whose published ports make `singularity-compose`
+use `sudo` (`singularity_fakeroot=false`); when the layout is unrecognised it
+does not decide. A setuid installation can still lack networking, for example
+when `allow setuid = no` or the user has no `/etc/subuid` entry, so after
+`singularity-compose up` the adapter also lists the running instances with
+`apptainer instance list --json`. `singularity-compose` 0.1.19 reports a
+failed `instance start` as an `ERROR` line and still exits 0; a missing
+instance therefore fails the start with the names of the missing instances
+and `singularity-compose`'s captured output, including Apptainer's `FATAL`
+line, instead of a later "no instance found" error. Instances started through
+`sudo` belong to root and are not checked.
 
 The adapter supports Harbor's `public` and `no-network` modes on
 SingularityCE 3.6.2. The `[environment]` policy is the baseline used when the
