@@ -69,12 +69,8 @@ does, the custom environment pulls that image with `<runtime> pull
 docker://<image>` and needs no container builder. A reference without a tag
 gets `:latest`, a reference with another scheme (such as `library://`) is
 pulled as written, and a path ending in `.sif` is used directly. Otherwise it
-builds `environment/Dockerfile` with Buildah, Podman, or Docker, converts it
-to a cached SIF, and requires no Apptainer definition file. Building needs one
-of `buildah`, `podman`, or `docker` on the host; when using Docker, its daemon
-must be running and the invoking process must have socket access. Rootless
-Buildah and Podman can only run Dockerfile `RUN` steps when the user has
-`/etc/subuid` and `/etc/subgid` entries.
+builds `environment/Dockerfile` into a cached SIF, as described in
+[Dockerfile builds](#dockerfile-builds).
 
 The pull-or-build choice follows Harbor: `harbor run --force-build` builds the
 Dockerfile even when `docker_image` is set, and pulls again when the task has
@@ -110,13 +106,105 @@ uv run -m ursa.integrations.harbor prebuild path/to/tasks
 
 It prepares the SIFs a trial without `--force-build` uses. Its `--force`
 option rebuilds or re-pulls them, like `singularity_force_pull`, and never
-switches a `docker_image` task to a Dockerfile build.
+switches a `docker_image` task to a Dockerfile build. Its `--builder` option
+sets the Dockerfile builder, like `singularity_builder`; use the same builder
+for the run so that it finds the prebuilt SIFs.
 
 For a direct run, add:
 
 ```bash
 --env ursa.integrations.harbor_singularity:DockerfileSingularityEnvironment
 ```
+
+### Dockerfile builds
+
+The `singularity_builder` environment kwarg, or `URSA_HARBOR_SIF_BUILDER`
+when the kwarg is unset, chooses how a Dockerfile becomes a SIF:
+
+- `apptainer`: translate the Dockerfile into an Apptainer definition file and
+  build it with `apptainer build --fakeroot` in the build context. This needs
+  no other tools and no `/etc/subuid` entry, because Apptainer 1.1 and later
+  fall back to a root-mapped user namespace plus the host's `fakeroot`
+  command.
+- `buildah`, `podman`, or `docker`: build an OCI image and convert it with
+  `<runtime> build`. With Docker, its daemon must be running and the invoking
+  process must have socket access. Rootless Buildah and Podman can only run
+  `RUN` steps when the user has `/etc/subuid` and `/etc/subgid` entries;
+  without them every step fails, for example with "error setting
+  supplemental groups list: operation not permitted".
+- `auto` (default): when the runtime is Apptainer, try `apptainer` first,
+  then Buildah, Podman, and Docker in that order. SingularityCE keeps the OCI
+  order, since its fakeroot builds need subuid ranges as well. A Dockerfile
+  that the translation does not support goes straight to the OCI builders
+  without a failed build. A builder that fails for a host reason, such as
+  unusable fakeroot or missing subuid ranges, is skipped for the rest of the
+  process, so each task does not repeat the failure. An explicit builder is
+  the only one tried.
+
+Apptainer is preferred over a working Buildah because it needs no probe
+build to find out whether `RUN` steps work. On a host where Buildah does
+work, `singularity_builder=buildah` keeps Docker's own build semantics.
+Definition builds and OCI builds are cached under different keys, and the
+definition key includes the translator version, so changing the builder
+rebuilds once; under `auto` a cached SIF from either builder is reused.
+
+The translation replays the Dockerfile from a generated script in `%post`,
+so `COPY` and `RUN` steps keep their order even though Apptainer copies
+`%files` before `%post`. The build context files that `COPY` and `ADD` name
+are staged into the image in `%setup` and removed at the end of the build.
+It supports:
+
+- Parser directives (`escape`; `syntax` and `check` are ignored), line
+  continuations, comments, and `RUN` heredocs. A `RUN` that is only a
+  heredoc runs as a script, with its `#!` line if it has one.
+- `ARG`, including before `FROM`, with values from Compose build `args`,
+  BuildKit's platform arguments such as `TARGETARCH`, and the predefined
+  proxy arguments. Host `*_proxy` variables are passed to `RUN` when no
+  proxy build argument is set, as Buildah does.
+- `ENV` in both forms; values that use variables set only by the base image,
+  such as `$PATH`, are evaluated during the build. The final values are
+  recorded in the image for run time.
+- `FROM <image>[:tag|@digest] [AS <name>]` and a `--platform` that matches
+  the host; `RUN` in shell form (through `SHELL`) and exec form; `WORKDIR`;
+  and `USER` for later build steps.
+- `COPY` and `ADD` from the build context, honoring `.dockerignore`, with
+  globs, several sources, Docker's trailing-slash rules for the
+  destination, `--chown`, and `--chmod`. `ADD` extracts local tar archives
+  (on the host, so the image needs no `bzip2` or `xz`) and downloads
+  `http` and `https` URLs.
+- Multi-stage builds: only the stages the target needs are built, and
+  `COPY --from` takes files from an earlier stage, by name or index, or
+  from another image, such as `ghcr.io/astral-sh/uv`.
+- `CMD`, `ENTRYPOINT`, `LABEL`, `EXPOSE`, `VOLUME`, `HEALTHCHECK`,
+  `STOPSIGNAL`, and `ONBUILD` are ignored. Harbor runs its own commands, and
+  the base image's own `ONBUILD` triggers do not run either.
+
+It rejects, naming the line, `RUN --mount` other than `type=cache` (which is
+ignored), `RUN --network=none`, `COPY --parents` and `--exclude`, `COPY` and
+`ADD` heredocs, `ADD` of Git repositories or with `--checksum`, globs in
+`COPY --from`, `FROM scratch`, `FROM` an earlier stage, variables in `COPY`
+sources that only the base image defines, and names that the shell cannot
+export. With `auto`, such a Dockerfile is built by an OCI builder if one is
+installed.
+
+Some Docker behavior differs:
+
+- As at run time, the final `USER` is not applied: Harbor chooses the
+  container user. Under a root-mapped namespace only root is mapped, so
+  `RUN` steps after a non-root `USER`, and `--chown` to another user, run
+  or copy as root while `fakeroot` reports the requested owner.
+- Apptainer mounts the host's `/tmp` and `/var/tmp` during `%post`. The
+  build script unmounts them, so files that steps leave there stay in the
+  image as with Docker, and warns if it cannot.
+- The host's `fakeroot` command is loaded into the image during the build,
+  so it fails in images whose C library is older than the host's, or is
+  musl, as in Alpine. The adapter then retries with
+  `--ignore-fakeroot-command`; package managers that drop privileges, such
+  as `apt-get`, still fail in that mode, and the OCI builders are tried.
+- Apptainer builds in `APPTAINER_TMPDIR` (default `/tmp`), which must be on
+  a local file system with room for the unpacked image; network file systems
+  such as NFS or Lustre do not work for fakeroot builds.
+- The contents of `ADD` URLs are not part of the cache key.
 
 ### Fakeroot
 
@@ -255,8 +343,9 @@ services:
 ```
 
 Export `HARBOR_SCICODE_TEST_DATA_PATH` in the shell that runs Harbor. SciCode
-tasks have no `docker_image`, so their Dockerfile is still built and needs a
-builder that can run `RUN` steps.
+tasks have no `docker_image`, so their Dockerfile is still built. With
+Apptainer, the default `singularity_builder=auto` builds it from a translated
+definition file, which also works for users without `/etc/subuid` entries.
 
 Unsupported Compose fields fail before launch. In particular,
 `singularity-compose` cannot represent healthchecks or conditional
@@ -321,9 +410,12 @@ and Singularity's
 [networking guide](https://docs.sylabs.io/guides/3.6/user-guide/networking.html).
 
 Set `[environment].workdir` in `task.toml` when a Dockerfile computes
-`WORKDIR` from an environment variable or inherits a non-root workdir from its
-base image. The task setting takes precedence over image metadata; the
-Singularity adapter rejects variable workdirs it cannot resolve before launch.
+`WORKDIR` from a variable that only its base image sets, or inherits a
+non-root workdir from its base image. Variables from the Dockerfile's own
+`ARG` and `ENV` lines and Compose build `args` are resolved, for the Compose
+build `target` when one is set. The task setting takes precedence over image
+metadata; the Singularity adapter rejects variable workdirs it cannot resolve
+before launch.
 
 ## Clean up
 
