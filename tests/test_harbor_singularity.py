@@ -1282,6 +1282,49 @@ async def test_stop_cleans_failed_start_when_instance_was_never_created(
     assert not environment._instance_start_attempted
 
 
+async def test_downloads_after_failed_start_are_skipped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    environment = _environment(tmp_path)
+
+    async def fail_build(_force_build: bool) -> Path:
+        raise RuntimeError("build failed")
+
+    async def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("download should not run commands after a failed start")
+
+    monkeypatch.setattr(environment, "_build_main_sif", fail_build)
+    with pytest.raises(RuntimeError, match="build failed"):
+        await environment.start(force_build=False)
+    monkeypatch.setattr(environment, "exec", unexpected)
+    monkeypatch.setattr(environment, "service_exec", unexpected)
+
+    with caplog.at_level("DEBUG"):
+        await environment.download_dir("/logs/agent", tmp_path / "agent")
+        await environment.download_file(
+            "/logs/agent/ursa.log", tmp_path / "file" / "ursa.log"
+        )
+        await environment.download_dir_filtered(
+            source_dir="/logs/agent",
+            target_dir=tmp_path / "filtered",
+            include=["*.log"],
+        )
+        await environment.service_download_dir(
+            "/logs", tmp_path / "helper", service="helper"
+        )
+
+    assert not (tmp_path / "agent").exists()
+    assert not (tmp_path / "file").exists()
+    assert not (tmp_path / "filtered").exists()
+    assert not (tmp_path / "helper").exists()
+    assert "Skipping download of /logs/agent" in caplog.text
+    assert not [
+        record for record in caplog.records if record.levelname == "ERROR"
+    ]
+
+
 @pytest.mark.parametrize(
     "output",
     [

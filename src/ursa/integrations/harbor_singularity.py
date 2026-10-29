@@ -2622,6 +2622,21 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         finally:
             self._remove_staging_path(staged)
 
+    def _skip_download_without_staging(self, source: str) -> bool:
+        """Skip downloads when start() failed or the environment stopped.
+
+        Harbor still collects logs after a failed start; raising here would
+        log a second traceback that hides the startup error.
+        """
+        if self._staging_dir is not None:
+            return False
+        self.logger.debug(
+            "Skipping download of %s; the Singularity environment is not "
+            "running",
+            source,
+        )
+        return True
+
     @override
     async def download_file(
         self, source_path: str, target_path: Path | str
@@ -2634,6 +2649,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         target_path: Path | str,
         execute: Callable[[str], Awaitable[ExecResult]],
     ) -> None:
+        if self._skip_download_without_staging(source_path):
+            return
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         staged = self._transfer_staging_path(Path(source_path).name)
@@ -2662,6 +2679,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         target_dir: Path | str,
         execute: Callable[[str], Awaitable[ExecResult]],
     ) -> None:
+        if self._skip_download_without_staging(source_dir):
+            return
         target = Path(target_dir)
         target.mkdir(parents=True, exist_ok=True)
         staged = self._transfer_staging_path(Path(source_dir).name)
@@ -2684,6 +2703,26 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     shutil.copy2(item, destination)
         finally:
             self._remove_staging_path(staged)
+
+    @override
+    async def download_dir_filtered(
+        self,
+        *,
+        source_dir: str,
+        target_dir: Path | str,
+        include: Sequence[str] | None = None,
+        exclude: Sequence[str] | None = None,
+        protect: Sequence[str] | None = None,
+    ) -> None:
+        if self._skip_download_without_staging(source_dir):
+            return
+        await super().download_dir_filtered(
+            source_dir=source_dir,
+            target_dir=target_dir,
+            include=include,
+            exclude=exclude,
+            protect=protect,
+        )
 
     def _compose_instance(self, service: str) -> str:
         instances = self._compose_instances.get(service)
