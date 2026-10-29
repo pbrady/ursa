@@ -171,6 +171,39 @@ form `depends_on`, commands, bind mounts, TCP `host:container` ports,
 their Harbor service name. Harbor's per-service artifact collection is also
 supported.
 
+Bind mounts use `SOURCE:TARGET`, `SOURCE:TARGET:ro`, `SOURCE:TARGET:rw`, or the
+long form with `type: bind` and optional `read_only: true`. The source must
+exist on the host, and paths cannot contain `:` or `,`. Because
+`singularity-compose` 0.1.19 accepts only `SOURCE:TARGET` volumes, the adapter
+passes read-only mounts, including read-only Harbor mounts, to Singularity as
+`--bind=SOURCE:TARGET:ro` start options instead. A mount inside the task's
+workdir or another writable Harbor path gets an empty mount point in that
+path's host directory, so the image does not need to provide one.
+
+Values in Compose files are interpolated as Docker Compose does: `$VAR`,
+`${VAR}`, `${VAR:-default}` and `${VAR-default}`, `${VAR:?message}` and
+`${VAR?message}`, `${VAR:+alternative}` and `${VAR+alternative}`, with nested
+defaults and `$$` for a literal `$`. Variables come from the host
+environment, overlaid with the task's `[environment].env` and Harbor's
+persistent environment, as for Harbor's Docker backend. A missing required
+variable fails with its message. Unlike Docker Compose, a plain `$VAR` or
+`${VAR}` that is unset is an error rather than an empty string; write
+`${VAR:-}` to allow an empty value. Unquoted and double-quoted `env_file`
+values are interpolated too, and single-quoted values are kept literally.
+
+For example, Harbor's SciCode adapter mounts its test data with:
+
+```yaml
+services:
+  main:
+    volumes:
+      - "${HARBOR_SCICODE_TEST_DATA_PATH:?set HARBOR_SCICODE_TEST_DATA_PATH to an absolute path to a local test_data.h5 before running harbor}:/app/test_data.h5:ro"
+```
+
+Export `HARBOR_SCICODE_TEST_DATA_PATH` in the shell that runs Harbor. SciCode
+tasks have no `docker_image`, so their Dockerfile is still built and needs a
+builder that can run `RUN` steps.
+
 Unsupported Compose fields fail before launch. In particular,
 `singularity-compose` cannot represent healthchecks or conditional
 `depends_on`, named volumes, custom Compose networks, entrypoints, resource
@@ -185,7 +218,10 @@ Multi-container tasks work with either SingularityCE or Apptainer. Although
 the adapter maps that command to the selected runtime inside its private
 project directory. An Apptainer installation therefore does not need a
 system-wide `singularity` alias. The `ursa-ai[harbor]` extra installs
-`singularity-compose`; the host runtime must provide fakeroot CNI networking.
+`singularity-compose`. A project whose only service is `main`, without
+published ports, uses host networking as a task without Compose does. Projects
+with sidecars or ports need bridge networking, which requires the host runtime
+to provide fakeroot CNI networking.
 
 The adapter supports Harbor's `public` and `no-network` modes on
 SingularityCE 3.6.2. The `[environment]` policy is the baseline used when the

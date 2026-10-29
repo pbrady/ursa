@@ -54,6 +54,7 @@ _COMPOSE_SERVICE_FIELDS = frozenset({
 })
 _COMPOSE_BUILD_FIELDS = frozenset({"args", "context", "dockerfile", "target"})
 _HOST_CA_CERTIFICATES_FILENAME = "host-ca-certificates.crt"
+_COMPOSE_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Runtime diagnostics that mean ``--fakeroot`` itself is unusable, as opposed
 # to an unrelated probe failure such as a pull error or a broken image.
 _FAKEROOT_FAILURE_MARKERS = (
@@ -103,11 +104,11 @@ def _merge_compose(base: dict[str, Any], overlay: dict[str, Any]) -> None:
         ):
             merged = list(current)
             positions = {
-                volume.split(":", 1)[1]: index
+                _volume_target(volume): index
                 for index, volume in enumerate(merged)
             }
             for volume in value:
-                target = volume.split(":", 1)[1]
+                target = _volume_target(volume)
                 if target in positions:
                     merged[positions[target]] = volume
                 else:
@@ -120,12 +121,126 @@ def _merge_compose(base: dict[str, Any], overlay: dict[str, Any]) -> None:
             base[key] = value
 
 
-def _compose_path(value: str, base_dir: Path) -> str:
-    if "$" in value:
+def _volume_target(volume: str) -> str:
+    """Return the container path of a normalized ``src:dst[:ro]`` volume."""
+    return volume.split(":")[1]
+
+
+def _compose_variable(
+    name: str, environ: Mapping[str, str], template: str
+) -> str:
+    try:
+        return environ[name]
+    except KeyError:
         raise ValueError(
-            "singularity-compose cannot interpolate variables in paths: "
-            f"{value!r}"
-        )
+            f"Compose variable {name!r} in {template!r} is not set on the "
+            f"host; use ${{{name}:-}} for an empty value"
+        ) from None
+
+
+def _compose_closing_brace(template: str, start: int) -> int:
+    depth = 1
+    index = start
+    while index < len(template):
+        if template.startswith("$$", index):
+            index += 2
+        elif template.startswith("${", index):
+            depth += 1
+            index += 2
+        elif template[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+            index += 1
+        else:
+            index += 1
+    raise ValueError(f"Unterminated Compose interpolation in {template!r}")
+
+
+def _interpolate_compose_braced(
+    expression: str, environ: Mapping[str, str], template: str
+) -> str:
+    match = _COMPOSE_VARIABLE.match(expression)
+    if match is None:
+        raise ValueError(f"Invalid Compose interpolation in {template!r}")
+    name = match.group()
+    modifier = expression[match.end() :]
+    if not modifier:
+        return _compose_variable(name, environ, template)
+    operator = next(
+        (
+            candidate
+            for candidate in (":-", ":?", ":+", "-", "?", "+")
+            if modifier.startswith(candidate)
+        ),
+        None,
+    )
+    if operator is None:
+        raise ValueError(f"Invalid Compose interpolation in {template!r}")
+    # As in Docker Compose, the colon forms also treat an empty value as
+    # unset, and the argument is only expanded when it is used.
+    value = environ.get(name)
+    present = value is not None and (value != "" or ":" not in operator)
+    argument = modifier[len(operator) :]
+    if operator.endswith("-"):
+        return value if present else _interpolate_compose(argument, environ)
+    if operator.endswith("+"):
+        return _interpolate_compose(argument, environ) if present else ""
+    if present:
+        return value
+    message = _interpolate_compose(argument, environ)
+    raise ValueError(
+        f"Compose variable {name!r} is required"
+        + (f": {message}" if message else "")
+    )
+
+
+def _interpolate_compose(template: str, environ: Mapping[str, str]) -> str:
+    """Expand Docker Compose ``$VAR`` and ``${VAR...}`` interpolation.
+
+    Supports ``$$`` escapes and the ``-``, ``?``, and ``+`` modifiers, each
+    with and without a colon. Unlike Docker Compose, a plain reference to an
+    unset variable is an error instead of an empty string, because these
+    values are usually host paths.
+    """
+    parts = []
+    index = 0
+    while (start := template.find("$", index)) != -1:
+        parts.append(template[index:start])
+        if template.startswith("$$", start):
+            parts.append("$")
+            index = start + 2
+        elif template.startswith("${", start):
+            end = _compose_closing_brace(template, start + 2)
+            parts.append(
+                _interpolate_compose_braced(
+                    template[start + 2 : end], environ, template
+                )
+            )
+            index = end + 1
+        elif match := _COMPOSE_VARIABLE.match(template, start + 1):
+            parts.append(_compose_variable(match.group(), environ, template))
+            index = match.end()
+        else:
+            raise ValueError(f"Invalid Compose interpolation in {template!r}")
+    parts.append(template[index:])
+    return "".join(parts)
+
+
+def _interpolate_compose_tree(value: Any, environ: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        return _interpolate_compose(value, environ)
+    if isinstance(value, list):
+        return [_interpolate_compose_tree(item, environ) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _interpolate_compose_tree(item, environ)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _compose_path(value: str, base_dir: Path) -> str:
     path = Path(value).expanduser()
     return str((path if path.is_absolute() else base_dir / path).resolve())
 
@@ -292,31 +407,44 @@ def _normalize_compose_service(
             if (
                 set(volume) - {"read_only", "source", "target", "type"}
                 or volume.get("type") != "bind"
-                or volume.get("read_only", False) is not False
+                or not isinstance(volume.get("read_only", False), bool)
                 or not isinstance(volume.get("source"), str)
                 or not isinstance(volume.get("target"), str)
             ):
                 raise ValueError(
-                    "singularity-compose supports only writable bind mounts "
+                    "singularity-compose supports only bind mounts "
                     f"on service {name!r}: {volume!r}"
                 )
-            volumes[index] = f"{volume['source']}:{volume['target']}"
+            volumes[index] = f"{volume['source']}:{volume['target']}" + (
+                ":ro" if volume.get("read_only") else ""
+            )
         for index, volume in enumerate(volumes):
-            if not isinstance(volume, str) or volume.count(":") != 1:
-                raise ValueError(
-                    "singularity-compose supports only writable bind mounts "
-                    f"on service {name!r}: {volume!r}"
-                )
-            source, target = volume.split(":", 1)
-            if not source.startswith(("/", ".", "~")) or not target.startswith(
-                "/"
+            parts = volume.split(":") if isinstance(volume, str) else []
+            if (
+                len(parts) not in (2, 3)
+                or not parts[0].startswith(("/", ".", "~"))
+                or not parts[1].startswith("/")
             ):
                 raise ValueError(
-                    "singularity-compose supports only writable bind mounts "
-                    f"on service {name!r}: {volume!r}"
+                    "singularity-compose supports only SOURCE:TARGET[:MODE] "
+                    f"bind mounts on service {name!r}: {volume!r}"
                 )
-            source = _compose_path(source, base_dir)
-            volumes[index] = f"{source}:{target}"
+            mode = parts[2] if len(parts) == 3 else "rw"
+            if mode not in {"ro", "rw"}:
+                raise ValueError(
+                    "singularity-compose supports only the ro and rw bind "
+                    f"mount modes on service {name!r}: {volume!r}"
+                )
+            # Singularity splits its bind list on commas.
+            if "," in volume:
+                raise ValueError(
+                    "Singularity bind mounts cannot contain commas on "
+                    f"service {name!r}: {volume!r}"
+                )
+            source = _compose_path(parts[0], base_dir)
+            volumes[index] = f"{source}:{parts[1]}" + (
+                ":ro" if mode == "ro" else ""
+            )
 
     ports = service.get("ports")
     if ports is not None and not isinstance(ports, list):
@@ -347,7 +475,15 @@ def _normalize_compose_service(
             ports[index] = f"{port['published']}:{port['target']}"
 
 
-def _load_docker_compose(paths: list[Path]) -> dict[str, Any]:
+def _load_docker_compose(
+    paths: list[Path], environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Load, interpolate, validate, and merge Docker Compose files.
+
+    Interpolation uses ``environ``, which defaults to the host environment,
+    and happens once here so later stages see literal values.
+    """
+    environ = os.environ if environ is None else environ
     config: dict[str, Any] = {"services": {}}
     for path in paths:
         try:
@@ -358,6 +494,10 @@ def _load_docker_compose(paths: list[Path]) -> dict[str, Any]:
             ) from exc
         if not isinstance(overlay, dict):
             raise ValueError(f"Docker Compose file must be a mapping: {path}")
+        try:
+            overlay = _interpolate_compose_tree(overlay, environ)
+        except ValueError as exc:
+            raise ValueError(f"Docker Compose file {path}: {exc}") from exc
         unsupported = set(overlay) - {"name", "services", "version"}
         if unsupported:
             raise ValueError(
@@ -420,16 +560,8 @@ def _resolve_compose_value(key: str, value: Any) -> str:
             raise ValueError(
                 f"Environment variable {key!r} is not set on the host"
             ) from exc
-    scalar = str(value).lower() if isinstance(value, bool) else str(value)
-    literal_marker = "\0URSA_COMPOSE_DOLLAR\0"
-    template = scalar.replace("$$", literal_marker)
-    resolved = resolve_env_vars({key: template})[key]
-    if "$" in template and resolved == template:
-        raise ValueError(
-            "Compose interpolation is supported only when the whole value "
-            f"is a ${{VARIABLE}} template: {scalar!r}"
-        )
-    return resolved.replace(literal_marker, "$")
+    # ``_load_docker_compose`` has already interpolated Compose values.
+    return str(value).lower() if isinstance(value, bool) else str(value)
 
 
 def _read_compose_env_file(path: Path) -> dict[str, str]:
@@ -454,7 +586,10 @@ def _read_compose_env_file(path: Path) -> dict[str, str]:
                 value = value[1:-1]
             elif " #" in value:
                 value = value.split(" #", 1)[0].rstrip()
-            environment[key] = _resolve_compose_value(key, value)
+            # Docker Compose resolves earlier entries of the file first.
+            environment[key] = _interpolate_compose(
+                value, {**os.environ, **environment}
+            )
     return environment
 
 
@@ -519,9 +654,21 @@ def _compose_volumes(
     staging_dir: Path,
     environment_file: Path | None,
     main_mounts: Sequence[Mapping[str, Any]],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Return a service's writable volumes and read-only binds.
+
+    singularity-compose 0.1.19 splits each volume into exactly ``src:dst``,
+    so read-only binds are returned separately for ``start.options``.
+    """
     volumes = list(service.get("volumes", []))
-    targets = {volume.split(":", 1)[1] for volume in volumes}
+    for volume in volumes:
+        source = volume.split(":")[0]
+        if not Path(source).exists():
+            raise FileNotFoundError(
+                f"Bind mount source on service {service_name!r} does not "
+                f"exist: {source}"
+            )
+    targets = {_volume_target(volume) for volume in volumes}
     if "/staging" in targets:
         raise ValueError("/staging is reserved by the Harbor environment")
     volumes.append(f"{staging_dir}:/staging")
@@ -533,10 +680,6 @@ def _compose_volumes(
                     "Singularity supports only Harbor bind mounts, got "
                     f"{mount.get('type')!r}"
                 )
-            if mount.get("read_only"):
-                raise ValueError(
-                    "singularity-compose cannot preserve read-only Harbor mounts"
-                )
             target = str(mount["target"])
             if target == "/staging":
                 raise ValueError(
@@ -546,10 +689,13 @@ def _compose_volumes(
                 volumes = [
                     volume
                     for volume in volumes
-                    if volume.split(":", 1)[1] != target
+                    if _volume_target(volume) != target
                 ]
             targets.add(target)
-            volumes.append(f"{mount['source']}:{target}")
+            volumes.append(
+                f"{mount['source']}:{target}"
+                + (":ro" if mount.get("read_only") else "")
+            )
     if environment_file is not None:
         target = "/.singularity.d/env/91-ursa-compose.sh"
         if target in targets:
@@ -557,7 +703,14 @@ def _compose_volumes(
                 f"Compose environment mount conflicts on service {service_name!r}"
             )
         volumes.append(f"{environment_file}:{target}")
-    return volumes
+    # Mount parents before the paths nested inside them; a later parent bind
+    # would hide an earlier nested one.
+    volumes.sort(
+        key=lambda volume: len(PurePosixPath(_volume_target(volume)).parts)
+    )
+    writable = [volume for volume in volumes if not volume.endswith(":ro")]
+    read_only = [volume for volume in volumes if volume.endswith(":ro")]
+    return writable, read_only
 
 
 async def docker_compose_to_singularity_compose(
@@ -573,6 +726,7 @@ async def docker_compose_to_singularity_compose(
     fakeroot: bool = True,
     main_overlay: Path | None = None,
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
+    interpolation_environment: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """Convert one or more Docker Compose files into a singularity-compose file."""
     paths = (
@@ -580,7 +734,7 @@ async def docker_compose_to_singularity_compose(
         if isinstance(docker_compose_paths, Path)
         else list(docker_compose_paths)
     )
-    config = _load_docker_compose(paths)
+    config = _load_docker_compose(paths, interpolation_environment)
     service_keys = {
         name: _compose_key(identity, name) for name in config["services"]
     }
@@ -588,6 +742,13 @@ async def docker_compose_to_singularity_compose(
         name: service.get("deploy", {}).get("replicas", 1)
         for name, service in config["services"].items()
     }
+    # A lone main service needs no bridge: host networking matches the
+    # non-Compose path and avoids fakeroot CNI, which many hosts lack.
+    host_network = (
+        list(config["services"]) == ["main"]
+        and not config["services"]["main"].get("ports")
+        and replicas_by_service["main"] == 1
+    )
     instance_keys = {
         name: (
             [service_keys[name]]
@@ -644,7 +805,9 @@ async def docker_compose_to_singularity_compose(
         }
         if network_mode == NetworkMode.NO_NETWORK:
             instance["network"]["type"] = "none"
-        volumes = _compose_volumes(
+        elif host_network:
+            instance["network"]["enable"] = False
+        volumes, read_only_binds = _compose_volumes(
             name,
             service,
             staging_dir=staging_dir,
@@ -653,6 +816,9 @@ async def docker_compose_to_singularity_compose(
         )
         if volumes:
             instance["volumes"] = volumes
+        # singularity-compose passes these through as ``--bind=src:dst:ro``
+        # after the writable volume binds.
+        start_options.extend(f"bind={bind}" for bind in read_only_binds)
         if depends_on := service.get("depends_on", []):
             instance["depends_on"] = [
                 instance_key
@@ -887,12 +1053,6 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         ]
         if unsupported_mounts:
             raise ValueError("Singularity supports only Harbor bind mounts")
-        if self._uses_compose and any(
-            mount.get("read_only") for mount in self._host_mounts
-        ):
-            raise ValueError(
-                "singularity-compose cannot preserve read-only Harbor mounts"
-            )
         config = None
         if self._uses_compose:
             config = self._load_compose_config()
@@ -926,8 +1086,18 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         paths.extend(self.extra_docker_compose_paths)
         return paths
 
+    def _compose_interpolation_environment(self) -> dict[str, str]:
+        """Return the variables Harbor's Docker backend gives Compose."""
+        environment = dict(os.environ)
+        if self.task_env_config.env:
+            environment.update(resolve_env_vars(self.task_env_config.env))
+        environment.update(self._persistent_env)
+        return environment
+
     def _load_compose_config(self) -> dict[str, Any]:
-        return _load_docker_compose(self._compose_paths())
+        return _load_docker_compose(
+            self._compose_paths(), self._compose_interpolation_environment()
+        )
 
     @override
     def _resolve_workdir(self) -> str:
@@ -1674,6 +1844,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             fakeroot=self._fakeroot,
             main_overlay=self._overlay_path,
             service_workdirs=service_workdirs,
+            interpolation_environment=self._compose_interpolation_environment(),
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -1688,10 +1859,15 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         ):
             raise RuntimeError("Invalid generated singularity-compose file")
         isolated = network_policy.network_mode == NetworkMode.NO_NETWORK
-        for instance in compose["instances"].values():
+        instances = compose["instances"].values()
+        # Match the conversion: a lone main instance uses host networking.
+        host_network = len(instances) == 1 and not any(
+            instance.get("ports") for instance in instances
+        )
+        for instance in instances:
             network = instance.setdefault("network", {})
             network["allocate_ip"] = not isolated
-            network["enable"] = True
+            network["enable"] = isolated or not host_network
             if isolated:
                 network["type"] = "none"
             else:
@@ -1878,7 +2054,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         }
         if self._uses_compose:
             configured_targets.update(
-                PurePosixPath(volume.split(":", 1)[1])
+                PurePosixPath(_volume_target(volume))
                 for volume in self._load_compose_config()["services"][
                     "main"
                 ].get("volumes", [])
@@ -1894,10 +2070,48 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             seen_targets.add(target)
         return tuple(binds)
 
+    def _main_mount_sources(self) -> list[tuple[Path, PurePosixPath]]:
+        mounts = [
+            (Path(mount["source"]), PurePosixPath(mount["target"]))
+            for mount in self._host_mounts
+            if mount.get("type") == "bind"
+        ]
+        if self._uses_compose:
+            mounts.extend(
+                (
+                    Path(volume.split(":")[0]),
+                    PurePosixPath(_volume_target(volume)),
+                )
+                for volume in self._load_compose_config()["services"][
+                    "main"
+                ].get("volumes", [])
+            )
+        return mounts
+
     def _prepare_harbor_bind_sources(self) -> None:
-        for source, _target in self._harbor_writable_binds():
+        binds = self._harbor_writable_binds()
+        for source, _target in binds:
             source.mkdir(parents=True, exist_ok=True)
             source.chmod(0o777)
+        # A mount nested inside a writable bind, such as SciCode's
+        # /app/test_data.h5 under the /app workdir, needs a mount point in
+        # that bind's host directory; Singularity cannot create one there.
+        for mount_source, mount_target in self._main_mount_sources():
+            parents = [
+                (source, target)
+                for source, target in binds
+                if mount_target != target
+                and mount_target.is_relative_to(target)
+            ]
+            if not parents:
+                continue
+            source, target = max(parents, key=lambda bind: len(bind[1].parts))
+            placeholder = source / mount_target.relative_to(target)
+            if mount_source.is_dir():
+                placeholder.mkdir(parents=True, exist_ok=True)
+            else:
+                placeholder.parent.mkdir(parents=True, exist_ok=True)
+                placeholder.touch(exist_ok=True)
 
     def _prepare_disk_overlay(self) -> None:
         """Create a sparse ext3 overlay compatible with Singularity 3.6."""
