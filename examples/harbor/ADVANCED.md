@@ -33,15 +33,22 @@ does not copy host config or keyring files into the task container.
 Harbor selects the model credential from `--ae`, then the host environment, or
 from the variable named by `--api-key-name`. The adapter moves that key and any
 `<PROVIDER>_BASE_URL` endpoint into the URSA inference provider, again as a
-generated environment reference. Provider extras such as `AZURE_API_VERSION`
-and the AWS variables for Bedrock and SageMaker are passed through unchanged.
-The text before the first `/` in `--model` always names the URSA inference
-provider, including custom providers that LiteLLM does not know. Harbor's
-`--base-url` flag is not supported; set `base_url` in `ursa.yaml` or export
+generated environment reference. Harbor itself also exports every `--ae`
+variable unchanged into each agent setup and run command, so a key passed with
+`--ae` is visible to the install commands and the runner under its original
+name. To pass the key only to the runner, as a generated reference, supply it
+from the host environment or `--api-key-name`, or as an URSA `{env: ...}`
+secret reference. Provider extras such as `AZURE_API_VERSION` and the AWS
+variables for Bedrock and SageMaker are passed through unchanged. The text
+before the first `/` in `--model` always names the URSA inference provider,
+including custom providers that LiteLLM does not know. Harbor's `--base-url`
+flag is not supported; set `base_url` in `ursa.yaml` or export
 `<PROVIDER>_BASE_URL` instead.
 
 Harbor MCP servers are forwarded to URSA. Servers that declare HTTP `headers`
 are rejected, because the adapter does not forward MCP request headers.
+URSA has no skills support, so Harbor rejects tasks that set
+`environment.skills_dir` and runs that pass `--skills`.
 
 Each trial renders human-readable agent and tool progress to `agent/ursa.log`
 and writes structured chat, tool, agent, and chain lifecycle records to
@@ -49,8 +56,9 @@ and writes structured chat, tool, agent, and chain lifecycle records to
 chat end records include token usage. The formatted final result is written to
 `agent/ursa_result.out`.
 
-Harbor copies these files to the host after the agent finishes. The adapter
-downloads `ursa.jsonl` itself to report token usage. Pass
+Harbor copies these files to the host after the agent finishes, applying any
+`include_logs` and `exclude_logs` filters. To report token usage, the adapter
+reads `ursa.jsonl` from a temporary copy that it deletes afterwards. Pass
 `--ek auto_mounting=true` to bind the trial's log directories to the host while
 the agent runs, for example to follow `ursa.log` live.
 

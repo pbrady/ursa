@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+import asyncio
 import base64
 import json
 import shlex
@@ -335,9 +336,38 @@ def test_mcp_servers_are_forwarded_without_headers(tmp_path):
         agent._mcp_config()
 
 
+def _usage_record(input_tokens: int, cached: int, output: int) -> str:
+    return (
+        json.dumps({
+            "type": "chat",
+            "event": "end",
+            "usage": {
+                "input_tokens": input_tokens,
+                "cached_tokens": cached,
+                "output_tokens": output,
+            },
+        })
+        + "\n"
+    )
+
+
+def test_skills_are_not_declared():
+    # Harbor 0.25 rejects tasks with skills_dir or --skills for this adapter.
+    assert UrsaHarborAgent.capabilities.skills is False
+
+
 @pytest.mark.asyncio
-async def test_run_downloads_unmounted_log_for_token_usage(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("mounted", "download", "expected"),
+    [
+        (False, "ok", (3, 1, 2)),
+        (False, "error", (None, None, None)),
+        (False, "hang", (None, None, None)),
+        (True, "unexpected", (5, 0, 4)),
+    ],
+)
+async def test_run_reads_token_usage_without_copying_log_to_host(
+    tmp_path, monkeypatch, mounted, download, expected
 ):
     logs = tmp_path / "agent"
     agent = UrsaHarborAgent(
@@ -345,46 +375,54 @@ async def test_run_downloads_unmounted_log_for_token_usage(
         config_file=_runtime_config(tmp_path / "ursa.yaml"),
     )
     agent._remote_config_file = "/installed-agent/tmp/ursa-config.json"
-    downloads: list[tuple[str, Path]] = []
+    if mounted:
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "ursa.jsonl").write_text(_usage_record(5, 0, 4))
+    downloads: list[str] = []
 
-    class UnmountedEnvironment:
+    class Environment:
         network_policy = None
 
         def is_path_mounted(self, environment_path: Any, host_path: Path):
             assert str(environment_path) == "/logs/agent"
             assert host_path == logs
-            return False
+            return mounted
 
         async def download_file(self, source: str, target: Path) -> None:
-            downloads.append((source, target))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                json.dumps({
-                    "type": "chat",
-                    "event": "end",
-                    "usage": {
-                        "input_tokens": 3,
-                        "cached_tokens": 1,
-                        "output_tokens": 2,
-                    },
-                })
-                + "\n"
-            )
+            downloads.append(source)
+            assert not target.is_relative_to(logs)
+            if download == "ok":
+                target.write_text(_usage_record(3, 1, 2))
+            elif download == "hang":
+                await asyncio.Event().wait()
+            else:
+                raise RuntimeError("download failed")
 
     async def run(_environment: Any, **_kwargs: Any) -> Any:
         return SimpleNamespace(stdout=None)
 
+    wait_for = asyncio.wait_for
+    timeouts: list[float] = []
+
+    async def short_wait_for(awaitable: Any, timeout: float) -> Any:
+        timeouts.append(timeout)
+        return await wait_for(awaitable, timeout=0.01)
+
     monkeypatch.setattr(agent, "exec_as_agent", run)
+    monkeypatch.setattr(harbor_integration.asyncio, "wait_for", short_wait_for)
     context = AgentContext()
 
-    await agent.run("solve it", UnmountedEnvironment(), context)
+    await agent.run("solve it", Environment(), context)
 
-    assert downloads == [("/logs/agent/ursa.jsonl", logs / "ursa.jsonl")]
+    assert downloads == ([] if mounted else ["/logs/agent/ursa.jsonl"])
+    assert timeouts == ([] if mounted else [10])
+    # Harbor's own log sync decides whether ursa.jsonl reaches the host.
+    assert (logs / "ursa.jsonl").exists() is mounted
     assert (
         context.n_input_tokens,
         context.n_cache_tokens,
         context.n_output_tokens,
-    ) == (3, 1, 2)
+    ) == expected
 
 
 def test_handoff_imports_checkpoint_as_local_named_agent(tmp_path, monkeypatch):

@@ -1066,24 +1066,32 @@ class UrsaHarborAgent(BaseInstalledAgent):
             except Exception:
                 pass
             usage_log = self.logs_dir / "ursa.jsonl"
-            try:
-                # Harbor syncs unmounted logs only after run() returns.
-                if not environment.is_path_mounted(
-                    self.environment_logs_dir, self.logs_dir
-                ):
-                    await asyncio.shield(
-                        environment.download_file(
-                            str(self.environment_logs_dir / "ursa.jsonl"),
-                            usage_log,
+            with tempfile.TemporaryDirectory() as staging:
+                try:
+                    # Harbor syncs unmounted logs only after run() returns, and
+                    # applies the include/exclude log filters then. Stage the
+                    # copy outside logs_dir so those filters still decide what
+                    # stays on the host.
+                    if not environment.is_path_mounted(
+                        self.environment_logs_dir, self.logs_dir
+                    ):
+                        usage_log = Path(staging) / "ursa.jsonl"
+                        await asyncio.shield(
+                            asyncio.wait_for(
+                                environment.download_file(
+                                    f"{self.environment_logs_dir}/ursa.jsonl",
+                                    usage_log,
+                                ),
+                                timeout=10,
+                            )
                         )
-                    )
-            except Exception:
-                pass
-            (
-                context.n_input_tokens,
-                context.n_cache_tokens,
-                context.n_output_tokens,
-            ) = _jsonl_token_usage(usage_log)
+                except Exception:
+                    pass
+                (
+                    context.n_input_tokens,
+                    context.n_cache_tokens,
+                    context.n_output_tokens,
+                ) = _jsonl_token_usage(usage_log)
 
 
 def make_harbor_agent(
