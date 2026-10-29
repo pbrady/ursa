@@ -2268,10 +2268,14 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
 
         storage_mb = self.task_env_config.storage_mb or 1024
         # SingularityCE 3.6 needs upper/ and work/ in the image, owned by the
-        # invoking user. Apptainer creates them itself, and under root-mapped
-        # fakeroot rejects pre-made ones as "upper dir is not writable".
+        # invoking user. Apptainer with fakeroot creates them itself, and under
+        # root-mapped fakeroot rejects pre-made ones as "upper dir is not
+        # writable". Without fakeroot it runs as the invoking user, who cannot
+        # create them in a bare image's root-owned root directory.
         layout = None
-        if not _runtime_is_apptainer(self._instance_runtime()):
+        if not (
+            self._fakeroot and _runtime_is_apptainer(self._instance_runtime())
+        ):
             layout = self._scratch_dir / "overlay-layout"
             for directory in (layout / "upper", layout / "work"):
                 directory.mkdir(parents=True)

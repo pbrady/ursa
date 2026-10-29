@@ -360,11 +360,14 @@ def test_runtime_environment_prefix_follows_the_runtime(
 
 
 @pytest.mark.parametrize(
-    ("name", "version", "layout"),
+    ("name", "version", "fakeroot", "layout"),
     [
-        ("singularity", "singularity-ce version 3.6.2", True),
-        ("singularity", "apptainer version 1.5.5", False),
-        ("apptainer", "", False),
+        ("singularity", "singularity-ce version 3.6.2", True, True),
+        ("singularity", "singularity-ce version 3.6.2", False, True),
+        ("singularity", "apptainer version 1.5.5", True, False),
+        ("apptainer", "", True, False),
+        # Without fakeroot the invoking user needs upper/ and work/ it owns.
+        ("apptainer", "", False, True),
     ],
 )
 def test_disk_overlay_layout_follows_the_runtime(
@@ -372,9 +375,11 @@ def test_disk_overlay_layout_follows_the_runtime(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
     version: str,
+    fakeroot: bool,
     layout: bool,
 ):
     environment = _environment(tmp_path, overlay=True)
+    environment._fakeroot = fakeroot
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     runtime = bin_dir / name
@@ -419,6 +424,7 @@ def test_disk_overlay_uses_mke2fs_ext3_without_mkfs_ext3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     environment = _environment(tmp_path, overlay=True)
+    environment._fakeroot = True
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     runtime = bin_dir / "apptainer"
