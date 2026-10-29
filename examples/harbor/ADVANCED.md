@@ -236,8 +236,9 @@ task's `environment` directory), `MAIN_IMAGE_NAME`, `PREBUILT_IMAGE_NAME`
 and the legacy `ENV_*_PATH` and `HOST_*_PATH` log mount variables. A missing
 required variable fails with its message, and, as in Docker Compose, a plain
 `$VAR` or `${VAR}` that is unset becomes an empty string with a warning.
-Unquoted and double-quoted `env_file` values are interpolated too, and
-single-quoted values are kept literally.
+Unquoted and double-quoted `env_file` values are interpolated with the same
+variables, and single-quoted values are kept literally. A bare `KEY` in
+`environment`, `env_file`, or build `args` also takes its value from them.
 
 For example, Harbor's SciCode adapter mounts its test data with:
 

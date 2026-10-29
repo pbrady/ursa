@@ -1440,6 +1440,28 @@ async def test_compose_interpolates_environment_env_file_and_build_args(
     assert main["build"]["args"] == {"TOKEN": "secret", "PRICE": "$5"}
 
 
+def test_compose_env_file_uses_the_interpolation_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("URSA_TASK_ONLY", raising=False)
+    env_file = tmp_path / "service.env"
+    env_file.write_text(
+        "FROM_TASK=${URSA_TASK_ONLY:?set by the task}\nURSA_TASK_ONLY\n"
+    )
+
+    environment = harbor_singularity._compose_environment(
+        "main",
+        {"env_file": [str(env_file)], "environment": ["URSA_TASK_ONLY"]},
+        {},
+        {"URSA_TASK_ONLY": "task-value"},
+    )
+
+    assert environment == {
+        "FROM_TASK": "task-value",
+        "URSA_TASK_ONLY": "task-value",
+    }
+
+
 async def test_compose_keeps_read_only_harbor_mounts(tmp_path: Path):
     compose = tmp_path / "docker-compose.yaml"
     compose.write_text("services:\n  main: {}\n")

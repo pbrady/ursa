@@ -588,10 +588,12 @@ def _compose_key(identity: str, service: str) -> str:
     return f"u{identity}-{safe_service}-{service_hash}"
 
 
-def _resolve_compose_value(key: str, value: Any) -> str:
+def _resolve_compose_value(
+    key: str, value: Any, environ: Mapping[str, str] | None = None
+) -> str:
     if value is None:
         try:
-            return os.environ[key]
+            return (os.environ if environ is None else environ)[key]
         except KeyError as exc:
             raise ValueError(
                 f"Environment variable {key!r} is not set on the host"
@@ -600,7 +602,9 @@ def _resolve_compose_value(key: str, value: Any) -> str:
     return str(value).lower() if isinstance(value, bool) else str(value)
 
 
-def _read_compose_env_file(path: Path) -> dict[str, str]:
+def _read_compose_env_file(
+    path: Path, environ: Mapping[str, str]
+) -> dict[str, str]:
     environment = {}
     for number, raw_line in enumerate(path.read_text().splitlines(), 1):
         line = raw_line.strip()
@@ -614,7 +618,7 @@ def _read_compose_env_file(path: Path) -> dict[str, str]:
                 f"Invalid environment entry at {path}:{number}: {raw_line!r}"
             )
         if not separator:
-            environment[key] = _resolve_compose_value(key, None)
+            environment[key] = _resolve_compose_value(key, None, environ)
         elif len(value) >= 2 and value[0] == value[-1] == "'":
             environment[key] = value[1:-1]
         else:
@@ -624,7 +628,7 @@ def _read_compose_env_file(path: Path) -> dict[str, str]:
                 value = value.split(" #", 1)[0].rstrip()
             # Docker Compose resolves earlier entries of the file first.
             environment[key] = _interpolate_compose(
-                value, {**os.environ, **environment}
+                value, {**environ, **environment}
             )
     return environment
 
@@ -633,21 +637,27 @@ def _compose_environment(
     service_name: str,
     service: dict[str, Any],
     main_environment: Mapping[str, str],
+    interpolation_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
+    environ = (
+        os.environ
+        if interpolation_environment is None
+        else interpolation_environment
+    )
     environment = {}
     for path in service.get("env_file", []):
-        environment.update(_read_compose_env_file(Path(path)))
+        environment.update(_read_compose_env_file(Path(path), environ))
     configured = service.get("environment", {})
     if isinstance(configured, dict):
         environment.update({
-            key: _resolve_compose_value(key, value)
+            key: _resolve_compose_value(key, value, environ)
             for key, value in configured.items()
         })
     else:
         for entry in configured:
             key, separator, value = entry.partition("=")
             environment[key] = _resolve_compose_value(
-                key, value if separator else None
+                key, value if separator else None, environ
             )
     if service_name == "main":
         environment.update(main_environment)
@@ -846,7 +856,12 @@ async def docker_compose_to_singularity_compose(
             project_dir,
             identity,
             name,
-            _compose_environment(name, service, main_environment or {}),
+            _compose_environment(
+                name,
+                service,
+                main_environment or {},
+                interpolation_environment,
+            ),
         )
         start_options = ["containall"]
         if home_root is None:
@@ -1738,16 +1753,17 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             return dockerfile, context, (), None
         raw_args = build.get("args", {})
         resolved_args: dict[str, str] = {}
+        environ = self._compose_interpolation_environment()
         if isinstance(raw_args, dict):
             resolved_args = {
-                str(key): _resolve_compose_value(str(key), value)
+                str(key): _resolve_compose_value(str(key), value, environ)
                 for key, value in raw_args.items()
             }
         else:
             for entry in raw_args:
                 key, separator, value = entry.partition("=")
                 resolved_args[key] = _resolve_compose_value(
-                    key, value if separator else None
+                    key, value if separator else None, environ
                 )
         args = tuple(
             f"{key}={value}" for key, value in sorted(resolved_args.items())
