@@ -661,6 +661,29 @@ async def test_compose_sidecar_lifecycle_and_file_transfer(
         await _cleanup_environment(environment, instances)
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="requires a genuinely unprivileged host user",
+)
+async def test_unprivileged_instance_has_a_writable_home(
+    tmp_path: Path, ubuntu_sif: Path
+):
+    environment = await _start_environment(tmp_path, ubuntu_sif)
+
+    try:
+        result = await environment.exec(
+            'mkdir -p "$HOME/.local/bin" && touch "$HOME/.local/bin/env" '
+            '&& echo "$HOME"'
+        )
+        override = await environment.exec('echo "$HOME"', env={"HOME": "/tmp"})
+
+        assert result.return_code == 0, result.stderr
+        assert result.stdout.strip() == "/harbor-home"
+        assert override.stdout.strip() == "/tmp"
+    finally:
+        await _cleanup_environment(environment)
+
+
 @pytest.mark.parametrize("fakeroot", [True, False])
 @pytest.mark.skipif(
     os.geteuid() == 0,

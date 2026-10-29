@@ -55,6 +55,9 @@ _COMPOSE_SERVICE_FIELDS = frozenset({
 _COMPOSE_BUILD_FIELDS = frozenset({"args", "context", "dockerfile", "target"})
 _HOST_CA_CERTIFICATES_FILENAME = "host-ca-certificates.crt"
 _COMPOSE_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Without fakeroot, Singularity keeps the host's HOME path but does not mount
+# it under --containall, so commands get a private writable home here instead.
+_CONTAINER_HOME = "/harbor-home"
 # Runtime diagnostics that mean ``--fakeroot`` itself is unusable, as opposed
 # to an unrelated probe failure such as a pull error or a broken image.
 _FAKEROOT_FAILURE_MARKERS = (
@@ -713,6 +716,16 @@ def _compose_volumes(
     return writable, read_only
 
 
+def _add_compose_home(
+    instance: dict[str, Any], home_root: Path | None, key: str
+) -> None:
+    if home_root is None:
+        return
+    home = home_root / key
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    instance["start"]["options"].append(f"home={home}:{_CONTAINER_HOME}")
+
+
 async def docker_compose_to_singularity_compose(
     docker_compose_paths: Path | Sequence[Path],
     singularity_compose_path: Path,
@@ -727,6 +740,7 @@ async def docker_compose_to_singularity_compose(
     main_overlay: Path | None = None,
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
     interpolation_environment: Mapping[str, str] | None = None,
+    home_root: Path | None = None,
 ) -> dict[str, list[str]]:
     """Convert one or more Docker Compose files into a singularity-compose file."""
     paths = (
@@ -785,7 +799,9 @@ async def docker_compose_to_singularity_compose(
             name,
             _compose_environment(name, service, main_environment or {}),
         )
-        start_options = ["containall", "no-home"]
+        start_options = ["containall"]
+        if home_root is None:
+            start_options.append("no-home")
         if fakeroot:
             start_options.insert(0, "fakeroot")
         if name == "main" and main_overlay is not None:
@@ -835,6 +851,7 @@ async def docker_compose_to_singularity_compose(
         if service_workdirs is None and replicas != 1:
             instance["deploy"] = {"replicas": replicas}
         if service_workdirs is None:
+            _add_compose_home(instance, home_root, key)
             instances[key] = instance
             instance_names[name] = [
                 f"{key}{replica}" for replica in range(1, replicas + 1)
@@ -845,6 +862,7 @@ async def docker_compose_to_singularity_compose(
             ):
                 replica = deepcopy(instance)
                 replica["start"]["options"].append(f"workdir={workdir}")
+                _add_compose_home(replica, home_root, instance_key)
                 instances[instance_key] = replica
             instance_names[name] = [
                 f"{instance_key}1" for instance_key in instance_keys[name]
@@ -1845,6 +1863,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             main_overlay=self._overlay_path,
             service_workdirs=service_workdirs,
             interpolation_environment=self._compose_interpolation_environment(),
+            home_root=None if self._fakeroot else self._staging / "harbor-home",
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -1967,7 +1986,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             "instance",
             "start",
             "--containall",
-            "--no-home",
+            *self._home_options(),
             "--workdir",
             str(self._runtime_workdir("main")),
         ]
@@ -1993,6 +2012,22 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             command.extend(["-B", bind])
         command.extend([str(self._sif_path), self._instance_name])
         return command
+
+    def _home_options(self) -> list[str]:
+        # Fakeroot already provides a writable /root through the overlay.
+        if self._fakeroot:
+            return ["--no-home"]
+        home = self._staging / "harbor-home" / "main"
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return ["--home", f"{home}:{_CONTAINER_HOME}"]
+
+    def _exec_home(
+        self, env: dict[str, str] | None, *, merge_persistent: bool
+    ) -> str | None:
+        merged = self._merge_env(env) if merge_persistent else env
+        if merged and "HOME" in merged:
+            return merged["HOME"]
+        return None if self._fakeroot else _CONTAINER_HOME
 
     def _prepare_host_ca_certificates(self) -> Path | None:
         """Materialize the host OpenSSL trust store in the staging mount."""
@@ -2684,8 +2719,13 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         *,
         default_cwd: str | None = None,
         resolve_default_user: bool = True,
+        home: str | None = None,
     ) -> str:
         command = f"cd {shlex.quote(cwd or default_cwd or self._workdir)} && {command}"
+        if home is not None:
+            # Singularity and Apptainer refuse to set HOME through their
+            # environment prefixes, so export it in the container shell.
+            command = f"export HOME={shlex.quote(home)}; {command}"
         requested_user = (
             self._resolve_user(user) if resolve_default_user else user
         )
@@ -2746,7 +2786,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         for key, value in (merged or {}).items():
             if not key or "=" in key or "\0" in key or "\0" in value:
                 raise ValueError(f"Invalid environment variable: {key!r}")
-            runtime_env[f"{prefix}{key}"] = value
+            # ``_exec_shell_command`` exports HOME, which the runtime rejects.
+            if key != "HOME":
+                runtime_env[f"{prefix}{key}"] = value
         return runtime_env
 
     async def _cleanup_exec_process(
@@ -2812,6 +2854,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             pid_file,
             default_cwd=default_cwd,
             resolve_default_user=merge_persistent,
+            home=self._exec_home(env, merge_persistent=merge_persistent),
         )
         runtime_command = [
             *self._instance_exec_prefix(

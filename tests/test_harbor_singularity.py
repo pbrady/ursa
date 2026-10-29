@@ -617,6 +617,118 @@ def test_log_dirs_bind_host_trial_only_with_auto_mounting(
     environment._cleanup_staging()
 
 
+@pytest.mark.parametrize("fakeroot", [False, True])
+def test_instance_home_is_private_and_writable_without_fakeroot(
+    tmp_path: Path, fakeroot: bool
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    environment._prepare_runtime_workdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    environment._staging_dir = staging
+    environment._sif_path = tmp_path / "image.sif"
+
+    start = environment._instance_start_command()
+
+    home = staging / "harbor-home" / "main"
+    if fakeroot:
+        # Fakeroot runs as root with a writable /root in the overlay.
+        assert "--no-home" in start
+        assert "--home" not in start
+        assert not home.exists()
+    else:
+        assert "--no-home" not in start
+        assert _option_value(start, "--home") == f"{home}:/harbor-home"
+        assert home.is_dir()
+        assert "--containall" in start
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize(
+    ("fakeroot", "env", "expected"),
+    [
+        (False, None, "/harbor-home"),
+        (False, {"HOME": "/custom"}, "/custom"),
+        (True, None, None),
+        (True, {"HOME": "/custom"}, "/custom"),
+    ],
+)
+async def test_exec_exports_home_instead_of_runtime_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fakeroot: bool,
+    env: dict[str, str] | None,
+    expected: str | None,
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    _prepare_started_environment(environment, tmp_path)
+    observed: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def spawn(*command: str, **kwargs: object) -> Process:
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        return Process()
+
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+
+    await environment.exec("true", env=env, user="root")
+
+    shell = observed["command"][-1]
+    runtime_env = observed["env"]
+    assert isinstance(shell, str) and isinstance(runtime_env, dict)
+    assert "SINGULARITYENV_HOME" not in runtime_env
+    assert "APPTAINERENV_HOME" not in runtime_env
+    if expected is None:
+        assert "export HOME" not in shell
+    else:
+        assert f"export HOME={expected}; cd " in shell
+    environment._cleanup_staging()
+
+
+async def test_compose_home_option_replaces_no_home_without_fakeroot(
+    tmp_path: Path,
+):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text("services:\n  main: {}\n  helper:\n    image: x\n")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "singularity-compose.yml"
+
+    async def resolve(_name: str, _service: dict[str, object]) -> str:
+        return "image.sif"
+
+    for fakeroot in (True, False):
+        await docker_compose_to_singularity_compose(
+            compose,
+            output,
+            identity="unit",
+            image_resolver=resolve,
+            staging_dir=staging,
+            fakeroot=fakeroot,
+            home_root=None if fakeroot else staging / "harbor-home",
+        )
+        instances = yaml.safe_load(output.read_text())["instances"]
+        for key, instance in instances.items():
+            options = instance["start"]["options"]
+            homes = [option for option in options if option.startswith("home=")]
+            if fakeroot:
+                assert "no-home" in options
+                assert not homes
+            else:
+                assert "no-home" not in options
+                home = staging / "harbor-home" / key
+                assert homes == [f"home={home}:/harbor-home"]
+                assert home.is_dir()
+
+
 async def test_direct_runtime_commands_use_isolated_host_workdirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

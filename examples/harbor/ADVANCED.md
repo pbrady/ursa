@@ -131,6 +131,15 @@ requests. The `singularity_fakeroot` environment kwarg controls this:
   user, so root-owned files in the image stay read-only and tasks that install
   system packages fail. The adapter logs one warning per process.
 
+Without fakeroot, Singularity keeps the host's `HOME` path inside the
+container but does not mount it, so the adapter gives each container a
+private, writable home at `/harbor-home`, backed by the trial's staging
+directory. Tools such as `pip install --user`, `uv`, and
+`source $HOME/.local/bin/env` then work. A `HOME` passed in a command's
+environment takes precedence. With fakeroot, `HOME` is `/root`, which is
+writable through the overlay; with `singularity_overlay=false` the image root
+filesystem, including `/root`, is read-only.
+
 To run tasks that do not need container root on a host without fakeroot:
 
 ```bash
