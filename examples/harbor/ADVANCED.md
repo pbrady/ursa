@@ -82,6 +82,28 @@ For a direct run, add:
 --env ursa.integrations.harbor_singularity:DockerfileSingularityEnvironment
 ```
 
+### Fakeroot
+
+The `singularity_fakeroot` environment kwarg controls whether containers run
+with `--fakeroot`, which makes the invoking user root inside the container so
+the adapter can switch to the container user that Harbor requests:
+
+- `auto` (default): before the first container command, the adapter checks
+  that `<runtime> exec --fakeroot <image> true` succeeds. If it fails, for
+  example because the user has no `/etc/subuid` entry, the adapter logs one
+  warning with the runtime's error and continues without fakeroot.
+- `true`: fakeroot is required. If the check fails, the trial fails before
+  the container starts, with the runtime's error.
+- `false`: never use fakeroot and skip the check.
+
+Without fakeroot, commands run as the invoking host user even when the task
+requests `root` or another container user, and the adapter logs a warning the
+first time this happens. To require fakeroot:
+
+```bash
+--ek singularity_fakeroot=true
+```
+
 ### Multi-container tasks
 
 Add Harbor's standard `environment/docker-compose.yaml` to start sidecars with

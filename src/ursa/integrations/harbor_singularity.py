@@ -22,7 +22,7 @@ from contextlib import suppress
 from copy import deepcopy
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, override
+from typing import Any, BinaryIO, Literal, override
 
 import archspec.cpu
 import yaml
@@ -687,7 +687,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         *args,
         singularity_image_cache_dir: Path | str | None = None,
         singularity_force_pull: bool = False,
-        singularity_fakeroot: bool = True,
+        singularity_fakeroot: bool | str = "auto",
         singularity_overlay: bool = True,
         singularity_no_mount: str | None = None,
         singularity_startup_timeout_sec: float = 300,
@@ -712,7 +712,10 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             else self._default_image_cache_dir()
         )
         self._force_pull = singularity_force_pull
-        self._fakeroot = singularity_fakeroot
+        self._fakeroot_setting = self._parse_fakeroot(singularity_fakeroot)
+        # ``start()`` resolves ``auto`` with a runtime probe before the first
+        # fakeroot command; until then only an explicit ``true`` enables it.
+        self._fakeroot = self._fakeroot_setting is True
         self._overlay_enabled = singularity_overlay
         self._runtime_path: str | None = None
         super().__init__(*args, **kwargs)
@@ -739,6 +742,20 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._compose_uses_sudo = False
         self._sif_use_token = f"{os.getpid()}-{secrets.token_hex(16)}"
         self._sifs_in_use: set[Path] = set()
+
+    @staticmethod
+    def _parse_fakeroot(value: bool | str) -> bool | Literal["auto"]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "auto":
+                return "auto"
+            if normalized in {"true", "1", "yes"}:
+                return True
+            if normalized in {"false", "0", "no"}:
+                return False
+        raise ValueError("singularity_fakeroot must be auto, true, or false")
 
     @staticmethod
     @override
@@ -1829,6 +1846,73 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             raise RuntimeError("Main Singularity image is not prepared")
         return image if "://" in image else f"docker://{image}"
 
+    async def _fakeroot_probe_error(self) -> str | None:
+        """Return why ``--fakeroot`` cannot run on this host, or ``None``."""
+        command = [
+            self._instance_runtime(),
+            "exec",
+            "--cleanenv",
+            "--containall",
+            "--no-home",
+            "--workdir",
+            str(self._runtime_workdir("fakeroot-probe")),
+            "--fakeroot",
+            self._main_seed_image(),
+            "true",
+        ]
+        try:
+            await self._run(*command)
+        except RuntimeError as exc:
+            lines = [line.strip() for line in str(exc).splitlines()]
+            lines = [line for line in lines if line]
+            # Report the runtime's own diagnosis, e.g. SingularityCE's
+            # "FATAL: could not use fakeroot: no mapping entry found in
+            # /etc/subuid", rather than the whole command line.
+            return next(
+                (line for line in reversed(lines) if "FATAL" in line),
+                lines[-1] if lines else type(exc).__name__,
+            )
+        return None
+
+    async def _resolve_fakeroot(self) -> None:
+        """Decide whether this start uses ``--fakeroot``.
+
+        Runs before the first command that would pass ``--fakeroot`` so the
+        seed exec, instance start, Compose options, and user switching all
+        see the resolved value.
+        """
+        if self._fakeroot_setting is False:
+            self._fakeroot = False
+            return
+        reason = await self._fakeroot_probe_error()
+        self._fakeroot = reason is None
+        if reason is not None:
+            self._fakeroot_unavailable(reason)
+
+    def _fakeroot_unavailable(self, reason: str) -> None:
+        """Apply the policy for a host without usable fakeroot.
+
+        ``true`` requires fakeroot and fails here; ``auto`` degrades to the
+        invoking host user. This is the single place to make ``auto`` fail
+        for tasks that cannot run without container root.
+        """
+        if self._fakeroot_setting is True:
+            raise RuntimeError(
+                "Singularity fakeroot is required (singularity_fakeroot=true) "
+                f"but unavailable on this host: {reason}. Fakeroot needs a "
+                "user-namespace mapping for the invoking user, such as "
+                "/etc/subuid and /etc/subgid entries. Set "
+                "singularity_fakeroot=auto to continue without it, or false "
+                "to skip this check."
+            )
+        self.logger.warning(
+            "Singularity fakeroot is unavailable, so commands will run as the "
+            "invoking host user instead of container root: %s. Set "
+            "singularity_fakeroot=false to skip this check, or true to "
+            "require fakeroot.",
+            reason,
+        )
+
     async def _seed_harbor_bind_sources(self) -> None:
         """Copy existing image content into writable bind sources."""
         if self._staging_dir is None:
@@ -2151,6 +2235,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             self._prepare_host_ca_certificates()
             self._instance_start_attempted = False
             async with asyncio.timeout(self._startup_timeout_sec):
+                await self._resolve_fakeroot()
                 if self._overlay_enabled:
                     self._prepare_disk_overlay()
                 self._prepare_harbor_bind_sources()
