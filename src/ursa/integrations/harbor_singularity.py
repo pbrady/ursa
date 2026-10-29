@@ -844,12 +844,12 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
     @override
     def _validate_definition(self) -> None:
         unsupported_mounts = [
-            mount for mount in self._mounts if mount.get("type") != "bind"
+            mount for mount in self._host_mounts if mount.get("type") != "bind"
         ]
         if unsupported_mounts:
             raise ValueError("Singularity supports only Harbor bind mounts")
         if self._uses_compose and any(
-            mount.get("read_only") for mount in self._mounts
+            mount.get("read_only") for mount in self._host_mounts
         ):
             raise ValueError(
                 "singularity-compose cannot preserve read-only Harbor mounts"
@@ -1532,7 +1532,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 )
                 for replica in range(1, replicas + 1)
             )
-        main_mounts = list(self._mounts)
+        main_mounts = list(self._host_mounts)
         for source, target in self._harbor_writable_binds():
             source.mkdir(parents=True, exist_ok=True)
             source.chmod(0o777)
@@ -1685,7 +1685,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         if network_policy.network_mode == NetworkMode.NO_NETWORK:
             command.extend(["--net", "--network", "none"])
         command.extend(["-B", f"{self._staging_dir}:/staging"])
-        for mount in self._mounts:
+        for mount in self._host_mounts:
             if mount.get("type") != "bind":
                 raise ValueError("Singularity supports only Harbor bind mounts")
             if mount.get("target") == "/staging":
@@ -1754,7 +1754,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         )
         configured_targets = {
             PurePosixPath(mount["target"])
-            for mount in self._mounts
+            for mount in self._host_mounts
             if mount.get("type") == "bind"
         }
         if self._uses_compose:

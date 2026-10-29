@@ -30,6 +30,7 @@ def _environment(
     network_mode: NetworkMode = NetworkMode.PUBLIC,
     phase_network_modes: tuple[NetworkMode, ...] = (),
     overlay: bool = False,
+    auto_mounting: bool = False,
 ) -> DockerfileSingularityEnvironment:
     environment_dir = tmp_path / "environment"
     environment_dir.mkdir()
@@ -69,6 +70,7 @@ def _environment(
         persistent_env={},
         singularity_fakeroot=False,
         singularity_overlay=overlay,
+        auto_mounting=auto_mounting,
     )
     environment._runtime_path = str(tmp_path / "fake-singularity")
     return environment
@@ -518,6 +520,37 @@ async def test_build_with_records_builder_and_apptainer_failures(
     save = next(item for item in observed if item[0][:2] == ("docker", "save"))
     assert save[1] == {"failure_log_path": build_log}
     assert output.read_bytes() == b"sif"
+
+
+@pytest.mark.parametrize("auto_mounting", [False, True])
+def test_log_dirs_bind_host_trial_only_with_auto_mounting(
+    tmp_path: Path, auto_mounting: bool
+):
+    environment = _environment(tmp_path, auto_mounting=auto_mounting)
+    environment._prepare_runtime_workdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    environment._staging_dir = staging
+    environment._sif_path = tmp_path / "image.sif"
+    trial_agent_dir = environment.trial_paths.agent_dir
+
+    start = environment._instance_start_command()
+    binds = [start[i + 1] for i, arg in enumerate(start) if arg == "-B"]
+    agent_binds = [bind for bind in binds if bind.endswith(":/logs/agent")]
+
+    assert f"{tmp_path / 'workspace'}:/workspace" in binds
+    if auto_mounting:
+        assert agent_binds == [f"{trial_agent_dir}:/logs/agent"]
+    else:
+        # Harbor downloads unmounted logs; staging keeps /logs writable.
+        assert agent_binds == [
+            f"{staging / 'harbor-writable' / 'logs' / 'agent'}:/logs/agent"
+        ]
+    assert (
+        environment.is_path_mounted("/logs/agent", trial_agent_dir)
+        is auto_mounting
+    )
+    environment._cleanup_staging()
 
 
 async def test_direct_runtime_commands_use_isolated_host_workdirs(
