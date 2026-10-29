@@ -33,6 +33,7 @@ from harbor.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
 )
+from harbor.environments.definition import should_use_prebuilt_docker_image
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import EnvironmentPaths
@@ -910,6 +911,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         main = config["services"]["main"] if config is not None else {}
         if (
             not ({"build", "image"} & set(main))
+            and not self.task_env_config.docker_image
             and not self._dockerfile_path.is_file()
         ):
             raise FileNotFoundError(
@@ -1029,6 +1031,63 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             build_args,
             target,
         )
+
+    @staticmethod
+    def _image_uri(image: str) -> str:
+        """Return the runtime pull URI for a Compose or task image reference."""
+        if "://" in image:
+            return image
+        name = image.rsplit("/", 1)[-1]
+        if ":" not in name and "@" not in name:
+            image = f"{image}:latest"
+        return f"docker://{image}"
+
+    def _pulled_image_cache_path(self, uri: str) -> Path:
+        # A digest-pinned reference keys the cache by its digest. Tags are
+        # keyed as written; ``singularity_force_pull`` refreshes them.
+        digest = hashlib.sha256(
+            json.dumps(
+                {"architecture": platform.machine(), "image": uri},
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        return self._image_cache_dir / f"image-{digest[:24]}.sif"
+
+    def _prebuilt_image(self, force_build: bool) -> str | None:
+        """Return the task image to pull instead of building, as in Harbor."""
+        image = self.task_env_config.docker_image
+        if not should_use_prebuilt_docker_image(
+            self.environment_dir, docker_image=image, force_build=force_build
+        ):
+            return None
+        return image
+
+    async def _pull_image_sif(self, image: str, force_pull: bool) -> Path:
+        """Pull an OCI image into the SIF cache, or use a local SIF file."""
+        if "://" not in image and image.endswith(".sif"):
+            path = Path(image).expanduser()
+            if not await self._is_valid_sif(path):
+                raise FileNotFoundError(f"Singularity image not found: {path}")
+            return path
+        uri = self._image_uri(image)
+        output = self._pulled_image_cache_path(uri)
+        self._image_cache_dir.mkdir(parents=True, exist_ok=True)
+        if not force_pull and await self._is_valid_sif(output):
+            return output
+        async with AsyncFileLock(output.with_suffix(".lock")):
+            if not force_pull and await self._is_valid_sif(output):
+                return output
+            temporary = output.with_suffix(".tmp.sif")
+            temporary.unlink(missing_ok=True)
+            try:
+                await self._run(
+                    self._instance_runtime(), "pull", str(temporary), uri
+                )
+                temporary.replace(output)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return output
 
     async def _is_valid_sif(self, path: Path) -> bool:
         if not path.is_file() or path.stat().st_size == 0:
@@ -1448,17 +1507,47 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             return None
         return self._compose_build_inputs(build)
 
-    async def _build_main_sif(self, force_build: bool) -> Path | None:
-        build = self._main_compose_build_inputs()
-        if build is None and self._uses_compose:
+    @staticmethod
+    def _compose_service_image(
+        service_name: str, service: dict[str, Any]
+    ) -> str | None:
+        if "build" in service or "image" not in service:
+            return None
+        image = service["image"]
+        if not isinstance(image, str) or not image:
+            raise ValueError(
+                f"Docker Compose image on service {service_name!r} "
+                "must be a non-empty string"
+            )
+        return image
+
+    def _main_image(self, force_build: bool) -> str | None:
+        """Return the image the main SIF is pulled from, if it is not built.
+
+        As with Harbor's Docker backend, an explicit Compose ``main.image``
+        wins over the task's prebuilt ``docker_image``, which in turn wins
+        over any Dockerfile unless the trial forces a build.
+        """
+        if self._uses_compose:
             main = self._load_compose_config()["services"]["main"]
-            if "image" in main:
-                return None
+            image = self._compose_service_image("main", main)
+            if image is not None:
+                return image
+        return self._prebuilt_image(force_build)
+
+    async def _build_main_sif(self, force_build: bool) -> Path:
+        # ``singularity_force_pull`` refreshes the cached SIF but never turns
+        # a prebuilt-image task into a Dockerfile build.
+        refresh = force_build or self._force_pull
+        image = self._main_image(force_build)
+        if image is not None:
+            return await self._pull_image_sif(image, refresh)
+        build = self._main_compose_build_inputs()
         if build is None:
-            return await self._build_dockerfile_sif(force_build)
+            return await self._build_dockerfile_sif(refresh)
         dockerfile, context, build_args, target = build
         return await self._build_dockerfile_sif(
-            force_build,
+            refresh,
             dockerfile_path=dockerfile,
             context_dir=context,
             build_args=build_args,
@@ -1466,48 +1555,44 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         )
 
     async def build_sifs(self, force_build: bool = False) -> list[Path]:
-        """Build every Dockerfile-backed SIF without starting an instance.
+        """Build or pull every SIF without starting an instance.
 
-        This includes the main environment and each Compose sidecar with a
-        ``build`` definition. Compose services that specify only ``image`` are
-        left as runtime image URIs and therefore do not produce a managed SIF
-        path here.
+        This includes the main environment and each Compose sidecar. Images
+        named by ``docker_image`` or a Compose ``image`` are pulled into the
+        SIF cache, so a login node can prepare compute nodes without registry
+        access.
         """
-        paths: list[Path] = []
-        main_path = await self._build_main_sif(force_build or self._force_pull)
-        if main_path is not None:
-            paths.append(main_path)
+        paths = [await self._build_main_sif(force_build)]
         if not self._uses_compose:
             return paths
 
+        refresh = force_build or self._force_pull
         compose_config = self._load_compose_config()
-        main_build = self._main_compose_build_inputs()
-        if (
-            main_build is None
-            and "image" not in compose_config["services"]["main"]
-        ):
-            main_build = (
-                self._dockerfile_path,
-                self.environment_dir,
-                (),
-                None,
+        seen_builds = set()
+        if self._main_image(force_build) is None:
+            seen_builds.add(
+                self._main_compose_build_inputs()
+                or (self._dockerfile_path, self.environment_dir, (), None)
             )
-        seen_builds = {main_build} if main_build is not None else set()
         for name, service in compose_config["services"].items():
-            if name == "main" or "build" not in service:
+            if name == "main":
                 continue
-            build = self._compose_build_inputs(service["build"])
-            if build in seen_builds:
-                continue
-            seen_builds.add(build)
-            dockerfile, context, build_args, target = build
-            path = await self._build_dockerfile_sif(
-                force_build or self._force_pull,
-                dockerfile_path=dockerfile,
-                context_dir=context,
-                build_args=build_args,
-                target=target,
-            )
+            image = self._compose_service_image(name, service)
+            if image is not None:
+                path = await self._pull_image_sif(image, refresh)
+            else:
+                build = self._compose_build_inputs(service["build"])
+                if build in seen_builds:
+                    continue
+                seen_builds.add(build)
+                dockerfile, context, build_args, target = build
+                path = await self._build_dockerfile_sif(
+                    refresh,
+                    dockerfile_path=dockerfile,
+                    context_dir=context,
+                    build_args=build_args,
+                    target=target,
+                )
             if path not in paths:
                 paths.append(path)
         return paths
@@ -1518,13 +1603,16 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         service: dict[str, Any],
         force_build: bool,
     ) -> str:
+        image = self._compose_service_image(service_name, service)
         if service_name == "main":
-            if "build" in service or "image" not in service:
-                if self._sif_path is None:
-                    raise RuntimeError("Main Singularity image is not prepared")
-                await self._mark_sif_in_use(self._sif_path)
-                return str(self._sif_path)
-        if "build" in service:
+            if self._sif_path is None:
+                raise RuntimeError("Main Singularity image is not prepared")
+            path = self._sif_path
+        elif image is not None:
+            # Pull into the shared cache; singularity-compose would otherwise
+            # pull a private copy into every per-trial project directory.
+            path = await self._pull_image_sif(image, force_build)
+        else:
             dockerfile, context, build_args, target = (
                 self._compose_build_inputs(service["build"])
             )
@@ -1535,17 +1623,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 build_args=build_args,
                 target=target,
             )
-            await self._mark_sif_in_use(path)
-            return str(path)
-        image = service["image"]
-        if not isinstance(image, str) or not image:
-            raise ValueError(
-                f"Docker Compose image on service {service_name!r} "
-                "must be a non-empty string"
-            )
-        if "://" not in image:
-            image = f"docker://{image}"
-        return image
+        await self._mark_sif_in_use(path)
+        return str(path)
 
     async def _prepare_compose_project(self, force_build: bool) -> None:
         self._compose_project_dir = Path(
@@ -1861,13 +1940,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._overlay_path = overlay
 
     def _main_seed_image(self) -> str:
-        if self._sif_path is not None:
-            return str(self._sif_path)
-        main = self._load_compose_config()["services"]["main"]
-        image = main.get("image")
-        if not isinstance(image, str) or not image:
+        if self._sif_path is None:
             raise RuntimeError("Main Singularity image is not prepared")
-        return image if "://" in image else f"docker://{image}"
+        return str(self._sif_path)
 
     async def _fakeroot_probe_error(self) -> str | None:
         """Return why ``--fakeroot`` cannot run on this host, or ``None``."""
@@ -2267,11 +2342,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             raise RuntimeError("Singularity is unavailable on Windows")
         try:
             self._raise_if_fakeroot_known_unavailable()
-            self._sif_path = await self._build_main_sif(
-                force_build or self._force_pull
-            )
-            if self._sif_path is not None:
-                await self._mark_sif_in_use(self._sif_path)
+            self._sif_path = await self._build_main_sif(force_build)
+            await self._mark_sif_in_use(self._sif_path)
             self._prepare_runtime_workdir()
             self._scratch_dir = Path(
                 tempfile.mkdtemp(prefix="ursa-harbor-singularity-")

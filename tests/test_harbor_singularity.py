@@ -1125,11 +1125,20 @@ async def test_build_sifs_builds_main_and_unique_compose_sidecars(
         observed.append((force_build, dockerfile, context))
         return tmp_path / f"{context.name}.sif"
 
+    async def pull(image: str, force_pull: bool) -> Path:
+        observed.append((force_pull, Path(image), Path()))
+        return tmp_path / "redis.sif"
+
     monkeypatch.setattr(environment, "_build_dockerfile_sif", build)
+    monkeypatch.setattr(environment, "_pull_image_sif", pull)
 
     paths = await environment.build_sifs(force_build=True)
 
-    assert paths == [tmp_path / "environment.sif", tmp_path / "helper.sif"]
+    assert paths == [
+        tmp_path / "environment.sif",
+        tmp_path / "helper.sif",
+        tmp_path / "redis.sif",
+    ]
     assert observed == [
         (
             True,
@@ -1137,7 +1146,312 @@ async def test_build_sifs_builds_main_and_unique_compose_sidecars(
             environment.environment_dir,
         ),
         (True, helper / "Dockerfile", helper),
+        (True, Path("redis:7"), Path()),
     ]
+
+
+def _image_environment(
+    tmp_path: Path,
+    docker_image: str | None,
+    *,
+    dockerfile: bool = True,
+    compose: str | None = None,
+    force_pull: bool = False,
+) -> DockerfileSingularityEnvironment:
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    if dockerfile:
+        (environment_dir / "Dockerfile").write_text(
+            "FROM ubuntu:24.04\nRUN apt-get update\nWORKDIR /app\n"
+        )
+    if compose is not None:
+        (environment_dir / "docker-compose.yaml").write_text(compose)
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    environment = DockerfileSingularityEnvironment(
+        environment_dir=environment_dir,
+        environment_name="unit-test",
+        session_id=f"{tmp_path.name}__env",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(docker_image=docker_image),
+        network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+        persistent_env={},
+        singularity_image_cache_dir=tmp_path / "cache",
+        singularity_force_pull=force_pull,
+        singularity_fakeroot=False,
+    )
+    return environment
+
+
+def _install_pull_runtime(
+    environment: DockerfileSingularityEnvironment,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str = "singularity",
+) -> Path:
+    """Fake a runtime that records argv, pulls, and validates SIF files."""
+    log = tmp_path / "runtime.log"
+    runtime = tmp_path / "bin" / name
+    runtime.parent.mkdir(exist_ok=True)
+    runtime.write_text(
+        "#!/bin/sh\n"
+        f'echo "$*" >> {log}\n'
+        'case "$1" in\n'
+        '  pull) printf sif > "$2" ;;\n'
+        '  sif) test -s "$3" ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    runtime.chmod(0o755)
+    environment._runtime_path = str(runtime)
+
+    def no_builders(command: str) -> str | None:
+        if command in {"buildah", "podman", "docker"}:
+            pytest.fail(f"a prebuilt image must not look up {command}")
+        return None
+
+    monkeypatch.setattr(harbor_singularity.shutil, "which", no_builders)
+    return log
+
+
+def _pulls(log: Path) -> list[list[str]]:
+    if not log.is_file():
+        return []
+    return [
+        line.split()
+        for line in log.read_text().splitlines()
+        if line.startswith("pull ")
+    ]
+
+
+async def test_prebuilt_image_is_pulled_instead_of_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _image_environment(tmp_path, "alexgshaw/x:20251031")
+    log = _install_pull_runtime(environment, tmp_path, monkeypatch)
+
+    first = await environment._build_main_sif(force_build=False)
+    second = await environment._build_main_sif(force_build=False)
+
+    pulls = _pulls(log)
+    assert len(pulls) == 1
+    assert pulls[0][0] == "pull"
+    assert pulls[0][1] == str(first.with_suffix(".tmp.sif"))
+    assert pulls[0][2] == "docker://alexgshaw/x:20251031"
+    assert first == second
+    assert first.parent == tmp_path / "cache"
+    assert first.name.startswith("image-")
+    assert first.read_text() == "sif"
+    assert not first.with_suffix(".tmp.sif").exists()
+    # The Dockerfile still provides the workdir, as for Harbor's Docker
+    # backend, but is never built.
+    assert environment._workdir == "/app"
+
+
+async def test_force_build_builds_dockerfile_despite_prebuilt_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _image_environment(tmp_path, "alexgshaw/x:20251031")
+    built: list[bool] = []
+
+    async def build(force_build: bool, **_kwargs: object) -> Path:
+        built.append(force_build)
+        return tmp_path / "built.sif"
+
+    async def unexpected(*_args: object) -> Path:
+        pytest.fail("force_build must build the task Dockerfile")
+
+    monkeypatch.setattr(environment, "_build_dockerfile_sif", build)
+    monkeypatch.setattr(environment, "_pull_image_sif", unexpected)
+
+    assert await environment._build_main_sif(force_build=True) == (
+        tmp_path / "built.sif"
+    )
+    assert built == [True]
+
+
+async def test_force_build_without_dockerfile_refreshes_the_pull(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _image_environment(
+        tmp_path, "alexgshaw/x:20251031", dockerfile=False
+    )
+    log = _install_pull_runtime(environment, tmp_path, monkeypatch)
+
+    await environment._build_main_sif(force_build=False)
+    await environment._build_main_sif(force_build=True)
+
+    assert len(_pulls(log)) == 2
+    assert environment._workdir == "/"
+
+
+async def test_force_pull_refreshes_prebuilt_image_without_building(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _image_environment(
+        tmp_path, "alexgshaw/x:20251031", force_pull=True
+    )
+    log = _install_pull_runtime(environment, tmp_path, monkeypatch)
+
+    await environment._build_main_sif(force_build=False)
+    await environment._build_main_sif(force_build=False)
+
+    assert len(_pulls(log)) == 2
+
+
+async def test_failed_pull_leaves_no_cached_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _image_environment(tmp_path, "example/missing:1")
+    _install_pull_runtime(environment, tmp_path, monkeypatch)
+    runtime = Path(environment._instance_runtime())
+    runtime.write_text(
+        '#!/bin/sh\nprintf partial > "$2"\n'
+        'echo "FATAL:   manifest unknown" >&2\nexit 255\n'
+    )
+
+    with pytest.raises(RuntimeError, match="manifest unknown"):
+        await environment._build_main_sif(force_build=False)
+
+    assert not [
+        path for path in (tmp_path / "cache").iterdir() if path.suffix == ".sif"
+    ]
+
+
+async def test_prebuilt_image_pull_uses_apptainer_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _image_environment(tmp_path, "ubuntu", dockerfile=False)
+    log = _install_pull_runtime(
+        environment, tmp_path, monkeypatch, name="apptainer"
+    )
+
+    await environment._build_main_sif(force_build=False)
+
+    assert _pulls(log)[0][2] == "docker://ubuntu:latest"
+    assert Path(environment._instance_runtime()).name == "apptainer"
+
+
+async def test_prebuilt_sif_path_is_used_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    image = tmp_path / "images" / "task.sif"
+    image.parent.mkdir()
+    image.write_text("sif")
+    environment = _image_environment(tmp_path, str(image), dockerfile=False)
+    log = _install_pull_runtime(environment, tmp_path, monkeypatch)
+
+    assert await environment._build_main_sif(force_build=False) == image
+    assert not _pulls(log)
+
+    image.unlink()
+    with pytest.raises(FileNotFoundError, match="task.sif"):
+        await environment._build_main_sif(force_build=False)
+
+
+@pytest.mark.parametrize(
+    ("image", "uri"),
+    [
+        ("ubuntu", "docker://ubuntu:latest"),
+        ("alexgshaw/x:20251031", "docker://alexgshaw/x:20251031"),
+        ("registry:5000/team/img", "docker://registry:5000/team/img:latest"),
+        ("registry:5000/team/img:v1", "docker://registry:5000/team/img:v1"),
+        ("img@sha256:" + "a" * 64, "docker://img@sha256:" + "a" * 64),
+        ("library://alpine:3.20", "library://alpine:3.20"),
+        ("docker://ubuntu:24.04", "docker://ubuntu:24.04"),
+    ],
+)
+def test_image_uri_normalization(image: str, uri: str):
+    assert DockerfileSingularityEnvironment._image_uri(image) == uri
+
+
+def test_pulled_image_cache_is_keyed_by_reference(tmp_path: Path):
+    environment = _image_environment(tmp_path, "ubuntu:24.04")
+    key = environment._pulled_image_cache_path
+
+    assert key("docker://ubuntu:24.04") == key("docker://ubuntu:24.04")
+    assert key("docker://ubuntu:24.04") != key("docker://ubuntu:22.04")
+    assert key("docker://img@sha256:" + "a" * 64) != key(
+        "docker://img@sha256:" + "b" * 64
+    )
+
+
+def test_prebuilt_image_does_not_require_a_dockerfile(tmp_path: Path):
+    environment = _image_environment(tmp_path, "ubuntu:24.04", dockerfile=False)
+
+    assert environment._main_image(force_build=False) == "ubuntu:24.04"
+    (tmp_path / "other").mkdir()
+    with pytest.raises(FileNotFoundError, match="Dockerfile"):
+        _image_environment(tmp_path / "other", None, dockerfile=False)
+
+
+async def test_separate_verifier_image_is_pulled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Harbor starts a separate verifier with its own EnvironmentConfig and
+    # force_build=False, so its docker_image is pulled like the agent's.
+    verifier = _image_environment(
+        tmp_path, "alexgshaw/x-tests:20251031", dockerfile=False
+    )
+    log = _install_pull_runtime(verifier, tmp_path, monkeypatch)
+
+    paths = await verifier.build_sifs()
+
+    assert len(paths) == 1
+    assert _pulls(log)[0][2] == "docker://alexgshaw/x-tests:20251031"
+
+
+@pytest.mark.parametrize(
+    ("main", "expected"),
+    [
+        ("    volumes: []\n", "docker://alexgshaw/x:20251031"),
+        ("    image: ubuntu:24.04\n", "docker://ubuntu:24.04"),
+    ],
+)
+async def test_compose_main_image_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    main: str,
+    expected: str,
+):
+    environment = _image_environment(
+        tmp_path,
+        "alexgshaw/x:20251031",
+        compose=f"services:\n  main:\n{main}",
+    )
+    log = _install_pull_runtime(environment, tmp_path, monkeypatch)
+
+    await environment._build_main_sif(force_build=False)
+
+    assert [pull[2] for pull in _pulls(log)] == [expected]
+
+
+async def test_compose_sidecar_images_resolve_to_cached_sifs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _image_environment(
+        tmp_path,
+        "alexgshaw/x:20251031",
+        compose="services:\n  main: {}\n  helper:\n    image: redis:7\n",
+    )
+    log = _install_pull_runtime(environment, tmp_path, monkeypatch)
+    environment._sif_path = await environment._build_main_sif(False)
+
+    main = await environment._compose_image("main", {}, False)
+    helper = await environment._compose_image(
+        "helper", {"image": "redis:7"}, False
+    )
+    paths = await environment.build_sifs()
+
+    assert main == str(environment._sif_path)
+    assert Path(helper).parent == tmp_path / "cache"
+    assert paths == [environment._sif_path, Path(helper)]
+    assert [pull[2] for pull in _pulls(log)] == [
+        "docker://alexgshaw/x:20251031",
+        "docker://redis:7",
+    ]
+    assert environment._sif_in_use_path(Path(helper)).is_file()
+    await environment._release_sifs_in_use()
 
 
 async def test_stop_removes_runtime_workdir_and_restart_uses_a_new_one(

@@ -64,17 +64,46 @@ the agent runs, for example to follow `ursa.log` live.
 
 ## Singularity
 
-The custom environment builds `environment/Dockerfile` with Buildah, Podman,
-or Docker, converts it to a cached SIF, and requires no Apptainer definition
-file. Compute nodes need `apptainer` or `singularity`, plus one of `buildah`,
-`podman`, or `docker`. When using Docker, its daemon must be running and the
-invoking process must have socket access.
+When a task sets `[environment].docker_image`, as every Terminal-Bench 2 task
+does, the custom environment pulls that image with `<runtime> pull
+docker://<image>` and needs no container builder. A reference without a tag
+gets `:latest`, a reference with another scheme (such as `library://`) is
+pulled as written, and a path ending in `.sif` is used directly. Otherwise it
+builds `environment/Dockerfile` with Buildah, Podman, or Docker, converts it
+to a cached SIF, and requires no Apptainer definition file. Building needs one
+of `buildah`, `podman`, or `docker` on the host; when using Docker, its daemon
+must be running and the invoking process must have socket access. Rootless
+Buildah and Podman can only run Dockerfile `RUN` steps when the user has
+`/etc/subuid` and `/etc/subgid` entries.
 
-SIFs are cached by build context under `$XDG_CACHE_HOME/ursa/harbor/sif`, or
-`~/.cache/ursa/harbor/sif` when `XDG_CACHE_HOME` is unset. Concurrent trials
-with the same build context share a lock and build only once. Set
-`URSA_HARBOR_SIF_CACHE` or pass `singularity_image_cache_dir` as an environment
-kwarg to use a different shared cache.
+The pull-or-build choice follows Harbor: `harbor run --force-build` builds the
+Dockerfile even when `docker_image` is set, and pulls again when the task has
+no Dockerfile. The `singularity_force_pull` environment kwarg refreshes cached
+images and rebuilds Dockerfiles, but never switches a `docker_image` task to a
+build. The same rules apply to a separate verifier image and to Compose
+services. A pulled task image does not report its `WORKDIR`; the adapter reads
+it from `environment/Dockerfile` when one exists, and otherwise uses `/`, so
+set `[environment].workdir` for image-only tasks that need another directory.
+
+SIFs are cached under `$XDG_CACHE_HOME/ursa/harbor/sif`, or
+`~/.cache/ursa/harbor/sif` when `XDG_CACHE_HOME` is unset. Built images are
+keyed by build context and pulled images by their reference, so a tag is
+pulled only once until it is refreshed and a digest-pinned reference
+(`name@sha256:...`) is keyed by its digest. Concurrent trials that need the
+same image share a lock and build or pull it only once. Set
+`URSA_HARBOR_SIF_CACHE` or pass `singularity_image_cache_dir` as an
+environment kwarg to use a different shared cache. The runtime also keeps
+its own layer cache, `~/.apptainer/cache` or `~/.singularity/cache` by
+default; set `APPTAINER_CACHEDIR` or `SINGULARITY_CACHEDIR` when home
+quotas are small. Registry credentials come from `APPTAINER_DOCKER_USERNAME`
+and `APPTAINER_DOCKER_PASSWORD` (or the `SINGULARITY_` forms), which also
+avoid Docker Hub's anonymous rate limit for large task sets.
+
+When compute nodes cannot reach a registry, prepare the cache on a login node:
+
+```bash
+uv run -m ursa.integrations.harbor prebuild path/to/tasks
+```
 
 For a direct run, add:
 

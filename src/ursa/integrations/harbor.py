@@ -1167,7 +1167,9 @@ def prebuild_sifs(
     ],
     force: Annotated[
         bool,
-        typer.Option("--force", help="Rebuild SIFs already present in cache"),
+        typer.Option(
+            "--force", help="Rebuild or re-pull SIFs already present in cache"
+        ),
     ] = False,
     image_cache_dir: Annotated[
         Path | None,
@@ -1177,7 +1179,7 @@ def prebuild_sifs(
         ),
     ] = None,
 ) -> None:
-    """Pre-build Dockerfile-backed SIF files for Harbor tasks."""
+    """Build or pull the SIF files for Harbor tasks ahead of a run."""
     from ursa.integrations.harbor_validation import (
         discover_harbor_tasks,
         prebuild_harbor_task,
