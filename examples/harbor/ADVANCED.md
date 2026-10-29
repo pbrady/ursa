@@ -218,7 +218,8 @@ long form with `type: bind` and optional `read_only: true`. The source must
 exist on the host, and paths cannot contain `:` or `,`. Because
 `singularity-compose` 0.1.19 accepts only `SOURCE:TARGET` volumes, the adapter
 passes read-only mounts, including read-only Harbor mounts, to Singularity as
-`--bind=SOURCE:TARGET:ro` start options instead. A mount inside the task's
+`--bind=SOURCE:TARGET:ro` start options instead, followed by any mounts nested
+inside them so the read-only parent does not hide them. A mount inside the task's
 workdir or another writable Harbor path gets an empty mount point in that
 path's host directory, so the image does not need to provide one.
 

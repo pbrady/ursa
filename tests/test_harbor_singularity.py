@@ -1413,6 +1413,53 @@ async def test_compose_keeps_read_only_harbor_mounts(tmp_path: Path):
     assert not any(volume.endswith(":ro") for volume in main["volumes"])
 
 
+async def test_compose_read_only_parent_does_not_hide_writable_child(
+    tmp_path: Path,
+):
+    for name in ("data", "out", "other"):
+        (tmp_path / name).mkdir()
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  main:\n"
+        "    volumes:\n"
+        f"      - {tmp_path}/out:/data/out\n"
+        f"      - {tmp_path}/data:/data:ro\n"
+        f"      - {tmp_path}/other:/other\n"
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "singularity-compose.yml"
+
+    async def resolve(_name: str, _service: dict[str, object]) -> str:
+        return "image.sif"
+
+    await docker_compose_to_singularity_compose(
+        compose,
+        output,
+        identity="unit",
+        image_resolver=resolve,
+        staging_dir=staging,
+        fakeroot=False,
+    )
+
+    (main,) = yaml.safe_load(output.read_text())["instances"].values()
+    # singularity-compose emits volumes first, then start options in order.
+    assert main["volumes"] == [
+        f"{tmp_path}/other:/other",
+        f"{staging}:/staging",
+    ]
+    binds = [
+        option
+        for option in main["start"]["options"]
+        if option.startswith("bind=")
+    ]
+    assert binds == [
+        f"bind={tmp_path}/data:/data:ro",
+        f"bind={tmp_path}/out:/data/out",
+    ]
+
+
 async def test_compose_writable_volumes_mount_parents_first(tmp_path: Path):
     (tmp_path / "nested").mkdir()
     compose = tmp_path / "docker-compose.yaml"

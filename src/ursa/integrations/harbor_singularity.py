@@ -677,10 +677,12 @@ def _compose_volumes(
     environment_file: Path | None,
     main_mounts: Sequence[Mapping[str, Any]],
 ) -> tuple[list[str], list[str]]:
-    """Return a service's writable volumes and read-only binds.
+    """Return a service's volumes and the binds to pass as start options.
 
     singularity-compose 0.1.19 splits each volume into exactly ``src:dst``,
-    so read-only binds are returned separately for ``start.options``.
+    so read-only binds go to ``start.options``, which follow the volumes on
+    the command line. Binds nested inside a read-only one go there too, so
+    the read-only parent cannot hide them.
     """
     volumes = list(service.get("volumes", []))
     for volume in volumes:
@@ -730,9 +732,23 @@ def _compose_volumes(
     volumes.sort(
         key=lambda volume: len(PurePosixPath(_volume_target(volume)).parts)
     )
-    writable = [volume for volume in volumes if not volume.endswith(":ro")]
-    read_only = [volume for volume in volumes if volume.endswith(":ro")]
-    return writable, read_only
+    read_only_targets = [
+        PurePosixPath(_volume_target(volume))
+        for volume in volumes
+        if volume.endswith(":ro")
+    ]
+
+    def under_read_only(volume: str) -> bool:
+        target = PurePosixPath(_volume_target(volume))
+        return any(
+            target == parent or parent in target.parents
+            for parent in read_only_targets
+        )
+
+    return (
+        [volume for volume in volumes if not under_read_only(volume)],
+        [volume for volume in volumes if under_read_only(volume)],
+    )
 
 
 def _add_compose_home(
@@ -842,7 +858,7 @@ async def docker_compose_to_singularity_compose(
             instance["network"]["type"] = "none"
         elif host_network:
             instance["network"]["enable"] = False
-        volumes, read_only_binds = _compose_volumes(
+        volumes, start_binds = _compose_volumes(
             name,
             service,
             staging_dir=staging_dir,
@@ -851,9 +867,9 @@ async def docker_compose_to_singularity_compose(
         )
         if volumes:
             instance["volumes"] = volumes
-        # singularity-compose passes these through as ``--bind=src:dst:ro``
-        # after the writable volume binds.
-        start_options.extend(f"bind={bind}" for bind in read_only_binds)
+        # singularity-compose passes these through as ``--bind=src:dst[:ro]``
+        # after the volume binds.
+        start_options.extend(f"bind={bind}" for bind in start_binds)
         if depends_on := service.get("depends_on", []):
             instance["depends_on"] = [
                 instance_key
