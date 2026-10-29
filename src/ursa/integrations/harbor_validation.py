@@ -7,11 +7,12 @@ from pathlib import Path
 from harbor.models.task.config import StepConfig, VerifierEnvironmentMode
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import (
-    resolve_effective_verifier_env_config,
+    VerifierEnvironmentDefinition,
     resolve_step_verifier_mode,
     resolve_task_verifier_mode,
+    resolve_verifier_environment_definition,
 )
-from harbor.models.trial.config import AgentConfig
+from harbor.models.trial.config import AgentConfig, VerifierConfig
 from harbor.models.trial.config import (
     EnvironmentConfig as TrialEnvironmentConfig,
 )
@@ -59,6 +60,7 @@ def _make_environment(
     suffix: str,
     purpose: str,
     image_cache_dir: Path | str | None = None,
+    enable_environment_dir_upload: bool = True,
 ) -> DockerfileSingularityEnvironment:
     trial_directory = (
         ".ursa-validation" if purpose == "validate" else f".ursa-{purpose}"
@@ -71,6 +73,7 @@ def _make_environment(
         task_env_config=task_env_config,
         network_policy=network_policy,
         phase_network_policies=phase_network_policies,
+        enable_environment_dir_upload=enable_environment_dir_upload,
         singularity_image_cache_dir=image_cache_dir,
     )
 
@@ -83,30 +86,40 @@ def _task_environments(
 ) -> list[DockerfileSingularityEnvironment]:
     trial_agent = AgentConfig()
     trial_environment = TrialEnvironmentConfig()
+    trial_verifier = VerifierConfig()
     steps: list[StepConfig | None] = list(task.config.steps or [None])
     plans: list[
-        tuple[StepConfig | None, VerifierEnvironmentMode, TrialNetworkPlan]
+        tuple[
+            VerifierEnvironmentMode,
+            VerifierEnvironmentDefinition | None,
+            TrialNetworkPlan,
+        ]
     ] = []
 
     for step in steps:
         mode = _verifier_mode(task, step)
-        verifier_environment = resolve_effective_verifier_env_config(
-            task.config, step
+        # Use the trial's image precedence: a step or task tests image when
+        # one is declared, otherwise the task environment.
+        verifier_definition = resolve_verifier_environment_definition(
+            task.config, task.paths, step
         )
         plan = resolve_trial_network_plan(
             task.config,
             trial_agent,
             trial_environment,
+            trial_verifier,
             step,
             verifier_mode=mode,
-            env_config=verifier_environment,
+            env_config=(
+                verifier_definition.config if verifier_definition else None
+            ),
         )
-        plans.append((step, mode, plan))
+        plans.append((mode, verifier_definition, plan))
 
     environments = []
     agent_phases = [
         policy
-        for _, mode, plan in plans
+        for mode, _, plan in plans
         for policy in (
             [plan.agent_phase, plan.verifier_phase]
             if mode == VerifierEnvironmentMode.SHARED
@@ -126,29 +139,22 @@ def _task_environments(
         )
     )
 
-    for index, (step, mode, plan) in enumerate(plans):
+    for index, (mode, definition, plan) in enumerate(plans):
         if mode != VerifierEnvironmentMode.SEPARATE:
             continue
-        verifier_environment = resolve_effective_verifier_env_config(
-            task.config, step
-        )
-        if verifier_environment is None or plan.verifier_env_baseline is None:
+        if definition is None or plan.verifier_env_baseline is None:
             raise RuntimeError("Separate verifier environment did not resolve")
-        environment_dir = task.paths.tests_dir
-        if step is not None:
-            step_tests = task.paths.step_tests_dir(step.name)
-            if step_tests.exists():
-                environment_dir = step_tests
         environments.append(
             _make_environment(
                 task,
-                environment_dir=environment_dir,
-                task_env_config=verifier_environment,
+                environment_dir=definition.directory,
+                task_env_config=definition.config,
                 network_policy=plan.verifier_env_baseline,
                 phase_network_policies=[plan.verifier_phase],
                 suffix=f"verifier-{index}",
                 purpose=purpose,
                 image_cache_dir=image_cache_dir,
+                enable_environment_dir_upload=not definition.bundled_tests,
             )
         )
     return environments

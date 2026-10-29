@@ -869,13 +869,6 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     "singularity-compose cannot provide sidecar networking "
                     "during a Harbor 'no-network' phase"
                 )
-        if not self._overlay_enabled and any(
-            policy != self._network_policy
-            for policy in self._phase_network_policies
-        ):
-            raise ValueError(
-                "Singularity network policy changes require a writable overlay"
-            )
         main = config["services"]["main"] if config is not None else {}
         if (
             not ({"build", "image"} & set(main))

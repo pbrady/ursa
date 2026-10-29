@@ -172,7 +172,11 @@ def test_host_ca_certificates_pem_loads_hashed_capath(
 
 
 def test_phase_network_change_requires_overlay(tmp_path: Path):
-    with pytest.raises(ValueError, match="require a writable overlay"):
+    # Without an overlay the environment reports a static network policy, so
+    # Harbor's BaseEnvironment rejects the phase change before startup.
+    with pytest.raises(
+        ValueError, match="cannot change network policy after start"
+    ):
         _environment(
             tmp_path,
             phase_network_modes=(NetworkMode.NO_NETWORK,),

@@ -13,6 +13,11 @@ import pytest
 pytest.importorskip("harbor")
 
 from harbor.models.agent.context import AgentContext
+from harbor.models.task.config import (
+    MCPServerConfig,
+    NetworkMode,
+    NetworkPolicy,
+)
 from langchain_core.language_models.fake_chat_models import (
     FakeMessagesListChatModel,
 )
@@ -141,6 +146,245 @@ def test_runtime_config_records_evaluation_group(tmp_path):
 
     assert runtime_config["group"] == "science"
     assert agent._runtime_group == "science"
+
+
+def _provider_config(path: Path) -> Path:
+    path.write_text(
+        "llm_model:\n"
+        "  model: gpt-4.1-nano\n"
+        "  model_provider: openai\n"
+        "inference_providers:\n"
+        "  lanl:\n"
+        "    model_provider: openai\n"
+        "  azure:\n"
+        "    model_provider: azure_openai\n"
+        "  bedrock:\n"
+        "    model_provider: bedrock_converse\n"
+    )
+    return path
+
+
+def test_model_connection_credentials_stay_out_of_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-host-secret")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="openai/gpt-4.1-nano",
+        config_file=_provider_config(tmp_path / "ursa.yaml"),
+    )
+
+    runtime_config, secret_env = agent._runtime_config()
+
+    assert UrsaHarborAgent.capabilities.base_url is False
+    provider = runtime_config["inference_providers"]["openai"]
+    assert provider["base_url"] == "https://gateway.example/v1"
+    assert secret_env == {provider["api_key"]["env"]: "sk-host-secret"}
+    assert "sk-host-secret" not in json.dumps(runtime_config)
+    assert agent._model_env == {}
+
+
+def test_custom_inference_provider_keeps_its_base_url(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANL_BASE_URL", "https://lanl.example/v1")
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="lanl/gpt-4.1-nano",
+        config_file=_provider_config(tmp_path / "ursa.yaml"),
+    )
+
+    runtime_config, _ = agent._runtime_config()
+
+    # LiteLLM does not know "lanl"; URSA's provider/model split still applies.
+    assert agent.model_connection.provider == "lanl"
+    assert agent.to_agent_info().model_info.provider == "lanl"
+    assert runtime_config["llm_model"] == {
+        "model": "gpt-4.1-nano",
+        "model_provider": "openai",
+        "inference_provider": "lanl",
+    }
+    assert runtime_config["inference_providers"]["lanl"]["base_url"] == (
+        "https://lanl.example/v1"
+    )
+
+
+def test_model_connection_forwards_provider_extra_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("AZURE_API_KEY", "azure-secret")
+    monkeypatch.setenv("AZURE_API_VERSION", "2024-10-21")
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="azure/gpt-4.1-nano",
+        config_file=_provider_config(tmp_path / "ursa.yaml"),
+    )
+
+    runtime_config, secret_env = agent._runtime_config()
+
+    provider = runtime_config["inference_providers"]["azure"]
+    assert secret_env == {provider["api_key"]["env"]: "azure-secret"}
+    assert agent._model_env == {"AZURE_API_VERSION": "2024-10-21"}
+
+
+def test_env_authenticated_provider_keeps_credentials_in_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="bedrock/anthropic.claude-sonnet",
+        config_file=_provider_config(tmp_path / "ursa.yaml"),
+    )
+
+    runtime_config, secret_env = agent._runtime_config()
+
+    assert agent.model_connection.provider == "amazon-bedrock"
+    assert "api_key" not in runtime_config["inference_providers"]["bedrock"]
+    assert secret_env == {}
+    assert agent._model_env == {
+        "AWS_BEARER_TOKEN_BEDROCK": "bedrock-token",
+        "AWS_REGION": "us-west-2",
+    }
+
+
+@pytest.mark.parametrize(
+    ("network_mode", "use_web"),
+    [
+        (NetworkMode.PUBLIC, True),
+        (NetworkMode.ALLOWLIST, False),
+        (NetworkMode.NO_NETWORK, False),
+    ],
+)
+def test_web_tools_require_public_network(network_mode, use_web):
+    environment = SimpleNamespace(
+        network_policy=NetworkPolicy(
+            network_mode=network_mode,
+            allowed_hosts=(
+                ["api.openai.com"]
+                if network_mode == NetworkMode.ALLOWLIST
+                else []
+            ),
+        )
+    )
+
+    assert UrsaHarborAgent._network_use_web(environment) is use_web
+    assert UrsaHarborAgent._network_use_web(object()) is None
+
+
+@pytest.mark.asyncio
+async def test_harbor_web_tool_decision_updates_runtime_config(
+    tmp_path, monkeypatch
+):
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent",
+        config_file=_runtime_config(tmp_path / "ursa.yaml"),
+    )
+    agent._remote_config_file = "/installed-agent/tmp/ursa-config.json"
+    agent._runtime_use_web = True
+    uploaded: list[bool] = []
+    payloads: list[dict[str, Any]] = []
+
+    async def upload(_environment: Any, runtime_config: dict[str, Any]):
+        uploaded.append(runtime_config["use_web"])
+
+    async def run(_environment: Any, **kwargs: Any) -> Any:
+        encoded = shlex.split(kwargs["command"])[-1]
+        payloads.append(json.loads(base64.urlsafe_b64decode(encoded)))
+        return SimpleNamespace(stdout=None)
+
+    monkeypatch.setattr(agent, "_upload_runtime_config", upload)
+    monkeypatch.setattr(agent, "exec_as_agent", run)
+    environment = SimpleNamespace(
+        network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    assert UrsaHarborAgent.capabilities.native_web_tools is True
+    await agent.set_web_tools_disabled(True, environment)
+    await agent.run("solve it", environment, AgentContext())
+    await agent.run("solve it again", environment, AgentContext())
+
+    assert uploaded == [False]
+    assert [payload["use_web"] for payload in payloads] == [False, False]
+
+
+def test_mcp_servers_are_forwarded_without_headers(tmp_path):
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent",
+        config_file=_runtime_config(tmp_path / "ursa.yaml"),
+        mcp_servers=[
+            MCPServerConfig(name="docs", url="http://mcp.example/sse")
+        ],
+    )
+
+    assert UrsaHarborAgent.capabilities.mcp_servers is True
+    assert UrsaHarborAgent.capabilities.mcp_http_headers is False
+    assert agent._mcp_config() == {
+        "docs": {
+            "transport": "sse",
+            "url": "http://mcp.example/sse",
+            "args": [],
+        }
+    }
+
+    agent.mcp_servers = [
+        MCPServerConfig(
+            name="docs",
+            transport="streamable-http",
+            url="http://mcp.example/mcp",
+            headers={"Authorization": "Bearer ${MCP_TOKEN}"},
+        )
+    ]
+    with pytest.raises(ValueError, match="does not forward MCP HTTP headers"):
+        agent._mcp_config()
+
+
+@pytest.mark.asyncio
+async def test_run_downloads_unmounted_log_for_token_usage(
+    tmp_path, monkeypatch
+):
+    logs = tmp_path / "agent"
+    agent = UrsaHarborAgent(
+        logs_dir=logs,
+        config_file=_runtime_config(tmp_path / "ursa.yaml"),
+    )
+    agent._remote_config_file = "/installed-agent/tmp/ursa-config.json"
+    downloads: list[tuple[str, Path]] = []
+
+    class UnmountedEnvironment:
+        network_policy = None
+
+        def is_path_mounted(self, environment_path: Any, host_path: Path):
+            assert str(environment_path) == "/logs/agent"
+            assert host_path == logs
+            return False
+
+        async def download_file(self, source: str, target: Path) -> None:
+            downloads.append((source, target))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps({
+                    "type": "chat",
+                    "event": "end",
+                    "usage": {
+                        "input_tokens": 3,
+                        "cached_tokens": 1,
+                        "output_tokens": 2,
+                    },
+                })
+                + "\n"
+            )
+
+    async def run(_environment: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(stdout=None)
+
+    monkeypatch.setattr(agent, "exec_as_agent", run)
+    context = AgentContext()
+
+    await agent.run("solve it", UnmountedEnvironment(), context)
+
+    assert downloads == [("/logs/agent/ursa.jsonl", logs / "ursa.jsonl")]
+    assert (
+        context.n_input_tokens,
+        context.n_cache_tokens,
+        context.n_output_tokens,
+    ) == (3, 1, 2)
 
 
 def test_handoff_imports_checkpoint_as_local_named_agent(tmp_path, monkeypatch):

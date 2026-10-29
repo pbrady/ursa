@@ -117,7 +117,7 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
 ):
     task = _task(tmp_path)
     cache = tmp_path / "sif-cache"
-    observed: list[tuple[Path, Path, bool]] = []
+    observed: list[tuple[Path, Path, bool, bool]] = []
 
     async def build(
         self: DockerfileSingularityEnvironment,
@@ -127,6 +127,7 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
             self.environment_dir,
             self._image_cache_dir,
             force_build,
+            self._enable_environment_dir_upload,
         ))
         return [cache / f"{self.environment_dir.name}.sif"]
 
@@ -137,10 +138,29 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
     )
 
     assert observed == [
-        (task / "environment", cache, True),
-        (task / "tests", cache, True),
+        (task / "environment", cache, True, True),
+        # The tests image bundles its own files, as in a Harbor trial.
+        (task / "tests", cache, True, False),
     ]
     assert paths == [cache / "environment.sif", cache / "tests.sif"]
+
+
+def test_separate_verifier_without_tests_image_uses_task_environment(
+    tmp_path,
+):
+    task_dir = _task(tmp_path)
+    (task_dir / "tests" / "Dockerfile").unlink()
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\n")
+
+    environments = _task_environments(Task(task_dir), purpose="validate")
+
+    assert [environment.environment_dir for environment in environments] == [
+        task_dir / "environment",
+        task_dir / "environment",
+    ]
+    verifier = environments[1]
+    assert verifier._enable_environment_dir_upload is True
+    assert verifier.network_policy.network_mode == NetworkMode.NO_NETWORK
 
 
 def test_harbor_prebuild_command_reports_built_sifs(tmp_path, monkeypatch):

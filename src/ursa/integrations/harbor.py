@@ -34,15 +34,19 @@ from jsonargparse import Namespace
 from pydantic import SecretStr
 
 try:
+    from harbor.agents.agent_auth_resolution import (
+        ModelConnectionSpec,
+        parse_model_name,
+    )
     from harbor.agents.capabilities import AgentCapabilities
     from harbor.agents.installed.base import BaseInstalledAgent
-    from harbor.agents.model_connection import PROVIDERS, ModelConnectionSpec
     from harbor.environments.base import BaseEnvironment
     from harbor.models.agent.context import AgentContext
     from harbor.models.task.config import NetworkMode
 except ImportError as exc:  # pragma: no cover - exercised without the extra
     raise ImportError(
-        "The Harbor integration requires `uv add 'ursa-ai[harbor]'`."
+        "The Harbor integration requires `uv add 'ursa-ai[harbor]'` "
+        f"(harbor>=0.25): {exc}"
     ) from exc
 
 from ursa.agents import BaseAgent as UrsaBaseAgent
@@ -129,8 +133,16 @@ class UrsaHarborAgent(BaseInstalledAgent):
             string or a sequence of requirement strings.
     """
 
-    MODEL_CONNECTION = ModelConnectionSpec(passthrough=True)
-    capabilities = AgentCapabilities(handoff=True)
+    # URSA writes the endpoint into its own provider config, so Harbor only
+    # projects the selected credential and provider extras into the env.
+    MODEL_CONNECTION = ModelConnectionSpec(
+        base_url_destination_names={"default": None}
+    )
+    capabilities = AgentCapabilities(
+        handoff=True,
+        mcp_servers=True,
+        native_web_tools=True,
+    )
     URSA_PYTHON_VERSION = "3.13"
     URSA_RUNNER = "/installed-agent/bin/ursa-harbor-runner"
     _INSTALL_ROOT = "/installed-agent"
@@ -172,6 +184,7 @@ class UrsaHarborAgent(BaseInstalledAgent):
         self._secret_env: dict[str, str] = {}
         self._model_env: dict[str, str] = {}
         self._runtime_group = DEFAULT_GROUP_NAME
+        self._web_tools_disabled: bool | None = None
         self._workspace = "/"
         self._runner_pid_file = (
             f"{self._INSTALL_ROOT}/tmp/ursa-harbor-runner-"
@@ -353,8 +366,28 @@ class UrsaHarborAgent(BaseInstalledAgent):
         requirement = f"{name}{extras} @ {archive}" if name else archive
         return f"{requirement}{marker}"
 
+    @staticmethod
+    def _parse_model_name_for_connection(
+        model_name: str, *, skip_model_parsing: bool = False
+    ) -> tuple[str | None, str]:
+        """Treat the text before '/' as the URSA inference provider.
+
+        Harbor otherwise asks LiteLLM, which does not know custom URSA
+        providers and would drop their ``<PROVIDER>_BASE_URL`` lookup.
+        """
+        provider, separator, model = model_name.partition("/")
+        if skip_model_parsing or not separator or not provider:
+            return parse_model_name(
+                model_name, skip_model_parsing=skip_model_parsing
+            )
+        return provider, model
+
     def _mcp_config(self) -> dict[str, dict[str, Any]]:
         """Convert Harbor's MCP list to URSA's named mapping."""
+        if any(server.headers for server in self.mcp_servers):
+            # Harbor rejects these before setup because mcp_http_headers is
+            # not declared; never pass unresolved ${VAR} templates to URSA.
+            raise ValueError("URSA does not forward MCP HTTP headers")
         return {
             server.name: server.model_dump(exclude={"name"}, exclude_none=True)
             for server in self.mcp_servers
@@ -404,16 +437,18 @@ class UrsaHarborAgent(BaseInstalledAgent):
             env_authenticated = connection.provider in self.ENV_AUTH_PROVIDERS
             if connection.api_key is not None and not env_authenticated:
                 provider_config["api_key"] = SecretStr(connection.api_key)
-            if connection.configured_base_url is not None:
-                provider_config["base_url"] = connection.configured_base_url
-            provider_access = PROVIDERS.get(connection.provider or "")
+            if connection.user_supplied_base_url:
+                provider_config["base_url"] = connection.user_supplied_base_url
+            # The key and URL move into the URSA config; provider extras such
+            # as AZURE_API_VERSION still reach the runner through the env.
             projected_names = (
                 set()
-                if env_authenticated or provider_access is None
+                if env_authenticated
                 else {
-                    *provider_access.api_key_envs,
-                    *provider_access.base_url_envs,
+                    connection.api_key_destination_name,
+                    *connection.base_url_destination_names,
                 }
+                - {None}
             )
             self._model_env = {
                 name: value
@@ -517,7 +552,16 @@ class UrsaHarborAgent(BaseInstalledAgent):
         policy = getattr(environment, "network_policy", None)
         if policy is None:
             return None
-        return policy.network_mode != NetworkMode.NO_NETWORK
+        # Match Harbor: an allowlist may contain only the inference host.
+        return policy.network_mode == NetworkMode.PUBLIC
+
+    async def set_web_tools_disabled(
+        self, disabled: bool, environment: BaseEnvironment
+    ) -> None:
+        """Record Harbor's web-tool decision for the next agent phase."""
+        # run() applies it, re-uploading the config only when it changes.
+        del environment
+        self._web_tools_disabled = disabled
 
     async def _upload_runtime_config(
         self,
@@ -948,7 +992,11 @@ class UrsaHarborAgent(BaseInstalledAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        use_web = self._network_use_web(environment)
+        use_web = (
+            self._network_use_web(environment)
+            if self._web_tools_disabled is None
+            else not self._web_tools_disabled
+        )
         if use_web is not None and use_web != getattr(
             self, "_runtime_use_web", None
         ):
@@ -1017,11 +1065,25 @@ class UrsaHarborAgent(BaseInstalledAgent):
                 )
             except Exception:
                 pass
+            usage_log = self.logs_dir / "ursa.jsonl"
+            try:
+                # Harbor syncs unmounted logs only after run() returns.
+                if not environment.is_path_mounted(
+                    self.environment_logs_dir, self.logs_dir
+                ):
+                    await asyncio.shield(
+                        environment.download_file(
+                            str(self.environment_logs_dir / "ursa.jsonl"),
+                            usage_log,
+                        )
+                    )
+            except Exception:
+                pass
             (
                 context.n_input_tokens,
                 context.n_cache_tokens,
                 context.n_output_tokens,
-            ) = _jsonl_token_usage(self.logs_dir / "ursa.jsonl")
+            ) = _jsonl_token_usage(usage_log)
 
 
 def make_harbor_agent(
