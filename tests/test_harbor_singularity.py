@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import inspect
+import logging
 import sys
 import weakref
 from pathlib import Path
@@ -11,6 +12,7 @@ import yaml
 pytest.importorskip("harbor")
 
 from harbor.cli.utils import parse_kwargs  # noqa: E402
+from harbor.mappers.terminal_bench import HARBOR_MAIN_SERVICE  # noqa: E402
 from harbor.models.task.config import (  # noqa: E402
     EnvironmentConfig,
     NetworkMode,
@@ -1139,6 +1141,9 @@ async def test_start_resolves_fakeroot_before_seed_and_compose(
         ("${UNSET:-a:b c}", "a:b c"),
         ("${UNSET:-$$literal}", "$literal"),
         ("${SET:-${MISSING:?not evaluated}}", "value"),
+        # Docker Compose substitutes an empty string for a plain reference.
+        ("${MISSING}/x", "/x"),
+        ("$MISSING", ""),
     ],
 )
 def test_compose_interpolation(template: str, expected: str):
@@ -1155,8 +1160,6 @@ def test_compose_interpolation(template: str, expected: str):
         ("${MISSING:?set MISSING first}", "'MISSING' is required: set"),
         ("${EMPTY:?must not be empty}", "'EMPTY' is required: must not"),
         ("${MISSING?}", "'MISSING' is required$"),
-        ("${MISSING}", "'MISSING'.*not set"),
-        ("$MISSING", "'MISSING'.*not set"),
         ("${UNTERMINATED", "Unterminated"),
         ("${1BAD}", "Invalid"),
         ("${BAD:x}", "Invalid"),
@@ -1166,6 +1169,64 @@ def test_compose_interpolation(template: str, expected: str):
 def test_compose_interpolation_errors(template: str, match: str):
     with pytest.raises(ValueError, match=match):
         harbor_singularity._interpolate_compose(template, {"EMPTY": ""})
+
+
+def test_unset_compose_variable_warns_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.setattr(
+        harbor_singularity, "_warned_unset_compose_variables", set()
+    )
+
+    with caplog.at_level(logging.WARNING, harbor_singularity.__name__):
+        harbor_singularity._interpolate_compose("${MISSING}", {})
+        harbor_singularity._interpolate_compose("$MISSING", {})
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "Compose variable 'MISSING' in '${MISSING}' is not set; defaulting "
+        "to an empty string"
+    ]
+
+
+def test_compose_interpolation_includes_harbor_infra_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Harbor's Terminal-Bench mapper writes this main service.
+    monkeypatch.delenv("TEST_DIR", raising=False)
+    monkeypatch.setenv("CONTEXT_DIR", "/host/value/is/overridden")
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (environment_dir / "docker-compose.yaml").write_text(
+        yaml.safe_dump({"services": {"main": HARBOR_MAIN_SERVICE}})
+    )
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    environment = DockerfileSingularityEnvironment(
+        environment_dir=environment_dir,
+        environment_name="unit-test",
+        session_id=f"{tmp_path.name}__env",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(
+            docker_image="alexgshaw/x:20251031", cpus=2, memory_mb=4096
+        ),
+        persistent_env={},
+        singularity_image_cache_dir=tmp_path / "cache",
+        singularity_fakeroot=False,
+    )
+
+    variables = environment._compose_interpolation_environment()
+    main = environment._load_compose_config()["services"]["main"]
+
+    assert variables["CONTEXT_DIR"] == str(environment_dir.resolve())
+    assert variables["MAIN_IMAGE_NAME"] == (f"hb__{environment.environment_id}")
+    assert variables["PREBUILT_IMAGE_NAME"] == "alexgshaw/x:20251031"
+    assert variables["CPUS"] == "2"
+    assert variables["MEMORY"] == "4096M"
+    assert main["build"] == {"context": str(environment_dir.resolve())}
+    assert main["environment"] == ["TEST_DIR="]
+    # Resource limits are accepted but not enforced.
+    assert main["deploy"] == {}
 
 
 SCICODE_COMPOSE = (

@@ -209,9 +209,10 @@ services:
 The adapter translates the subset that `singularity-compose` can represent:
 images, Dockerfile builds (`context`, `dockerfile`, `args`, and `target`), list
 form `depends_on`, commands, bind mounts, TCP `host:container` ports,
-`deploy.replicas`, `environment`, and `env_file`. Sidecars are reachable by
-their Harbor service name. Harbor's per-service artifact collection is also
-supported.
+`deploy.replicas`, `environment`, and `env_file`. `deploy.resources` is
+accepted but not enforced, like the task's `cpus` and `memory_mb`. Sidecars are
+reachable by their Harbor service name. Harbor's per-service artifact
+collection is also supported.
 
 Bind mounts use `SOURCE:TARGET`, `SOURCE:TARGET:ro`, `SOURCE:TARGET:rw`, or the
 long form with `type: bind` and optional `read_only: true`. The source must
@@ -226,13 +227,17 @@ path's host directory, so the image does not need to provide one.
 Values in Compose files are interpolated as Docker Compose does: `$VAR`,
 `${VAR}`, `${VAR:-default}` and `${VAR-default}`, `${VAR:?message}` and
 `${VAR?message}`, `${VAR:+alternative}` and `${VAR+alternative}`, with nested
-defaults and `$$` for a literal `$`. Variables come from the host
-environment, overlaid with the task's `[environment].env` and Harbor's
-persistent environment, as for Harbor's Docker backend. A missing required
-variable fails with its message. Unlike Docker Compose, a plain `$VAR` or
-`${VAR}` that is unset is an error rather than an empty string; write
-`${VAR:-}` to allow an empty value. Unquoted and double-quoted `env_file`
-values are interpolated too, and single-quoted values are kept literally.
+defaults and `$$` for a literal `$`. As for Harbor's Docker backend,
+variables come from the host environment, overlaid with the task's
+`[environment].env` and Harbor's persistent environment, and then with
+Harbor's own Compose variables, which take precedence: `CONTEXT_DIR` (the
+task's `environment` directory), `MAIN_IMAGE_NAME`, `PREBUILT_IMAGE_NAME`
+(the task's `docker_image`), `CPUS` and `MEMORY` (from the task's resources),
+and the legacy `ENV_*_PATH` and `HOST_*_PATH` log mount variables. A missing
+required variable fails with its message, and, as in Docker Compose, a plain
+`$VAR` or `${VAR}` that is unset becomes an empty string with a warning.
+Unquoted and double-quoted `env_file` values are interpolated too, and
+single-quoted values are kept literally.
 
 For example, Harbor's SciCode adapter mounts its test data with:
 

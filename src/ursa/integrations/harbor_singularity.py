@@ -34,6 +34,7 @@ from harbor.environments.capabilities import (
     EnvironmentResourceCapabilities,
 )
 from harbor.environments.definition import should_use_prebuilt_docker_image
+from harbor.environments.docker.compose_env import legacy_log_mount_env_vars
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import EnvironmentPaths
@@ -55,6 +56,9 @@ _COMPOSE_SERVICE_FIELDS = frozenset({
 _COMPOSE_BUILD_FIELDS = frozenset({"args", "context", "dockerfile", "target"})
 _HOST_CA_CERTIFICATES_FILENAME = "host-ca-certificates.crt"
 _COMPOSE_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Compose files are loaded several times per trial; warn once per variable.
+_warned_unset_compose_variables: set[str] = set()
+_logger = logging.getLogger(__name__)
 # Without fakeroot, Singularity keeps the host's HOME path but does not mount
 # it under --containall, so commands get a private writable home here instead.
 # Fakeroot without a disk overlay uses it too, since /root is read-only then.
@@ -151,13 +155,18 @@ def _volume_target(volume: str) -> str:
 def _compose_variable(
     name: str, environ: Mapping[str, str], template: str
 ) -> str:
-    try:
+    if name in environ:
         return environ[name]
-    except KeyError:
-        raise ValueError(
-            f"Compose variable {name!r} in {template!r} is not set on the "
-            f"host; use ${{{name}:-}} for an empty value"
-        ) from None
+    # Docker Compose substitutes an empty string and warns once.
+    if name not in _warned_unset_compose_variables:
+        _warned_unset_compose_variables.add(name)
+        _logger.warning(
+            "Compose variable %r in %r is not set; defaulting to an empty "
+            "string",
+            name,
+            template,
+        )
+    return ""
 
 
 def _compose_closing_brace(template: str, start: int) -> int:
@@ -221,9 +230,8 @@ def _interpolate_compose(template: str, environ: Mapping[str, str]) -> str:
     """Expand Docker Compose ``$VAR`` and ``${VAR...}`` interpolation.
 
     Supports ``$$`` escapes and the ``-``, ``?``, and ``+`` modifiers, each
-    with and without a colon. Unlike Docker Compose, a plain reference to an
-    unset variable is an error instead of an empty string, because these
-    values are usually host paths.
+    with and without a colon. As in Docker Compose, a plain reference to an
+    unset variable becomes an empty string with a warning.
     """
     parts = []
     index = 0
@@ -347,11 +355,17 @@ def _normalize_compose_service(
 
     deploy = service.get("deploy")
     if deploy is not None:
-        if not isinstance(deploy, dict) or set(deploy) - {"replicas"}:
+        if not isinstance(deploy, dict) or set(deploy) - {
+            "replicas",
+            "resources",
+        }:
             raise ValueError(
-                "singularity-compose supports only deploy.replicas on service "
-                f"{name!r}"
+                "singularity-compose supports only deploy.replicas and "
+                f"deploy.resources on service {name!r}"
             )
+        # Like the task's cpus and memory_mb, Compose resource limits are not
+        # enforced; Harbor's Terminal-Bench mapper always emits them.
+        deploy.pop("resources", None)
         replicas = deploy.get("replicas", 1)
         if (
             not isinstance(replicas, int)
@@ -1141,11 +1155,26 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         return paths
 
     def _compose_interpolation_environment(self) -> dict[str, str]:
-        """Return the variables Harbor's Docker backend gives Compose."""
+        """Return the variables Harbor's Docker backend gives Compose.
+
+        Harbor's infrastructure variables take precedence over the host
+        environment, task ``[environment].env``, and persistent env.
+        """
         environment = dict(os.environ)
         if self.task_env_config.env:
             environment.update(resolve_env_vars(self.task_env_config.env))
         environment.update(self._persistent_env)
+        environment.update({
+            "CONTEXT_DIR": str(self.environment_dir.resolve()),
+            "MAIN_IMAGE_NAME": f"hb__{self.environment_id}".lower(),
+            **legacy_log_mount_env_vars(self._host_mounts, host_value="source"),
+        })
+        if docker_image := self.task_env_config.docker_image:
+            environment["PREBUILT_IMAGE_NAME"] = docker_image
+        if (cpus := self.task_env_config.cpus) is not None:
+            environment["CPUS"] = str(cpus)
+        if memory_mb := self.task_env_config.memory_mb:
+            environment["MEMORY"] = f"{memory_mb}M"
         return environment
 
     def _load_compose_config(self) -> dict[str, Any]:
