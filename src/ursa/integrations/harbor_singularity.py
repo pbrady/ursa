@@ -47,6 +47,7 @@ from ursa.integrations.harbor_dockerfile import (
     Definition,
     DockerfileUnsupported,
     dockerfile_workdir,
+    image_config,
     translate_dockerfile,
 )
 
@@ -1922,6 +1923,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     context_dir,
                     build_args=build_args,
                     target=target,
+                    image_config=image_config,
                 )
             except DockerfileUnsupported as exc:
                 if not oci_builders:

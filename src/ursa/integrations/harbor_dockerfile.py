@@ -23,19 +23,22 @@ import posixpath
 import re
 import shlex
 import shutil
+import ssl
 import tarfile
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from http.client import HTTPException
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from pathspec import GitIgnoreSpec
 
 # Part of the SIF cache key for definition builds; bump it whenever the
 # generated definition or build script changes.
-DOCKERFILE_TRANSLATOR_VERSION = 1
+DOCKERFILE_TRANSLATOR_VERSION = 2
 
 _STAGING = "/.ursa-build"
 _DEFAULT_SHELL = ("/bin/sh", "-c")
@@ -512,6 +515,136 @@ def _parse_build_args(build_args: Sequence[str]) -> dict[str, str]:
     return values
 
 
+_MANIFEST_TYPES = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+_CHALLENGE = re.compile(r'(\w+)="([^"]*)"')
+_image_configs: dict[tuple[str, str], Mapping[str, Any]] = {}
+# Looks up an image's OCI config for a machine; see ``image_config``.
+ImageConfig = Callable[[str, str], Mapping[str, Any] | None]
+
+
+class _RegistryRedirect(urllib.request.HTTPRedirectHandler):
+    """Drop the registry token when a blob redirects to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        host = urllib.parse.urlsplit(req.full_url).netloc
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != host:
+            new.remove_header("Authorization")
+        return new
+
+
+def _image_reference(image: str) -> tuple[str, str, str]:
+    """Split an image into its registry host, repository, and tag or digest."""
+    name, _, digest = image.partition("@")
+    tag = "latest"
+    if ":" in name.rsplit("/", 1)[-1]:
+        name, tag = name.rsplit(":", 1)
+    first, _, rest = name.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        registry, repository = first, rest
+    else:
+        registry, repository = "docker.io", name
+    if registry in {"docker.io", "index.docker.io"}:
+        registry = "registry-1.docker.io"
+        if "/" not in repository:
+            repository = f"library/{repository}"
+    return registry, repository, digest or tag
+
+
+def _registry_json(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    accept: str,
+    auth: dict[str, str],
+) -> Any:
+    """GET a registry document, fetching an anonymous token on a 401."""
+
+    def fetch() -> Any:
+        request = urllib.request.Request(url, headers={"Accept": accept})
+        if "token" in auth:
+            request.add_header("Authorization", f"Bearer {auth['token']}")
+        with opener.open(request, timeout=60) as response:
+            return json.loads(response.read(1 << 22))
+
+    try:
+        return fetch()
+    except urllib.error.HTTPError as exc:
+        challenge = exc.headers.get("WWW-Authenticate", "")
+        if exc.code != 401 or "token" in auth:
+            raise
+        if not challenge.lower().startswith("bearer "):
+            raise
+    params = dict(_CHALLENGE.findall(challenge))
+    query = {key: params[key] for key in ("service", "scope") if key in params}
+    token_url = f"{params['realm']}?{urllib.parse.urlencode(query)}"
+    with opener.open(token_url, timeout=60) as response:
+        body = json.loads(response.read(1 << 20))
+    auth["token"] = body.get("token") or body["access_token"]
+    return fetch()
+
+
+def image_config(image: str, machine: str) -> Mapping[str, Any] | None:
+    """Return the OCI config of ``image`` for ``machine``, or ``None``.
+
+    Apptainer keeps only the environment of a ``docker`` bootstrap, so the
+    base image's ``WorkingDir`` and ``User`` come from the registry. Only
+    anonymous access is tried; ``None`` means the config could not be read.
+    """
+    key = (image, machine)
+    if key in _image_configs:
+        return _image_configs[key]
+    registry, repository, reference = _image_reference(image)
+    base = f"https://{registry}/v2/{repository}"
+    architecture = _ARCHITECTURES.get(machine.lower(), machine.lower())
+    context = ssl.create_default_context()
+    # Python 3.13's strict mode rejects some site proxy CAs that Apptainer
+    # accepts; the chain is still verified.
+    context.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+    opener = urllib.request.build_opener(
+        _RegistryRedirect, urllib.request.HTTPSHandler(context=context)
+    )
+    auth: dict[str, str] = {}
+    try:
+        manifest = _registry_json(
+            opener, f"{base}/manifests/{reference}", _MANIFEST_TYPES, auth
+        )
+        if "manifests" in manifest:
+            digests = [
+                entry["digest"]
+                for entry in manifest["manifests"]
+                if entry.get("platform", {}).get("os") == "linux"
+                and entry["platform"].get("architecture") == architecture
+            ]
+            if not digests:
+                return None
+            manifest = _registry_json(
+                opener, f"{base}/manifests/{digests[0]}", _MANIFEST_TYPES, auth
+            )
+        blob = _registry_json(
+            opener,
+            f"{base}/blobs/{manifest['config']['digest']}",
+            "application/json",
+            auth,
+        )
+        config = blob.get("config") or {}
+    except (
+        AttributeError,
+        HTTPException,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    _image_configs[key] = config
+    return config
+
+
 def dockerignore_spec(context_dir: Path) -> GitIgnoreSpec | None:
     path = context_dir / ".dockerignore"
     if not path.is_file():
@@ -985,12 +1118,14 @@ class _Translator:
         build_args: Mapping[str, str],
         machine: str,
         environ: Mapping[str, str],
+        image_config: ImageConfig | None = None,
     ) -> None:
         self.parsed = parsed
         self.context_dir = context_dir
         self.build_args = build_args
         self.machine = machine
         self.environ = environ
+        self.image_config = image_config
         self.ignore = dockerignore_spec(context_dir)
         self.global_scope, self.stages = _split_stages(
             parsed, build_args, machine, strict=True
@@ -1076,6 +1211,28 @@ class _StageScript:
         self.shell: list[str] = list(_DEFAULT_SHELL)
         self.user: _Value = ()
         self.lines: list[str] = []
+        self.steps = 0
+
+    def base_image(self) -> None:
+        """Start in the base image's ``WorkingDir`` as its ``User``."""
+        lookup = self.translator.image_config
+        if lookup is None:
+            return
+        config = lookup(self.stage.image, self.translator.machine)
+        if config is None:
+            self.translator.warnings.append(
+                f"line {self.stage.instruction.line}: cannot read the config "
+                f"of {self.stage.image}; build steps start in / as root "
+                "instead of its WORKDIR and USER"
+            )
+            return
+        workdir = config.get("WorkingDir") or ""
+        if workdir not in {"", "/"}:
+            self.lines.append(f"_ursa_workdir {shlex.quote(workdir)}")
+        user = config.get("User") or ""
+        if user:
+            self.user = (user,)
+            self.lines.append(f"_ursa_user={shlex.quote(user)}")
 
     def run(self) -> DefinitionStage:
         proxies = [
@@ -1091,6 +1248,7 @@ class _StageScript:
         for name, value in proxies:
             self.lines.append(f"export {name}={shlex.quote(value)}")
         self.lines.append("_ursa_private_tmp")
+        self.base_image()
         for instruction in self.stage.instructions:
             if instruction.keyword in _IGNORED_INSTRUCTIONS:
                 self.translator.notes.append(
@@ -1116,11 +1274,17 @@ class _StageScript:
                     f"the final USER {user} is not applied at run time; "
                     "Harbor chooses the container user"
                 )
-        self.plan.body = "\n".join(self.lines) + "\n"
+        # A stage without steps, such as one that only names an image for
+        # COPY --from, needs no %post, so its image needs no shell.
+        if self.steps:
+            self.plan.body = "\n".join(self.lines) + "\n"
+        else:
+            self.plan.body = None
         return self.plan
 
     def emit(self, instruction: Instruction, *commands: str) -> None:
         summary = instruction.summary.splitlines()[0]
+        self.steps += 1
         self.lines.append(
             f"_ursa_step {instruction.line} {shlex.quote(summary)}"
         )
@@ -1458,11 +1622,15 @@ def translate_dockerfile(
     target: str | None = None,
     machine: str | None = None,
     environ: Mapping[str, str] | None = None,
+    image_config: ImageConfig | None = None,
 ) -> Definition:
     """Translate a Dockerfile into Apptainer build stages.
 
     Raises ``DockerfileUnsupported``, naming the line, for constructs the
-    translation cannot reproduce, before anything is built.
+    translation cannot reproduce, before anything is built. ``image_config``
+    looks up a base image's OCI config, as ``image_config()`` does, so build
+    steps start in its ``WorkingDir`` as its ``User``; without it they start
+    in ``/`` as root.
     """
     try:
         parsed = parse_dockerfile(dockerfile.read_text())
@@ -1472,6 +1640,7 @@ def translate_dockerfile(
             _parse_build_args(build_args),
             machine or platform.machine(),
             os.environ if environ is None else environ,
+            image_config,
         )
         return translator.translate(target)
     except DockerfileUnsupported as exc:

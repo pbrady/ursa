@@ -166,7 +166,12 @@ It supports:
   recorded in the image for run time.
 - `FROM <image>[:tag|@digest] [AS <name>]` and a `--platform` that matches
   the host; `RUN` in shell form (through `SHELL`) and exec form; `WORKDIR`;
-  and `USER` for later build steps.
+  and `USER` for later build steps. As in Docker, build steps start in the
+  base image's `WORKDIR` and as its `USER`. Apptainer does not keep these,
+  so the adapter reads the base image's config from its registry, without
+  credentials; if it cannot, it warns and the steps start in `/` as root.
+  A stage with no build steps, such as one that only names an image for
+  `COPY --from`, runs nothing in that image.
 - `COPY` and `ADD` from the build context, honoring `.dockerignore`, with
   globs, several sources, Docker's trailing-slash rules for the
   destination, `--chown`, and `--chmod`. `ADD` extracts local tar archives

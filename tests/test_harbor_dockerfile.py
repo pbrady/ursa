@@ -1,6 +1,11 @@
+import io
+import json
 import os
 import subprocess
 import tarfile
+import urllib.error
+import urllib.request
+from email.message import Message
 from pathlib import Path
 from textwrap import dedent
 
@@ -8,6 +13,7 @@ import pytest
 
 pytest.importorskip("pathspec")
 
+from ursa.integrations import harbor_dockerfile  # noqa: E402
 from ursa.integrations.harbor_dockerfile import (  # noqa: E402
     ArchiveSource,
     ContextSource,
@@ -206,18 +212,19 @@ def test_env_wins_over_arg_of_the_same_name(tmp_path: Path):
 def test_proxy_args_come_from_build_args_or_the_host(tmp_path: Path):
     from_host = _translate(
         tmp_path,
-        "FROM ubuntu\n",
+        "FROM ubuntu\nRUN true\n",
         environ={"https_proxy": "http://proxy:3128", "HOME": "/home/me"},
     )
     from_args = _translate(
         tmp_path,
-        "FROM ubuntu\n",
+        "FROM ubuntu\nRUN true\n",
         build_args=("HTTP_PROXY=http://other:8080",),
         environ={"https_proxy": "http://proxy:3128"},
     )
 
-    assert _steps(from_host) == "export https_proxy=http://proxy:3128\n"
-    assert _steps(from_args) == "export HTTP_PROXY=http://other:8080\n"
+    run = "_ursa_run /bin/sh -c true\n"
+    assert _steps(from_host) == "export https_proxy=http://proxy:3128\n" + run
+    assert _steps(from_args) == "export HTTP_PROXY=http://other:8080\n" + run
 
 
 def test_env_forms_and_deferred_variables(tmp_path: Path):
@@ -304,6 +311,194 @@ def test_workdir_user_and_ignored_instructions(tmp_path: Path):
         for note in definition.notes
     )
     assert sum("is ignored" in note for note in definition.notes) == 7
+
+
+def test_steps_start_in_the_base_image_workdir_and_user(tmp_path: Path):
+    configs = {
+        "swebench/sweb.eval:1": {"WorkingDir": "/testbed", "User": "dev"},
+        "ubuntu": {"WorkingDir": "", "User": ""},
+    }
+    lookups = []
+
+    def config(image: str, machine: str) -> dict[str, str] | None:
+        lookups.append((image, machine))
+        return configs.get(image)
+
+    definition = _translate(
+        tmp_path,
+        "FROM ubuntu AS plain\n"
+        "RUN pwd\n"
+        "FROM private.example/base AS unknown\n"
+        "RUN pwd\n"
+        "FROM swebench/sweb.eval:1\n"
+        "COPY --from=plain /etc/hostname ./\n"
+        "COPY --from=unknown /etc/hosts ./\n"
+        "RUN git add -A\n"
+        "WORKDIR sub\n",
+        image_config=config,
+    )
+
+    assert lookups == [
+        ("swebench/sweb.eval:1", "x86_64"),
+        ("ubuntu", "x86_64"),
+        ("private.example/base", "x86_64"),
+    ]
+    assert _steps(definition, 0) == "_ursa_run /bin/sh -c pwd\n"
+    assert _steps(definition, 1) == "_ursa_run /bin/sh -c pwd\n"
+    assert _steps(definition).startswith(
+        "_ursa_workdir /testbed\n_ursa_user=dev\n"
+    )
+    assert _steps(definition).endswith(
+        "_ursa_run /bin/sh -c 'git add -A'\n_ursa_workdir sub\n"
+    )
+    assert definition.warnings == [
+        "line 3: cannot read the config of private.example/base; build "
+        "steps start in / as root instead of its WORKDIR and USER"
+    ]
+    assert any(
+        "final USER dev is not applied" in note for note in definition.notes
+    )
+
+
+def test_stage_without_steps_has_no_post(tmp_path: Path):
+    definition = _translate(
+        tmp_path,
+        "FROM --platform=linux/amd64 fhir@sha256:0 AS fhir\n"
+        "LABEL a=b\n"
+        "FROM python:3.11-slim\n"
+        "COPY --from=fhir /app/main.war /app/main.war\n",
+        environ={"https_proxy": "http://proxy:3128"},
+    )
+
+    assert definition.stages[0].body is None
+    assert definition.render(Path("/stage")).startswith(
+        "Bootstrap: docker\nFrom: fhir@sha256:0\nStage: s0\n\n"
+        "Bootstrap: docker\nFrom: python:3.11-slim\nStage: s1\n"
+    )
+    assert _translate(tmp_path, "FROM a\nCMD x\n").stages[0].body is None
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        ("ubuntu", ("registry-1.docker.io", "library/ubuntu", "latest")),
+        ("user/app:1", ("registry-1.docker.io", "user/app", "1")),
+        ("docker.io/user/app", ("registry-1.docker.io", "user/app", "latest")),
+        (
+            "ghcr.io/o/r/n:t@sha256:ab",
+            ("ghcr.io", "o/r/n", "sha256:ab"),
+        ),
+        ("localhost:5000/app:2", ("localhost:5000", "app", "2")),
+        ("localhost/app", ("localhost", "app", "latest")),
+    ],
+)
+def test_image_reference(image: str, expected: tuple[str, str, str]):
+    assert harbor_dockerfile._image_reference(image) == expected
+
+
+def _headers(challenge: str | None = None) -> Message:
+    headers = Message()
+    if challenge is not None:
+        headers["WWW-Authenticate"] = challenge
+    return headers
+
+
+class _Registry:
+    """A registry that wants an anonymous token for every request."""
+
+    def __init__(self, documents: dict[str, object]) -> None:
+        self.documents = documents
+        self.requests: list[tuple[str, str | None]] = []
+
+    def open(self, request, timeout):
+        if isinstance(request, str):
+            assert request == (
+                "https://auth.example/token?service=reg&"
+                "scope=repository%3Alibrary%2Fubuntu%3Apull"
+            )
+            return io.BytesIO(json.dumps({"token": "t"}).encode())
+        url = request.full_url
+        auth = request.get_header("Authorization")
+        self.requests.append((url, auth))
+        if auth != "Bearer t":
+            raise urllib.error.HTTPError(
+                url,
+                401,
+                "Unauthorized",
+                _headers(
+                    'Bearer realm="https://auth.example/token",service="reg",'
+                    'scope="repository:library/ubuntu:pull"'
+                ),
+                None,
+            )
+        if url not in self.documents:
+            raise urllib.error.HTTPError(
+                url, 404, "Not Found", _headers(), None
+            )
+        return io.BytesIO(json.dumps(self.documents[url]).encode())
+
+
+def test_image_config_reads_the_platform_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    base = "https://registry-1.docker.io/v2/library/ubuntu"
+    registry = _Registry({
+        f"{base}/manifests/24.04": {
+            "manifests": [
+                {
+                    "digest": "sha256:arm",
+                    "platform": {"os": "linux", "architecture": "arm64"},
+                },
+                {
+                    "digest": "sha256:att",
+                    "platform": {"os": "unknown", "architecture": "unknown"},
+                },
+                {
+                    "digest": "sha256:amd",
+                    "platform": {"os": "linux", "architecture": "amd64"},
+                },
+            ]
+        },
+        f"{base}/manifests/sha256:amd": {"config": {"digest": "sha256:cfg"}},
+        f"{base}/blobs/sha256:cfg": {"config": {"WorkingDir": "/app"}},
+    })
+    monkeypatch.setattr(harbor_dockerfile, "_image_configs", {})
+    monkeypatch.setattr(
+        harbor_dockerfile.urllib.request, "build_opener", lambda *_: registry
+    )
+
+    assert harbor_dockerfile.image_config("ubuntu:24.04", "x86_64") == {
+        "WorkingDir": "/app"
+    }
+    assert [url for url, auth in registry.requests if auth] == [
+        f"{base}/manifests/24.04",
+        f"{base}/manifests/sha256:amd",
+        f"{base}/blobs/sha256:cfg",
+    ]
+    # Cached per process; failures are not cached.
+    assert harbor_dockerfile.image_config("ubuntu:24.04", "x86_64") == {
+        "WorkingDir": "/app"
+    }
+    assert harbor_dockerfile.image_config("ubuntu:24.04", "aarch64") is None
+    assert harbor_dockerfile.image_config("ubuntu:missing", "x86_64") is None
+    assert set(harbor_dockerfile._image_configs) == {("ubuntu:24.04", "x86_64")}
+
+
+def test_registry_redirect_drops_the_token_for_another_host():
+    handler = harbor_dockerfile._RegistryRedirect()
+    request = urllib.request.Request(
+        "https://ghcr.io/v2/o/r/blobs/sha256:0",
+        headers={"Authorization": "Bearer t"},
+    )
+    same = handler.redirect_request(
+        request, None, 307, "", _headers(), "https://ghcr.io/v2/other"
+    )
+    other = handler.redirect_request(
+        request, None, 307, "", _headers(), "https://cdn.example/blob"
+    )
+
+    assert same.get_header("Authorization") == "Bearer t"
+    assert other.get_header("Authorization") is None
 
 
 @pytest.mark.parametrize(
@@ -569,7 +764,7 @@ def test_copy_source_links_outside_context_are_rejected(tmp_path: Path):
 
 
 def _shell(script: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
-    definition = _translate(tmp_path, "FROM a\n")
+    definition = _translate(tmp_path, "FROM a\nRUN true\n")
     prelude = definition.stages[0].script or ""
     prelude = prelude[: prelude.index("_ursa_private_tmp\n")]
     return subprocess.run(

@@ -29,6 +29,14 @@ from ursa.integrations.harbor_singularity import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep definition builds from reading base image configs online."""
+    monkeypatch.setattr(
+        harbor_singularity, "image_config", lambda image, machine: {}
+    )
+
+
 def _environment(
     tmp_path: Path,
     *,
@@ -781,6 +789,8 @@ def _fake_apptainer(
         '    eval "output=\\${$(($# - 1))}"\n'
         '    eval "definition=\\${$#}"\n'
         f'    cp "$definition" {tmp_path}/last.def\n'
+        f"    rm -rf {tmp_path}/last-staging\n"
+        f'    cp -R "${{definition%/*}}" {tmp_path}/last-staging\n'
         f"    {build}\n"
         "    ;;\n"
         "esac\n"
@@ -854,6 +864,36 @@ async def test_auto_builds_dockerfile_from_apptainer_definition(
 
     assert await environment._build_dockerfile_sif(False) == output
     assert len(_builds(calls)) == 1
+
+
+async def test_definition_build_starts_in_base_image_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    (environment.environment_dir / "Dockerfile").write_text(
+        "FROM swebench/sweb.eval:latest\nRUN git add -A\n"
+    )
+    _fake_apptainer(environment, tmp_path)
+    _oci_builders(monkeypatch)
+    lookups = []
+
+    def config(image: str, machine: str) -> dict[str, str]:
+        lookups.append(image)
+        return {"WorkingDir": "/testbed", "User": "root"}
+
+    monkeypatch.setattr(harbor_singularity, "image_config", config)
+
+    await environment._build_dockerfile_sif(False)
+
+    assert lookups == ["swebench/sweb.eval:latest"]
+    script = (tmp_path / "last-staging" / "s0" / "build.sh").read_text()
+    assert script.endswith(
+        "_ursa_private_tmp\n"
+        "_ursa_workdir /testbed\n"
+        "_ursa_user=root\n"
+        "_ursa_step 2 'RUN git add -A'\n"
+        "_ursa_run /bin/sh -c 'git add -A'\n"
+    )
 
 
 async def test_auto_reuses_cached_oci_build(
