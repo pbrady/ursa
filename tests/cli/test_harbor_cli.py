@@ -52,10 +52,24 @@ network_mode = "public"
 
 
 def test_harbor_validate_help_exposes_paths():
-    result = runner.invoke(harbor_integration.app, ["validate", "--help"])
+    # Rich sizes help to the terminal, which defaults to 80 columns without a
+    # TTY (e.g. under Slurm), and Typer versions spell the metavar as PATHS or
+    # {paths}. Pin a wide plain console and compare case-insensitively.
+    result = runner.invoke(
+        harbor_integration.app,
+        ["validate", "--help"],
+        env={"COLUMNS": "200", "TERM": "dumb"},
+    )
 
     assert result.exit_code == 0
-    assert "PATHS" in result.stdout
+    usage = next(
+        line for line in result.stdout.splitlines() if "Usage:" in line
+    )
+    assert "paths" in usage.lower()
+    assert (
+        "Task files, task directories, or roots to scan recursively"
+        in result.stdout
+    )
 
 
 def test_validate_harbor_paths_reports_success(tmp_path):
