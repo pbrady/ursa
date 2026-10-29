@@ -81,9 +81,12 @@ Dockerfile even when `docker_image` is set, and pulls again when the task has
 no Dockerfile. The `singularity_force_pull` environment kwarg refreshes cached
 images and rebuilds Dockerfiles, but never switches a `docker_image` task to a
 build. The same rules apply to a separate verifier image and to Compose
-services. A pulled task image does not report its `WORKDIR`; the adapter reads
-it from `environment/Dockerfile` when one exists, and otherwise uses `/`, so
-set `[environment].workdir` for image-only tasks that need another directory.
+services. A Compose `main.image` replaces a pulled `docker_image`; when the
+task is built instead, it only names the built image, as in Harbor, and is
+pulled only if the task has no Dockerfile. A pulled task image does not report
+its `WORKDIR`; the adapter reads it from `environment/Dockerfile` when one
+exists, and otherwise uses `/`, so set `[environment].workdir` for image-only
+tasks that need another directory.
 
 SIFs are cached under `$XDG_CACHE_HOME/ursa/harbor/sif`, or
 `~/.cache/ursa/harbor/sif` when `XDG_CACHE_HOME` is unset. Built images are

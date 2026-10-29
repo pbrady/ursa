@@ -1151,7 +1151,11 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         compose_build = main.get("build")
         if compose_build is not None:
             dockerfile_path = self._compose_build_paths(compose_build)[0]
-        elif self._uses_compose and "image" in main:
+        elif (
+            self._uses_compose
+            and "image" in main
+            and self._main_image(force_build=False) == main["image"]
+        ):
             return "/"
         elif not dockerfile_path.is_file():
             return "/"
@@ -1732,16 +1736,21 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
     def _main_image(self, force_build: bool) -> str | None:
         """Return the image the main SIF is pulled from, if it is not built.
 
-        As with Harbor's Docker backend, an explicit Compose ``main.image``
-        wins over the task's prebuilt ``docker_image``, which in turn wins
-        over any Dockerfile unless the trial forces a build.
+        As with Harbor's Docker backend, the task's prebuilt ``docker_image``
+        wins over any Dockerfile unless the trial forces a build, and an
+        explicit Compose ``main.image`` replaces that prebuilt image. When
+        Harbor would build, ``main.image`` only names the built image, so it
+        is pulled only if there is no Dockerfile to build.
         """
+        prebuilt = self._prebuilt_image(force_build)
         if self._uses_compose:
             main = self._load_compose_config()["services"]["main"]
             image = self._compose_service_image("main", main)
-            if image is not None:
+            if image is not None and (
+                prebuilt is not None or not self._dockerfile_path.is_file()
+            ):
                 return image
-        return self._prebuilt_image(force_build)
+        return prebuilt
 
     async def _build_main_sif(
         self, force_build: bool, *, refresh: bool = False

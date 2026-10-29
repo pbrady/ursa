@@ -2024,6 +2024,51 @@ async def test_compose_main_image_precedence(
     assert [pull[2] for pull in _pulls(log)] == [expected]
 
 
+@pytest.mark.parametrize(
+    ("docker_image", "force_build", "dockerfile", "pulled"),
+    [
+        # Harbor builds the Dockerfile; main.image only names the result.
+        (None, False, True, False),
+        ("alexgshaw/x:20251031", True, True, False),
+        # Nothing to build, so main.image is the only source.
+        (None, False, False, True),
+        ("alexgshaw/x:20251031", True, False, True),
+    ],
+)
+async def test_compose_main_image_follows_harbor_build_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    docker_image: str | None,
+    force_build: bool,
+    dockerfile: bool,
+    pulled: bool,
+):
+    environment = _image_environment(
+        tmp_path,
+        docker_image,
+        dockerfile=dockerfile,
+        compose="services:\n  main:\n    image: ubuntu:24.04\n",
+    )
+    observed: list[str] = []
+
+    async def build(_force_build: bool, **_kwargs: object) -> Path:
+        observed.append("build")
+        return tmp_path / "built.sif"
+
+    async def pull(image: str, _force_pull: bool) -> Path:
+        observed.append(image)
+        return tmp_path / "pulled.sif"
+
+    monkeypatch.setattr(environment, "_build_dockerfile_sif", build)
+    monkeypatch.setattr(environment, "_pull_image_sif", pull)
+
+    await environment._build_main_sif(force_build=force_build)
+
+    assert observed == (["ubuntu:24.04"] if pulled else ["build"])
+    if docker_image is None:
+        assert environment._workdir == ("/" if pulled else "/app")
+
+
 async def test_compose_sidecar_images_resolve_to_cached_sifs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
