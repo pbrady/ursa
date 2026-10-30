@@ -107,6 +107,34 @@ _FAKEROOT_COMMAND_FAILURE_MARKERS = (
     "error while starting the `faked' daemon",
     "required by /.singularity.d/libs/libfakeroot",
 )
+# Without /etc/subuid, Apptainer's fakeroot wraps every instance exec in the
+# fakeroot(1) command, whose faked daemon exits with that exec. Processes the
+# exec left running, such as a tmux server or a ``nohup`` job, keep the
+# preloaded libfakeroot and then block forever on their next stat or chown.
+# Apptainer skips its wrapper when FAKEROOTKEY is already set, so instance
+# execs set it and run this script, which shares one faked per instance,
+# started on first use and replaced if it has died, and preloads libfakeroot
+# for that daemon. Without the fakeroot command it only clears FAKEROOTKEY.
+_SHARED_FAKED_SCRIPT = (
+    "unset FAKEROOTKEY; "
+    "libs=/.singularity.d/libs; state=/tmp/.ursa-faked; "
+    'if [ -x "$libs/faked" ] && [ -r "$libs/libfakeroot.so" ]; then '
+    'key_pid=$(cat "$state" 2>/dev/null); '
+    "case $key_pid in "
+    '*:*) [ "$(cat "/proc/${key_pid#*:}/comm" 2>/dev/null)" = faked ] '
+    "|| key_pid= ;; "
+    "*) key_pid= ;; esac; "
+    'if [ -z "$key_pid" ]; then '
+    'key_pid=$("$libs/faked" </dev/null 2>/dev/null) && '
+    'echo "$key_pid" > "$state.$$" && mv -f "$state.$$" "$state"; fi; '
+    "case $key_pid in *:*) "
+    "FAKEROOTKEY=${key_pid%%:*}; "
+    "LD_PRELOAD=$libs/libfakeroot.so${LD_PRELOAD:+:$LD_PRELOAD}; "
+    "FAKED_MODE=unknown-is-root; FAKEROOTDONTTRYCHOWN=1; "
+    "export FAKEROOTKEY LD_PRELOAD FAKED_MODE FAKEROOTDONTTRYCHOWN;; "
+    "esac; fi; "
+    'exec "$@"'
+)
 
 
 @cache
@@ -2514,14 +2542,26 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         instance_name: str | None = None,
         default_cwd: str | None = None,
     ) -> list[str]:
-        return [
-            self._instance_runtime(),
+        runtime = self._instance_runtime()
+        command = [
+            runtime,
             "exec",
             "--cleanenv",
             "--pwd",
             cwd or default_cwd or self._workdir,
-            f"instance://{instance_name or self._instance_name}",
         ]
+        shared_faked = self._fakeroot and _runtime_is_apptainer(runtime)
+        if shared_faked:
+            command.extend(["--env", "FAKEROOTKEY=ursa-shared-faked"])
+        command.append(f"instance://{instance_name or self._instance_name}")
+        if shared_faked:
+            command.extend([
+                "/bin/sh",
+                "-c",
+                _SHARED_FAKED_SCRIPT,
+                "ursa-shared-faked",
+            ])
+        return command
 
     def _instance_start_command(
         self, network_policy: NetworkPolicy | None = None

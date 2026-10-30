@@ -1456,6 +1456,82 @@ async def test_exec_exports_home_instead_of_runtime_env(
     environment._cleanup_staging()
 
 
+@pytest.mark.parametrize(
+    ("runtime", "fakeroot", "shared"),
+    [
+        ("apptainer", True, True),
+        ("apptainer", False, False),
+        ("fake-singularity", True, False),
+    ],
+)
+async def test_apptainer_fakeroot_execs_share_one_faked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: str,
+    fakeroot: bool,
+    shared: bool,
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    _prepare_started_environment(environment, tmp_path)
+    environment._runtime_path = str(tmp_path / runtime)
+    observed: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def spawn(*command: str, **kwargs: object) -> Process:
+        observed["command"] = list(command)
+        return Process()
+
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+
+    await environment.exec("true")
+
+    command = observed["command"]
+    assert isinstance(command, list)
+    instance = command.index(f"instance://{environment._instance_name}")
+    assert command[instance + 1 : instance + 3] == (
+        ["/bin/sh", "-c"] if shared else ["bash", "-c"]
+    )
+    if shared:
+        assert command[instance - 2 : instance] == [
+            "--env",
+            "FAKEROOTKEY=ursa-shared-faked",
+        ]
+        assert command[instance + 3] == harbor_singularity._SHARED_FAKED_SCRIPT
+        assert command[instance + 5 : instance + 7] == ["bash", "-c"]
+    else:
+        assert "--env" not in command
+    environment._cleanup_staging()
+
+
+async def test_shared_faked_script_runs_the_command_without_fakeroot():
+    # Outside Apptainer's fakeroot command there is no faked to share: the
+    # script clears the key that stopped Apptainer's wrapper and runs as is.
+    process = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        "-c",
+        harbor_singularity._SHARED_FAKED_SCRIPT,
+        "ursa-shared-faked",
+        "sh",
+        "-c",
+        'echo "${FAKEROOTKEY-unset} ${LD_PRELOAD-unset} $1"',
+        "sh",
+        "argument with spaces",
+        stdout=asyncio.subprocess.PIPE,
+        env={"FAKEROOTKEY": "ursa-shared-faked", "PATH": "/usr/bin:/bin"},
+    )
+    stdout, _ = await process.communicate()
+
+    assert process.returncode == 0
+    assert stdout.decode().strip() == "unset unset argument with spaces"
+
+
 async def test_compose_home_option_replaces_no_home_without_fakeroot(
     tmp_path: Path,
 ):

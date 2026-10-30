@@ -696,6 +696,36 @@ async def test_unprivileged_instance_has_a_writable_home(
         await _cleanup_environment(environment)
 
 
+async def test_fakeroot_background_process_outlives_its_exec(
+    tmp_path: Path, ubuntu_sif: Path
+):
+    # Apptainer's per-exec faked used to exit with the exec that started a
+    # background job, after which the job blocked on its first stat.
+    _require_fakeroot(ubuntu_sif)
+    environment = await _start_environment(
+        tmp_path, ubuntu_sif, fakeroot=True, overlay=True
+    )
+
+    try:
+        started = await environment.exec(
+            "nohup sh -c 'sleep 2; ls -la / > /tmp/background-ls; "
+            "chown 1000 /tmp/background-ls; echo done >> /tmp/background-ls'"
+            " >/dev/null 2>&1 &"
+        )
+        assert started.return_code == 0, started.stderr
+        finished = await environment.exec(
+            "for i in $(seq 100); do "
+            "tail -n 1 /tmp/background-ls 2>/dev/null | grep -qx done "
+            "&& break; sleep 0.1; done; "
+            "tail -n 1 /tmp/background-ls; stat -c %u /tmp/background-ls",
+            timeout_sec=60,
+        )
+        assert finished.return_code == 0, finished.stderr
+        assert finished.stdout.split() == ["done", "1000"]
+    finally:
+        await _cleanup_environment(environment)
+
+
 @pytest.mark.parametrize("fakeroot", [True, False])
 @pytest.mark.skipif(
     os.geteuid() == 0,

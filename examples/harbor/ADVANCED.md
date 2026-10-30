@@ -282,9 +282,16 @@ An unprivileged (user-space) Apptainer installation has extra requirements:
   owned by the invoking user.
 - Without an `/etc/subuid` entry, Apptainer 1.1 and later implement
   `--fakeroot` with a root-mapped user namespace, helped by the host's
-  `fakeroot` command when it is installed. Only root is mapped, so tasks that
-  ask for a non-root container user fail to switch to it, and package
-  managers can fail to drop privileges; check an `apt-get install` early.
+  `fakeroot` command when it is installed. Only root is mapped, so without
+  that command tasks that ask for a non-root container user fail to switch to
+  it, and package managers can fail to drop privileges; check an
+  `apt-get install` early. With it, Apptainer runs each command under its own
+  `faked` daemon, which exits with the command, and processes left running,
+  such as the tmux server of Harbor's `terminus-2` agent or a `nohup` server,
+  then hang on their next `stat` or `chown`. The adapter therefore keeps one
+  `faked` per instance, started by the first command and restarted if it
+  dies, and runs every command under it, so ownership set by one command is
+  also seen by later ones.
 - Non-root users get only `--network none`, so Compose projects with sidecars
   or published ports cannot start: Apptainer refuses `--net` with "network
   requires root or a suid installation with /etc/subuid --fakeroot".
