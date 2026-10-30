@@ -1630,6 +1630,43 @@ async def test_exec_shares_one_faked_only_when_detected(
     environment._cleanup_staging()
 
 
+async def test_exec_timeout_returns_while_a_background_job_holds_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    monkeypatch.setattr(harbor_singularity, "_EXEC_OUTPUT_DRAIN_SEC", 0.05)
+    cleaned: list[str] = []
+
+    class Process:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            # Output never ends, as when ``server &`` keeps the pipes open.
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def spawn(*_command: str, **_kwargs: object) -> Process:
+        return Process()
+
+    async def cleanup(_process: Process, pid_file: str, **_kwargs: object):
+        cleaned.append(pid_file)
+
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+    monkeypatch.setattr(environment, "_cleanup_exec_process", cleanup)
+
+    result = await asyncio.wait_for(
+        environment.exec("server &", timeout_sec=0.05), timeout=5
+    )
+
+    assert result.return_code == 124
+    assert "timed out" in result.stderr
+    assert len(cleaned) == 1
+    environment._cleanup_staging()
+
+
 @pytest.mark.parametrize("key", ["1151152171", "", None])
 async def test_fakeroot_command_probe_reports_only_a_wrapped_exec(
     key: str | None,

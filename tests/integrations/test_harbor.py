@@ -5,6 +5,7 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -404,6 +405,23 @@ async def test_timeout_kills_the_command_but_keeps_instance_usable(
     assert reaped.return_code != 0
     follow_up = await environment.exec("printf still-running")
     assert follow_up.return_code == 0
+    assert follow_up.stdout == "still-running"
+
+
+async def test_timeout_returns_while_a_background_job_holds_output(
+    environment: DockerfileSingularityEnvironment,
+):
+    # The shell exits at once, but its background job keeps the exec's
+    # output pipes open, so only the timeout can end the exec.
+    started = time.monotonic()
+    result = await environment.exec("sleep 120 & echo started", timeout_sec=2)
+    elapsed = time.monotonic() - started
+    await environment.exec("pkill -x sleep || true")
+
+    assert result.return_code == 124
+    assert "timed out" in result.stderr
+    assert elapsed < 60
+    follow_up = await environment.exec("printf still-running")
     assert follow_up.stdout == "still-running"
 
 

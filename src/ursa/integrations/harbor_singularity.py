@@ -112,6 +112,9 @@ _FAKEROOT_COMMAND_FAILURE_MARKERS = (
 # it ("Device or resource busy"), so apt-get install of python3 and other
 # packages that need tzdata fails. Docker leaves the image's file in place.
 _HOST_LOCALTIME = "/etc/localtime"
+# How long a timed-out or cancelled exec waits for its output pipes to close
+# after its process tree is killed. Background jobs it started keep them open.
+_EXEC_OUTPUT_DRAIN_SEC = 10
 # Without /etc/subuid, Apptainer's fakeroot wraps every instance exec in the
 # fakeroot(1) command, whose faked daemon exits with that exec. Processes the
 # exec left running, such as a tmux server or a ``nohup`` job, keep the
@@ -3577,7 +3580,14 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     instance_name=instance_name,
                     default_cwd=default_cwd,
                 )
-            stdout, stderr = await communication
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    communication, timeout=_EXEC_OUTPUT_DRAIN_SEC
+                )
+            except TimeoutError:
+                # A background job the command started, e.g. ``server &``,
+                # still holds the output pipes after the tree was killed.
+                stdout, stderr = b"", b""
         except asyncio.CancelledError:
             cleanup_call = (
                 self._cleanup_exec_process(process, pid_file)
@@ -3593,7 +3603,11 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             with suppress(asyncio.CancelledError):
                 await asyncio.shield(cleanup)
             with suppress(Exception, asyncio.CancelledError):
-                await asyncio.shield(communication)
+                await asyncio.wait_for(
+                    asyncio.shield(communication),
+                    timeout=_EXEC_OUTPUT_DRAIN_SEC,
+                )
+            communication.cancel()
             raise
 
         stdout_text = stdout.decode(errors="replace")
