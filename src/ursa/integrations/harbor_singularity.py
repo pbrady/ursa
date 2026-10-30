@@ -154,6 +154,173 @@ _SHARED_FAKED_SCRIPT = (
     "esac; fi; "
     'exec "$@"'
 )
+# Commands that sanitize their environment drop the preloaded libfakeroot and
+# its FAKEROOTKEY, so they and their children run as the real, root-mapped
+# uid: chown to any other id fails with "Invalid argument", and apt's drop to
+# _apt fails with "setgroups 65534 failed". The shared faked cannot reach them
+# (``/etc/ld.so.preload`` would load libfakeroot, but not its key), so under
+# the fakeroot command the instance start runs ``_FAKEROOT_COMMAND_SETUP``,
+# which keeps apt as root and shadows the image's sudo with this shim: inside
+# the instance a root caller needs no sudo to become root, and its commands
+# keep the environment, or switch users through su as Harbor's user switching
+# does. Non-root callers and sudo's other modes get the image's sudo.
+_SUDO_SHIM_MARKER = "ursa-sudo-shim"
+_SUDO_SHIM_PATH = "/usr/local/sbin/sudo"
+_SUDO_SHIM_STASH = "/usr/local/lib/ursa/sudo"
+_APT_FAKEROOT_CONFIG = "/etc/apt/apt.conf.d/00ursa-fakeroot"
+_SUDO_SHIM = r"""#!/bin/sh
+# ursa-sudo-shim: written by URSA's Harbor Apptainer environment. Under
+# Apptainer's fakeroot command every process already runs as (fake) root,
+# and sudo would strip the fakeroot preload from the command's environment.
+# For a root caller this runs the command with its environment kept, or as
+# another user through su, like Harbor's user switching. Other callers, and
+# sudo's other modes, get the image's sudo.
+real=
+IFS=:
+for dir in $PATH:/usr/bin:/bin:/usr/sbin:/sbin; do
+    if [ -x "$dir/sudo" ] && ! grep -q ursa-sudo-shim "$dir/sudo" 2>/dev/null
+    then
+        real=$dir/sudo
+        break
+    fi
+done
+unset IFS
+if [ -z "$real" ]; then
+    echo "sudo: command not found" >&2
+    exit 127
+fi
+[ "$(id -u)" = 0 ] || exec "$real" "$@"
+parse() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --) count=$((count + 1)); return ;;
+            --user=*) user=${1#*=} ;;
+            --chdir=*) dir=${1#*=} ;;
+            --group=* | --close-from=* | --prompt=* | --role=* | --type=* | \
+                --command-timeout=* | --preserve-env=*) ;;
+            --user | --chdir | --group | --close-from | --prompt | --role | \
+                --type | --command-timeout)
+                [ $# -ge 2 ] || { delegate=1; return; }
+                case $1 in
+                    --user) user=$2 ;;
+                    --chdir) dir=$2 ;;
+                esac
+                count=$((count + 1))
+                shift
+                ;;
+            --login) login=1 ;;
+            --shell) shell=1 ;;
+            --set-home) home=1 ;;
+            --background) background=1 ;;
+            --preserve-env | --non-interactive | --stdin | --askpass | \
+                --bell | --preserve-groups | --reset-timestamp) ;;
+            -[!-]*)
+                flags=${1#-}
+                while [ -n "$flags" ]; do
+                    flag=${flags%"${flags#?}"}
+                    flags=${flags#?}
+                    case $flag in
+                        u | D | g | C | p | r | t | T)
+                            if [ -n "$flags" ]; then
+                                value=$flags
+                                flags=
+                            else
+                                [ $# -ge 2 ] || { delegate=1; return; }
+                                value=$2
+                                count=$((count + 1))
+                                shift
+                            fi
+                            case $flag in
+                                u) user=$value ;;
+                                D) dir=$value ;;
+                            esac
+                            ;;
+                        i) login=1 ;;
+                        s) shell=1 ;;
+                        H) home=1 ;;
+                        b) background=1 ;;
+                        A | B | E | k | n | N | P | S) ;;
+                        *) delegate=1; return ;;
+                    esac
+                done
+                ;;
+            -*) delegate=1; return ;;
+            *) return ;;
+        esac
+        count=$((count + 1))
+        shift
+    done
+}
+quote() {
+    for arg; do
+        arg=$(printf '%sx' "$arg" | sed "s/'/'\\\\''/g")
+        printf "'%s' " "${arg%x}"
+    done
+}
+user= dir= login= shell= home= background= delegate= count=0
+parse "$@"
+[ -z "$delegate" ] || exec "$real" "$@"
+shift "$count"
+[ $# -gt 0 ] || [ -n "$login$shell" ] || exec "$real"
+case $user in
+    \#*) user=$(getent passwd "${user#?}" | cut -d: -f1) ;;
+esac
+entry=$(getent passwd "${user:-root}")
+if [ -z "$entry" ]; then
+    echo "sudo: unknown user ${user:-root}" >&2
+    exit 1
+fi
+target=${entry%%:*}
+target_home=$(printf '%s' "$entry" | cut -d: -f6)
+target_shell=$(printf '%s' "$entry" | cut -d: -f7)
+target_shell=${target_shell:-/bin/sh}
+export SUDO_USER="$(id -un)" SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
+export SUDO_COMMAND="$*"
+if [ -n "$dir" ]; then
+    cd "$dir" || exit 1
+fi
+if [ -n "$login" ]; then
+    command="cd $(quote "$target_home") 2>/dev/null; exec $(quote "$target_shell") -l"
+    [ $# -eq 0 ] || command="$command -c $(quote "$(quote "$@")")"
+elif [ -n "$shell" ]; then
+    command="exec $(quote "${SHELL:-$target_shell}")"
+    [ $# -eq 0 ] || command="$command -c $(quote "$(quote "$@")")"
+else
+    command="exec env -- $(quote "$@")"
+fi
+if [ "$target" = "$(id -un)" ]; then
+    [ -z "$home$login" ] || export HOME="$target_home"
+    set -- /bin/sh -c "$command"
+else
+    set -- su "$target" -s /bin/sh -c "$command"
+fi
+if [ -n "$background" ]; then
+    "$@" &
+    exit 0
+fi
+exec "$@"
+"""
+# Installs the shim only over an image's /usr/bin/sudo, and later when an apt
+# install adds sudo, so ``command -v sudo`` still fails where the image has
+# none, as under Docker. Without a writable overlay every write just fails.
+_FAKEROOT_COMMAND_SETUP = (
+    "if [ -d /etc/apt ]; then "
+    "mkdir -p /etc/apt/apt.conf.d 2>/dev/null; "
+    "printf '%s\\n' "
+    "'// Written by URSA: under the fakeroot command apt cannot drop to _apt.' "
+    "'APT::Sandbox::User \"root\";' "
+    f"'DPkg::Post-Invoke {{ \"[ -e {_SUDO_SHIM_PATH} ] || "
+    f"! [ -x /usr/bin/sudo ] || cp {_SUDO_SHIM_STASH} {_SUDO_SHIM_PATH} || "
+    "true\"; };' "
+    f"> {_APT_FAKEROOT_CONFIG} 2>/dev/null; fi; "
+    f"if mkdir -p {PurePosixPath(_SUDO_SHIM_STASH).parent} "
+    f"{PurePosixPath(_SUDO_SHIM_PATH).parent} 2>/dev/null && "
+    f"printf '%s\\n' \"$1\" > {_SUDO_SHIM_STASH} 2>/dev/null && "
+    f"chmod 755 {_SUDO_SHIM_STASH} && [ -x /usr/bin/sudo ] && "
+    f"{{ ! [ -e {_SUDO_SHIM_PATH} ] || "
+    f"grep -q {_SUDO_SHIM_MARKER} {_SUDO_SHIM_PATH}; }}; then "
+    f"cp {_SUDO_SHIM_STASH} {_SUDO_SHIM_PATH}; fi; true"
+)
 
 
 @cache
@@ -3158,7 +3325,17 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._instance_started = True
         await self._detect_shared_faked()
         # Also starts the shared faked before any agent command.
-        await self._run(*self._instance_exec_prefix(), "true")
+        if self._shared_faked:
+            await self._run(
+                *self._instance_exec_prefix(),
+                "/bin/sh",
+                "-c",
+                _FAKEROOT_COMMAND_SETUP,
+                "sh",
+                _SUDO_SHIM,
+            )
+        else:
+            await self._run(*self._instance_exec_prefix(), "true")
 
     async def _detect_shared_faked(self) -> None:
         """Share one faked per instance under Apptainer's fakeroot command.

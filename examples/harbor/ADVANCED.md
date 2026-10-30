@@ -304,6 +304,25 @@ An unprivileged (user-space) Apptainer installation has extra requirements:
   keeps that ownership in memory, so it is lost when the instance restarts
   for a network-policy change. Fakeroot with `/etc/subuid` entries has no
   wrapper and is left as it is.
+- Under that wrapper, commands that clear their environment lose the
+  fakeroot preload and its key, and then fail to change ownership ("Invalid
+  argument") or to drop privileges. `sudo` is the common case: `sudo apt-get
+  install` fails with "setgroups 65534 failed" when apt drops to `_apt`.
+  With the writable overlay the adapter therefore writes
+  `APT::Sandbox::User "root";` to `/etc/apt/apt.conf.d/00ursa-fakeroot`, so
+  apt never drops to `_apt`, and, when the image has `/usr/bin/sudo` (or an
+  `apt-get install` adds it), shadows it with a shim at
+  `/usr/local/sbin/sudo`. Inside the instance every command already runs as
+  root, so for a root caller the shim runs the command with its environment
+  kept, or as the `-u` user through `su`, as Harbor's user switching does.
+  Non-root callers and the other modes, such as `sudo -l`, still get the
+  image's `sudo`, which Apptainer's "no new privileges" flag stops from
+  gaining root. Images without `sudo` get no shim, so `command -v sudo`
+  fails as it does under Docker. Daemons that clear their environment
+  themselves stay broken: `postfix start` fails with "chown
+  /var/spool/postfix/hold: Invalid argument". An `/etc/ld.so.preload` entry
+  does not help them, since it loads libfakeroot without the key that
+  reaches the shared `faked`.
 - Non-root users get only `--network none`, so Compose projects with sidecars
   or published ports cannot start: Apptainer refuses `--net` with "network
   requires root or a suid installation with /etc/subuid --fakeroot".

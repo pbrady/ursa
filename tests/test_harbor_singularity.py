@@ -1580,8 +1580,17 @@ async def test_instance_start_detects_apptainer_fakeroot_command(
         assert "--env" not in command
         assert command[command.index(instance) + 1] == "/bin/sh"
     assert environment._shared_faked is shared
-    # The startup exec that follows starts the shared faked.
-    assert commands[-1][-1] == "true"
+    # The startup exec that follows starts the shared faked, and under it
+    # sets up apt and the sudo shim.
+    if shared:
+        assert commands[-1][-4:] == [
+            "-c",
+            harbor_singularity._FAKEROOT_COMMAND_SETUP,
+            "sh",
+            harbor_singularity._SUDO_SHIM,
+        ]
+    else:
+        assert commands[-1][-1] == "true"
     assert ("--env" in commands[-1]) is shared
     environment._cleanup_staging()
 
@@ -1745,6 +1754,130 @@ async def test_shared_faked_script_runs_the_command_without_fakeroot():
 
     assert process.returncode == 0
     assert stdout.decode().strip() == "unset unset argument with spaces"
+
+
+def _sudo_shim_bin(tmp_path: Path) -> dict[str, str]:
+    """Stub the image's sudo, id, getent, and su around the sudo shim."""
+    shim_dir = tmp_path / "sbin"
+    stub_dir = tmp_path / "bin"
+    home = tmp_path / "home" / "bob"
+    for directory in (shim_dir, stub_dir, home):
+        directory.mkdir(parents=True)
+    scripts = {
+        shim_dir / "sudo": harbor_singularity._SUDO_SHIM,
+        stub_dir / "sudo": '#!/bin/sh\necho "image sudo: $*"\n',
+        stub_dir / "id": (
+            "#!/bin/sh\n"
+            'case $1 in -un) [ "$TEST_UID" = 0 ] && echo root || echo bob ;;'
+            ' *) echo "$TEST_UID" ;; esac\n'
+        ),
+        stub_dir / "getent": (
+            "#!/bin/sh\n"
+            "case $2 in root | 0) echo root:x:0:0:root:/root:/bin/sh ;;"
+            f" bob | 1000) echo bob:x:1000:1000::{home}:/bin/sh ;;"
+            " *) exit 2 ;; esac\n"
+        ),
+        # su runs the command as the shim built it and reports the user.
+        stub_dir / "su": (
+            '#!/bin/sh\necho "su $1 $2 $3 $4"\nexec /bin/sh -c "$5"\n'
+        ),
+    }
+    for path, script in scripts.items():
+        path.write_text(script)
+        path.chmod(0o755)
+    return {"PATH": f"{shim_dir}:{stub_dir}:/usr/bin:/bin", "TEST_UID": "0"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "uid", "expected"),
+    [
+        # Root keeps its environment and needs no sudo to stay root.
+        (
+            ["-E", "MODE=kept", "sh", "-c", 'echo "$MODE $SUDO_USER $PRELOAD"'],
+            "0",
+            ["kept root fakeroot"],
+        ),
+        (["-nH", "--", "sh", "-c", 'echo "$HOME"'], "0", ["/root"]),
+        (
+            ["-u", "bob", "printf", "[%s]", "a b", "c'd", "$x"],
+            "0",
+            ["su bob -s /bin/sh -c", "[a b][c'd][$x]"],
+        ),
+        (
+            ["-Eu#1000", "sh", "-c", 'echo "$PRELOAD"'],
+            "0",
+            ["su bob -s /bin/sh -c", "fakeroot"],
+        ),
+        (["--user=bob", "-i", "pwd"], "0", ["su bob -s /bin/sh -c", "{home}"]),
+        # Other modes and non-root callers get the image's sudo.
+        (["-l"], "0", ["image sudo: -l"]),
+        (["-u", "bob", "-V"], "0", ["image sudo: -u bob -V"]),
+        ([], "0", ["image sudo:"]),
+        (["-n", "true"], "1000", ["image sudo: -n true"]),
+    ],
+)
+async def test_sudo_shim_keeps_the_environment_of_root_commands(
+    tmp_path: Path, arguments: list[str], uid: str, expected: list[str]
+):
+    env = {**_sudo_shim_bin(tmp_path), "TEST_UID": uid, "PRELOAD": "fakeroot"}
+    process = await asyncio.create_subprocess_exec(
+        str(tmp_path / "sbin" / "sudo"),
+        *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    stdout, _ = await process.communicate()
+
+    assert process.returncode == 0, stdout.decode()
+    home = str(tmp_path / "home" / "bob")
+    assert [line.rstrip() for line in stdout.decode().splitlines()] == [
+        line.format(home=home) for line in expected
+    ]
+
+
+@pytest.mark.parametrize(
+    ("image_sudo", "other_sudo"),
+    [(True, False), (False, False), (True, True)],
+)
+async def test_fakeroot_command_setup_shadows_only_an_image_sudo(
+    tmp_path: Path, image_sudo: bool, other_sudo: bool
+):
+    root = tmp_path / "root"
+    (root / "etc" / "apt").mkdir(parents=True)
+    (root / "usr" / "bin").mkdir(parents=True)
+    if image_sudo:
+        (root / "usr" / "bin" / "sudo").write_text("#!/bin/sh\n")
+        (root / "usr" / "bin" / "sudo").chmod(0o755)
+    shim = root / harbor_singularity._SUDO_SHIM_PATH.lstrip("/")
+    if other_sudo:
+        shim.parent.mkdir(parents=True)
+        shim.write_text("#!/bin/sh\necho another sudo\n")
+    script = (
+        harbor_singularity._FAKEROOT_COMMAND_SETUP.replace(
+            "/etc/apt", f"{root}/etc/apt"
+        )
+        .replace("/usr/local", f"{root}/usr/local")
+        .replace("/usr/bin/sudo", f"{root}/usr/bin/sudo")
+    )
+    for _ in range(2):  # An instance restart runs it again.
+        process = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", script, "sh", harbor_singularity._SUDO_SHIM
+        )
+        assert await process.wait() == 0
+
+    config = root / harbor_singularity._APT_FAKEROOT_CONFIG.lstrip("/")
+    assert 'APT::Sandbox::User "root";' in config.read_text().splitlines()
+    stash = root / harbor_singularity._SUDO_SHIM_STASH.lstrip("/")
+    assert stash.read_text() == harbor_singularity._SUDO_SHIM + "\n"
+    if other_sudo:
+        assert shim.read_text() == "#!/bin/sh\necho another sudo\n"
+    elif image_sudo:
+        assert shim.read_text() == stash.read_text()
+        assert shim.stat().st_mode & 0o111
+    else:
+        assert not shim.exists()
+    assert harbor_singularity._SUDO_SHIM_MARKER in stash.read_text()
 
 
 async def test_compose_home_option_replaces_no_home_without_fakeroot(
