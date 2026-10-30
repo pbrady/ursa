@@ -1423,6 +1423,7 @@ def test_apptainer_overlay_keeps_the_image_localtime_and_tmp(
 ):
     environment = _environment(tmp_path, fakeroot=True)
     environment._runtime_path = str(tmp_path / runtime)
+    environment._workdir = "/app"
     environment._prepare_runtime_workdir()
     staging = tmp_path / "staging"
     staging.mkdir()
@@ -1441,6 +1442,10 @@ def test_apptainer_overlay_keeps_the_image_localtime_and_tmp(
         if option == "--no-mount"
     ]
     assert no_mounts == (["/etc/localtime", "tmp"] if dropped else [])
+    # A bind over /app would be a mount of its own, and renames from it to
+    # the overlay's /tmp fail with EXDEV too.
+    workdir_bind = f"{staging / 'harbor-writable' / 'workdir'}:/app"
+    assert (workdir_bind in start) is not dropped
     environment._cleanup_staging()
 
 
@@ -1581,6 +1586,16 @@ async def test_instance_start_detects_apptainer_fakeroot_command(
     )
 
     instance = f"instance://{environment._instance_name}"
+    # Over Apptainer's overlay the workdir has no bind, so the start creates
+    # it before the first exec that starts in it.
+    created = [
+        index
+        for index, command in enumerate(commands)
+        if command[-3:] == ["mkdir", "-p", environment._workdir]
+    ]
+    assert created == ([1] if runtime == "apptainer" else [])
+    for index in created:
+        assert _option_value(commands[index], "--pwd") == "/"
     probed = [
         command
         for command in commands

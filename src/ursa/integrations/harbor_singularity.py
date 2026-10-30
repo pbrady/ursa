@@ -116,7 +116,8 @@ _HOST_LOCALTIME = "/etc/localtime"
 # separate filesystem from the overlay, so os.rename between /tmp and the rest
 # of the container fails with EXDEV. Over a disk overlay the adapter keeps the
 # image's directories instead, which the overlay makes writable, as Docker
-# does. Without one, only the workdir's are writable.
+# does, and leaves the task's workdir unbound in the overlay with them; see
+# ``_harbor_writable_binds``. Without one, only the workdir's are writable.
 _OVERLAY_NO_MOUNTS = (_HOST_LOCALTIME, "tmp")
 # How long a timed-out or cancelled exec waits for its output pipes to close
 # after its process tree is killed. Background jobs it started keep them open.
@@ -2886,7 +2887,10 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             (root / "skills", EnvironmentPaths.default_skills_dir),
         ]
         workdir = PurePosixPath(self._workdir)
-        if workdir != PurePosixPath("/"):
+        # Over a disk overlay that keeps the image's /tmp, the workdir stays
+        # in the overlay too: a bind there would be a separate mount, so
+        # os.rename between it and /tmp would still fail with EXDEV.
+        if workdir != PurePosixPath("/") and not self._keeps_image_paths:
             candidates.append((root / "workdir", workdir))
         candidates.extend(
             (root / target.relative_to("/"), target)
@@ -3344,6 +3348,15 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             self._instance_start_attempted = True
             await self._run(*self._instance_start_command(network_policy))
         self._instance_started = True
+        if self._keeps_image_paths:
+            # Without its bind, the workdir that every exec starts in exists
+            # only if the image has it; Docker creates a missing one.
+            await self._run(
+                *self._instance_exec_prefix(default_cwd="/"),
+                "mkdir",
+                "-p",
+                self._workdir,
+            )
         await self._detect_shared_faked()
         # Also starts the shared faked before any agent command.
         if self._shared_faked:
