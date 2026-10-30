@@ -276,6 +276,16 @@ script of `tzdata`, which `python3` and many other packages depend on, fails
 with "Device or resource busy" when it replaces the file, and `apt-get
 install` fails with it.
 
+Apptainer also mounts directories of the instance's `--workdir` over `/tmp`
+and `/var/tmp`. They are a separate filesystem from the rest of the
+container, so `os.rename` between `/tmp` and, say, `/app` fails with
+"Invalid cross-device link" (EXDEV), as in the verifier of
+`path-tracing-reverse`. With the writable overlay the adapter also passes
+`--no-mount tmp` to Apptainer, so `/tmp` and `/var/tmp` are the image's own
+directories in the overlay, as under Docker, and count toward the task's
+`storage_mb`. Without the overlay, and on SingularityCE, they stay in the
+workdir.
+
 An unprivileged (user-space) Apptainer installation has extra requirements:
 
 - `squashfuse` mounts SIF images; without it, Apptainer extracts the image to

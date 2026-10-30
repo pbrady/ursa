@@ -519,9 +519,19 @@ async def test_fakeroot_overlay_provides_a_writable_container_root(
             "/created-at-runtime/value"
         )
         read_back = await environment.exec("cat /created-at-runtime/value")
+        # Apptainer keeps the image's /tmp in the overlay, so a rename across
+        # it, as path-tracing-reverse's verifier does, works as under Docker.
+        # mv would fall back to a copy; perl-base is in every Ubuntu image.
+        renamed = await environment.exec(
+            'cd /created-at-runtime && perl -e \'rename("value", '
+            '"/tmp/value") && rename("/tmp/value", "back") or die "$!\\n"\' '
+            "&& cat back"
+        )
 
         assert result.return_code == 0
         assert read_back.stdout == "overlay"
+        if environment._keeps_image_paths:
+            assert renamed.stdout == "overlay", renamed.stderr
     finally:
         await _cleanup_environment(environment)
 

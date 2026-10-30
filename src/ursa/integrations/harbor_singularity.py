@@ -112,6 +112,12 @@ _FAKEROOT_COMMAND_FAILURE_MARKERS = (
 # it ("Device or resource busy"), so apt-get install of python3 and other
 # packages that need tzdata fails. Docker leaves the image's file in place.
 _HOST_LOCALTIME = "/etc/localtime"
+# Apptainer also binds the instance's --workdir over /tmp and /var/tmp, a
+# separate filesystem from the overlay, so os.rename between /tmp and the rest
+# of the container fails with EXDEV. Over a disk overlay the adapter keeps the
+# image's directories instead, which the overlay makes writable, as Docker
+# does. Without one, only the workdir's are writable.
+_OVERLAY_NO_MOUNTS = (_HOST_LOCALTIME, "tmp")
 # How long a timed-out or cancelled exec waits for its output pipes to close
 # after its process tree is killed. Background jobs it started keep them open.
 _EXEC_OUTPUT_DRAIN_SEC = 10
@@ -126,10 +132,11 @@ _EXEC_OUTPUT_DRAIN_SEC = 10
 # and replaced if it has died, and preloads libfakeroot for that daemon.
 # Without the fakeroot command's files it only clears FAKEROOTKEY.
 _FAKEROOT_COMMAND_MARKER = "ursa-fakeroot-command"
-# Records the shared faked's ``key:pid``. The instance's /tmp lives in its
-# --workdir, which outlives an instance restart, while the daemon does not,
-# so the probe that runs first in every new instance removes the record.
-_SHARED_FAKED_STATE = "/tmp/.ursa-faked"
+# Records the shared faked's ``key:pid`` in the instance's own /dev/shm,
+# which --containall makes a fresh tmpfs per instance. /tmp, in the --workdir
+# or the overlay, outlives an instance restart while the daemon does not, so
+# the probe that runs first in every new instance also removes the record.
+_SHARED_FAKED_STATE = "/dev/shm/.ursa-faked"
 _FAKEROOT_COMMAND_PROBE = (
     f"rm -f {_SHARED_FAKED_STATE}; "
     f'if [ -n "${{FAKEROOTKEY-}}" ]; then echo {_FAKEROOT_COMMAND_MARKER}; fi'
@@ -1115,7 +1122,7 @@ async def docker_compose_to_singularity_compose(
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
     interpolation_environment: Mapping[str, str] | None = None,
     home_root: Path | None = None,
-    keep_image_localtime: bool = False,
+    keep_image_paths: bool = False,
 ) -> dict[str, list[str]]:
     """Convert one or more Docker Compose files into a singularity-compose file."""
     paths = (
@@ -1182,8 +1189,10 @@ async def docker_compose_to_singularity_compose(
             start_options.insert(0, "fakeroot")
         if name == "main" and main_overlay is not None:
             start_options.append(f"overlay={main_overlay}")
-            if keep_image_localtime:
-                start_options.append(f"no-mount={_HOST_LOCALTIME}")
+            if keep_image_paths:
+                start_options.extend(
+                    f"no-mount={path}" for path in _OVERLAY_NO_MOUNTS
+                )
         elif main_overlay is not None:
             # ``singularity-compose up --read_only`` is required to prevent
             # its implicit tmpfs overlay from conflicting with main's disk
@@ -2555,7 +2564,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 if self._uses_private_home
                 else None
             ),
-            keep_image_localtime=self._keeps_image_localtime,
+            keep_image_paths=self._keeps_image_paths,
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -2773,8 +2782,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             command.insert(3, "--fakeroot")
         if self._overlay_path is not None:
             command.extend(["--overlay", str(self._overlay_path)])
-        if self._keeps_image_localtime:
-            command.extend(["--no-mount", _HOST_LOCALTIME])
+        if self._keeps_image_paths:
+            for path in _OVERLAY_NO_MOUNTS:
+                command.extend(["--no-mount", path])
         for source, target in self._harbor_writable_binds():
             command.extend(["-B", f"{source}:{target}"])
         if network_policy.network_mode == NetworkMode.NO_NETWORK:
@@ -2795,9 +2805,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         return command
 
     @property
-    def _keeps_image_localtime(self) -> bool:
-        # See ``_HOST_LOCALTIME``. Only Apptainer, where this was measured,
-        # drops the bind; SingularityCE keeps its default binds.
+    def _keeps_image_paths(self) -> bool:
+        # See ``_OVERLAY_NO_MOUNTS``. Only Apptainer, where this was measured,
+        # drops the binds; SingularityCE keeps its default binds.
         return self._overlay_path is not None and _runtime_is_apptainer(
             self._instance_runtime()
         )

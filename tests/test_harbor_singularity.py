@@ -1411,7 +1411,7 @@ def test_instance_home_is_private_unless_fakeroot_has_an_overlay(
         ("fake-singularity", True, False),
     ],
 )
-def test_apptainer_overlay_keeps_the_image_localtime(
+def test_apptainer_overlay_keeps_the_image_localtime_and_tmp(
     tmp_path: Path, runtime: str, overlay: bool, dropped: bool
 ):
     environment = _environment(tmp_path, fakeroot=True)
@@ -1426,16 +1426,19 @@ def test_apptainer_overlay_keeps_the_image_localtime(
 
     start = environment._instance_start_command()
 
-    # tzdata's postinst cannot replace a bind-mounted /etc/localtime.
-    if dropped:
-        assert _option_value(start, "--no-mount") == "/etc/localtime"
-    else:
-        assert "--no-mount" not in start
+    # tzdata's postinst cannot replace a bind-mounted /etc/localtime, and
+    # os.rename between /app and the workdir's /tmp fails with EXDEV.
+    no_mounts = [
+        start[index + 1]
+        for index, option in enumerate(start)
+        if option == "--no-mount"
+    ]
+    assert no_mounts == (["/etc/localtime", "tmp"] if dropped else [])
     environment._cleanup_staging()
 
 
 @pytest.mark.parametrize("keep", [True, False])
-async def test_compose_main_overlay_keeps_the_image_localtime(
+async def test_compose_main_overlay_keeps_the_image_localtime_and_tmp(
     tmp_path: Path, keep: bool
 ):
     compose = tmp_path / "docker-compose.yaml"
@@ -1460,7 +1463,7 @@ async def test_compose_main_overlay_keeps_the_image_localtime(
         image_resolver=resolve,
         staging_dir=staging,
         main_overlay=tmp_path / "overlay.img",
-        keep_image_localtime=keep,
+        keep_image_paths=keep,
     )
 
     instances = yaml.safe_load(output.read_text())["instances"]
@@ -1468,8 +1471,9 @@ async def test_compose_main_overlay_keeps_the_image_localtime(
         key.split("-")[1]: instance["start"]["options"]
         for key, instance in instances.items()
     }
-    assert ("no-mount=/etc/localtime" in options["main"]) is keep
-    assert "no-mount=/etc/localtime" not in options["helper"]
+    for option in ("no-mount=/etc/localtime", "no-mount=tmp"):
+        assert (option in options["main"]) is keep
+        assert option not in options["helper"]
 
 
 @pytest.mark.parametrize(
@@ -1683,7 +1687,7 @@ async def test_fakeroot_command_probe_reports_only_a_wrapped_exec(
     env = {"PATH": "/usr/bin:/bin"}
     if key is not None:
         env["FAKEROOTKEY"] = key
-    # A record left in /tmp by the faked of an instance that was restarted.
+    # A record left by the faked of an instance that was restarted.
     state = tmp_path / "ursa-faked"
     state.write_text("1151152171:68\n")
     process = await asyncio.create_subprocess_exec(
