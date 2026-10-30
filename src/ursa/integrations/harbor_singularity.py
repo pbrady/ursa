@@ -417,9 +417,20 @@ def _compose_uses_host_network(config: Mapping[str, Any]) -> bool:
     )
 
 
+def _openssl_context() -> ssl.SSLContext:
+    """Return an empty context of the stdlib, OpenSSL-backed SSLContext."""
+    # ``truststore.inject_into_ssl()``, which the URSA CLI calls, replaces
+    # ssl.SSLContext with a subclass whose get_ca_certs raises
+    # NotImplementedError.
+    context_class = next(
+        cls for cls in ssl.SSLContext.__mro__ if cls.__module__ == "ssl"
+    )
+    return context_class(ssl.PROTOCOL_TLS_CLIENT)
+
+
 def _host_ca_certificates_pem() -> str:
     """Serialize the host OpenSSL trust anchors as one PEM bundle."""
-    context = ssl.create_default_context()
+    context = _openssl_context()
     paths = ssl.get_default_verify_paths()
     if paths.cafile is not None:
         context.load_verify_locations(cafile=paths.cafile)

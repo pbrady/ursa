@@ -169,6 +169,7 @@ inference_providers:
 
 def test_auth_main_dispatches_login(monkeypatch):
     called = []
+    monkeypatch.setattr("ursa.cli.inject_truststore_into_ssl", lambda: None)
     monkeypatch.setattr(
         "ursa.cli.auth.login",
         lambda username, config, from_env: called.append((
@@ -186,6 +187,7 @@ def test_auth_main_dispatches_login(monkeypatch):
 def test_auth_main_dispatches_list(monkeypatch, tmp_path):
     config = tmp_path / "config.yaml"
     called = []
+    monkeypatch.setattr("ursa.cli.inject_truststore_into_ssl", lambda: None)
     monkeypatch.setattr(
         "ursa.cli.auth.list_credentials",
         lambda config, show_secrets: called.append((config, show_secrets)),

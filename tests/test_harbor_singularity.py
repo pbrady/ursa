@@ -123,11 +123,7 @@ def test_host_ca_certificates_pem_uses_ssl(
             assert binary_form
             return [b"first", b"second"]
 
-    monkeypatch.setattr(
-        harbor_singularity.ssl,
-        "create_default_context",
-        lambda: Context(),
-    )
+    monkeypatch.setattr(harbor_singularity, "_openssl_context", Context)
     monkeypatch.setattr(
         harbor_singularity.ssl,
         "get_default_verify_paths",
@@ -163,11 +159,7 @@ def test_host_ca_certificates_pem_loads_hashed_capath(
             assert binary_form
             return self.loaded
 
-    monkeypatch.setattr(
-        harbor_singularity.ssl,
-        "create_default_context",
-        lambda: Context(),
-    )
+    monkeypatch.setattr(harbor_singularity, "_openssl_context", Context)
     monkeypatch.setattr(
         harbor_singularity.ssl,
         "get_default_verify_paths",
@@ -186,6 +178,21 @@ def test_host_ca_certificates_pem_loads_hashed_capath(
     assert harbor_singularity._host_ca_certificates_pem() == (
         "PEM:certificate\n"
     )
+
+
+def test_host_ca_certificates_pem_survives_truststore_injection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    truststore = pytest.importorskip("truststore")
+    expected = harbor_singularity._host_ca_certificates_pem()
+    # What ``truststore.inject_into_ssl()`` does, undone after the test.
+    monkeypatch.setattr(
+        harbor_singularity.ssl, "SSLContext", truststore.SSLContext
+    )
+
+    with pytest.raises(NotImplementedError):
+        harbor_singularity.ssl.create_default_context().get_ca_certs()
+    assert harbor_singularity._host_ca_certificates_pem() == expected
 
 
 def test_phase_network_change_requires_overlay(tmp_path: Path):
