@@ -288,10 +288,12 @@ An unprivileged (user-space) Apptainer installation has extra requirements:
   `apt-get install` early. With it, Apptainer runs each command under its own
   `faked` daemon, which exits with the command, and processes left running,
   such as the tmux server of Harbor's `terminus-2` agent or a `nohup` server,
-  then hang on their next `stat` or `chown`. The adapter therefore keeps one
-  `faked` per instance, started by the first command and restarted if it
-  dies, and runs every command under it, so ownership set by one command is
-  also seen by later ones.
+  then hang on their next `stat` or `chown`. When the instance's first
+  command shows that wrapper (its environment has `FAKEROOTKEY`), the adapter
+  keeps one `faked` per instance instead, started at instance start and
+  restarted if it dies, and runs every command under it, so ownership set by
+  one command is also seen by later ones. Fakeroot with `/etc/subuid` entries
+  has no wrapper and is left as it is.
 - Non-root users get only `--network none`, so Compose projects with sidecars
   or published ports cannot start: Apptainer refuses `--net` with "network
   requires root or a suid installation with /etc/subuid --fakeroot".

@@ -111,10 +111,16 @@ _FAKEROOT_COMMAND_FAILURE_MARKERS = (
 # fakeroot(1) command, whose faked daemon exits with that exec. Processes the
 # exec left running, such as a tmux server or a ``nohup`` job, keep the
 # preloaded libfakeroot and then block forever on their next stat or chown.
-# Apptainer skips its wrapper when FAKEROOTKEY is already set, so instance
-# execs set it and run this script, which shares one faked per instance,
-# started on first use and replaced if it has died, and preloads libfakeroot
-# for that daemon. Without the fakeroot command it only clears FAKEROOTKEY.
+# An exec under that wrapper sees FAKEROOTKEY, which the first instance exec
+# checks for; subuid-mapped fakeroot sets none. Apptainer skips its wrapper
+# when FAKEROOTKEY is already set, so in that mode instance execs set it and
+# run this script, which shares one faked per instance, started on first use
+# and replaced if it has died, and preloads libfakeroot for that daemon.
+# Without the fakeroot command's files it only clears FAKEROOTKEY.
+_FAKEROOT_COMMAND_MARKER = "ursa-fakeroot-command"
+_FAKEROOT_COMMAND_PROBE = (
+    f'if [ -n "${{FAKEROOTKEY-}}" ]; then echo {_FAKEROOT_COMMAND_MARKER}; fi'
+)
 _SHARED_FAKED_SCRIPT = (
     "unset FAKEROOTKEY; "
     "libs=/.singularity.d/libs; state=/tmp/.ursa-faked; "
@@ -1134,6 +1140,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._compose_identity = f"{identity[:8]}{secrets.token_hex(4)}"
         self._instance_started = False
         self._instance_start_attempted = False
+        # Set by the first instance exec when Apptainer wraps execs in the
+        # fakeroot command; see ``_SHARED_FAKED_SCRIPT``.
+        self._shared_faked = False
         self._warned_user_switch_without_fakeroot = False
         self._fakeroot_disabled_explained = False
         self._compose_project_dir: Path | None = None
@@ -2542,19 +2551,17 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         instance_name: str | None = None,
         default_cwd: str | None = None,
     ) -> list[str]:
-        runtime = self._instance_runtime()
         command = [
-            runtime,
+            self._instance_runtime(),
             "exec",
             "--cleanenv",
             "--pwd",
             cwd or default_cwd or self._workdir,
         ]
-        shared_faked = self._fakeroot and _runtime_is_apptainer(runtime)
-        if shared_faked:
+        if self._shared_faked:
             command.extend(["--env", "FAKEROOTKEY=ursa-shared-faked"])
         command.append(f"instance://{instance_name or self._instance_name}")
-        if shared_faked:
+        if self._shared_faked:
             command.extend([
                 "/bin/sh",
                 "-c",
@@ -3019,6 +3026,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             raise
         self._instance_started = False
         self._instance_start_attempted = False
+        # Set by the first instance exec when Apptainer wraps execs in the
+        # fakeroot command; see ``_SHARED_FAKED_SCRIPT``.
+        self._shared_faked = False
         return True
 
     async def _stop_compose(self, *, warn: bool) -> bool:
@@ -3077,6 +3087,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 raise
         self._instance_started = False
         self._instance_start_attempted = False
+        # Set by the first instance exec when Apptainer wraps execs in the
+        # fakeroot command; see ``_SHARED_FAKED_SCRIPT``.
+        self._shared_faked = False
         return True
 
     async def _stop_prepared_runtime(self, *, warn: bool) -> bool:
@@ -3116,7 +3129,29 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             self._instance_start_attempted = True
             await self._run(*self._instance_start_command(network_policy))
         self._instance_started = True
+        await self._detect_shared_faked()
+        # Also starts the shared faked before any agent command.
         await self._run(*self._instance_exec_prefix(), "true")
+
+    async def _detect_shared_faked(self) -> None:
+        """Share one faked per instance under Apptainer's fakeroot command.
+
+        Only Apptainer's root-mapped fakeroot, used without /etc/subuid
+        entries, wraps each exec in fakeroot(1); its execs see FAKEROOTKEY.
+        Subuid-mapped fakeroot and SingularityCE keep their own exec path.
+        """
+        self._shared_faked = False
+        if not (
+            self._fakeroot and _runtime_is_apptainer(self._instance_runtime())
+        ):
+            return
+        output = await self._run(
+            *self._instance_exec_prefix(),
+            "/bin/sh",
+            "-c",
+            _FAKEROOT_COMMAND_PROBE,
+        )
+        self._shared_faked = _FAKEROOT_COMMAND_MARKER in output.split()
 
     async def _restore_prepared_runtime(
         self, network_policy: NetworkPolicy

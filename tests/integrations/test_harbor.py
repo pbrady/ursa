@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -696,32 +697,53 @@ async def test_unprivileged_instance_has_a_writable_home(
         await _cleanup_environment(environment)
 
 
-async def test_fakeroot_background_process_outlives_its_exec(
+async def _drive_background_shell(
+    environment: DockerfileSingularityEnvironment,
+) -> None:
+    """Drive a shell started by one exec from later execs, as terminus-2
+    drives its tmux shell."""
+    started = await environment.exec(
+        "rm -f /tmp/shell.in /tmp/shell.out; mkfifo /tmp/shell.in; "
+        "nohup bash -c 'exec bash <>/tmp/shell.in' >/tmp/shell.out 2>&1 &"
+    )
+    assert started.return_code == 0, started.stderr
+    steps = [
+        ("ls", "ls -la / >/dev/null"),
+        ("stat", "stat -c %U /etc/hostname >/dev/null"),
+        ("write", "cat > /tmp/heredoc.txt <<'EOF'\nwritten\nEOF"),
+        ("chown", "chown 1000 /tmp/heredoc.txt"),
+    ]
+    for name, command in steps:
+        marker = f"{name}-done"
+        # The marker goes on its own line so it cannot end a heredoc.
+        lines = shlex.quote(f"{command}\necho {marker}")
+        sent = await environment.exec(
+            f"printf '%s\\n' {lines} "
+            "> /tmp/shell.in; "
+            "for i in $(seq 100); do "
+            f"grep -qx {marker} /tmp/shell.out && break; sleep 0.1; done; "
+            f"grep -x {marker} /tmp/shell.out",
+            timeout_sec=60,
+        )
+        assert sent.stdout.strip() == marker, (name, sent.stdout, sent.stderr)
+    finished = await environment.exec(
+        "cat /tmp/heredoc.txt; stat -c %u /tmp/heredoc.txt"
+    )
+    assert finished.stdout.split() == ["written", "1000"], finished.stderr
+
+
+async def test_fakeroot_background_shell_serves_later_execs(
     tmp_path: Path, ubuntu_sif: Path
 ):
     # Apptainer's per-exec faked used to exit with the exec that started a
-    # background job, after which the job blocked on its first stat.
+    # background shell, after which the shell blocked on its first stat.
     _require_fakeroot(ubuntu_sif)
     environment = await _start_environment(
         tmp_path, ubuntu_sif, fakeroot=True, overlay=True
     )
 
     try:
-        started = await environment.exec(
-            "nohup sh -c 'sleep 2; ls -la / > /tmp/background-ls; "
-            "chown 1000 /tmp/background-ls; echo done >> /tmp/background-ls'"
-            " >/dev/null 2>&1 &"
-        )
-        assert started.return_code == 0, started.stderr
-        finished = await environment.exec(
-            "for i in $(seq 100); do "
-            "tail -n 1 /tmp/background-ls 2>/dev/null | grep -qx done "
-            "&& break; sleep 0.1; done; "
-            "tail -n 1 /tmp/background-ls; stat -c %u /tmp/background-ls",
-            timeout_sec=60,
-        )
-        assert finished.return_code == 0, finished.stderr
-        assert finished.stdout.split() == ["done", "1000"]
+        await _drive_background_shell(environment)
     finally:
         await _cleanup_environment(environment)
 

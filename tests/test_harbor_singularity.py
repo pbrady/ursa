@@ -1457,23 +1457,74 @@ async def test_exec_exports_home_instead_of_runtime_env(
 
 
 @pytest.mark.parametrize(
-    ("runtime", "fakeroot", "shared"),
+    ("runtime", "fakeroot", "wrapped", "shared"),
     [
-        ("apptainer", True, True),
-        ("apptainer", False, False),
-        ("fake-singularity", True, False),
+        # Root-mapped fakeroot: Apptainer's fakeroot command wraps execs.
+        ("apptainer", True, True, True),
+        # Subuid-mapped fakeroot: no wrapper, so no FAKEROOTKEY.
+        ("apptainer", True, False, False),
+        ("apptainer", False, True, False),
+        ("fake-singularity", True, True, False),
     ],
 )
-async def test_apptainer_fakeroot_execs_share_one_faked(
+async def test_instance_start_detects_apptainer_fakeroot_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     runtime: str,
     fakeroot: bool,
+    wrapped: bool,
     shared: bool,
 ):
     environment = _environment(tmp_path, fakeroot=fakeroot)
     _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
     environment._runtime_path = str(tmp_path / runtime)
+    commands: list[list[str]] = []
+
+    async def run(*command: str, **_kwargs: object) -> str:
+        commands.append(list(command))
+        if command[-1] == harbor_singularity._FAKEROOT_COMMAND_PROBE:
+            # Apptainer's own warnings share the captured output.
+            output = "WARNING: Skipping mount /etc/localtime\n"
+            if wrapped:
+                output += harbor_singularity._FAKEROOT_COMMAND_MARKER + "\n"
+            return output
+        return ""
+
+    monkeypatch.setattr(environment, "_run", run)
+    monkeypatch.setattr(
+        environment, "_instance_start_command", lambda _policy: ["start"]
+    )
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    instance = f"instance://{environment._instance_name}"
+    probed = [
+        command
+        for command in commands
+        if command[-1] == harbor_singularity._FAKEROOT_COMMAND_PROBE
+    ]
+    assert len(probed) == (runtime == "apptainer" and fakeroot)
+    for command in probed:
+        assert "--env" not in command
+        assert command[command.index(instance) + 1] == "/bin/sh"
+    assert environment._shared_faked is shared
+    # The startup exec that follows starts the shared faked.
+    assert commands[-1][-1] == "true"
+    assert ("--env" in commands[-1]) is shared
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize("shared", [True, False])
+async def test_exec_shares_one_faked_only_when_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool
+):
+    environment = _environment(tmp_path, fakeroot=True)
+    _prepare_started_environment(environment, tmp_path)
+    environment._runtime_path = str(tmp_path / "apptainer")
+    environment._shared_faked = shared
     observed: dict[str, object] = {}
 
     class Process:
@@ -1508,6 +1559,28 @@ async def test_apptainer_fakeroot_execs_share_one_faked(
     else:
         assert "--env" not in command
     environment._cleanup_staging()
+
+
+@pytest.mark.parametrize("key", ["1151152171", "", None])
+async def test_fakeroot_command_probe_reports_only_a_wrapped_exec(
+    key: str | None,
+):
+    env = {"PATH": "/usr/bin:/bin"}
+    if key is not None:
+        env["FAKEROOTKEY"] = key
+    process = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        "-c",
+        harbor_singularity._FAKEROOT_COMMAND_PROBE,
+        stdout=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, _ = await process.communicate()
+
+    assert process.returncode == 0
+    assert stdout.decode().split() == (
+        [harbor_singularity._FAKEROOT_COMMAND_MARKER] if key else []
+    )
 
 
 async def test_shared_faked_script_runs_the_command_without_fakeroot():
