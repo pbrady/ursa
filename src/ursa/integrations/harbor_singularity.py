@@ -114,11 +114,13 @@ _FAKEROOT_COMMAND_FAILURE_MARKERS = (
 _HOST_LOCALTIME = "/etc/localtime"
 # Apptainer also binds the instance's --workdir over /tmp and /var/tmp, a
 # separate filesystem from the overlay, so os.rename between /tmp and the rest
-# of the container fails with EXDEV. Over a disk overlay the adapter keeps the
-# image's directories instead, which the overlay makes writable, as Docker
-# does, and leaves the task's workdir unbound in the overlay with them; see
-# ``_harbor_writable_binds``. Without one, only the workdir's are writable.
-_OVERLAY_NO_MOUNTS = (_HOST_LOCALTIME, "tmp")
+# of the container fails with EXDEV. Over a disk overlay with fakeroot the
+# adapter keeps the image's directories instead, which the overlay makes
+# writable, as Docker does, and leaves the task's workdir unbound in the
+# overlay with them; see ``_harbor_writable_binds``. Without fakeroot the
+# invoking user cannot write the image's root-owned directories, even /tmp,
+# through the overlay, so only the workdir's and the binds are writable.
+_IMAGE_TMP = "tmp"
 # How long a timed-out or cancelled exec waits for its output pipes to close
 # after its process tree is killed. Background jobs it started keep them open.
 _EXEC_OUTPUT_DRAIN_SEC = 10
@@ -1134,7 +1136,7 @@ async def docker_compose_to_singularity_compose(
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
     interpolation_environment: Mapping[str, str] | None = None,
     home_root: Path | None = None,
-    keep_image_paths: bool = False,
+    main_no_mounts: Sequence[str] = (),
 ) -> dict[str, list[str]]:
     """Convert one or more Docker Compose files into a singularity-compose file."""
     paths = (
@@ -1201,10 +1203,7 @@ async def docker_compose_to_singularity_compose(
             start_options.insert(0, "fakeroot")
         if name == "main" and main_overlay is not None:
             start_options.append(f"overlay={main_overlay}")
-            if keep_image_paths:
-                start_options.extend(
-                    f"no-mount={path}" for path in _OVERLAY_NO_MOUNTS
-                )
+            start_options.extend(f"no-mount={path}" for path in main_no_mounts)
         elif main_overlay is not None:
             # ``singularity-compose up --read_only`` is required to prevent
             # its implicit tmpfs overlay from conflicting with main's disk
@@ -2576,7 +2575,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 if self._uses_private_home
                 else None
             ),
-            keep_image_paths=self._keeps_image_paths,
+            main_no_mounts=self._overlay_no_mounts,
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -2794,9 +2793,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             command.insert(3, "--fakeroot")
         if self._overlay_path is not None:
             command.extend(["--overlay", str(self._overlay_path)])
-        if self._keeps_image_paths:
-            for path in _OVERLAY_NO_MOUNTS:
-                command.extend(["--no-mount", path])
+        for path in self._overlay_no_mounts:
+            command.extend(["--no-mount", path])
         for source, target in self._harbor_writable_binds():
             command.extend(["-B", f"{source}:{target}"])
         if network_policy.network_mode == NetworkMode.NO_NETWORK:
@@ -2817,12 +2815,21 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         return command
 
     @property
-    def _keeps_image_paths(self) -> bool:
-        # See ``_OVERLAY_NO_MOUNTS``. Only Apptainer, where this was measured,
-        # drops the binds; SingularityCE keeps its default binds.
-        return self._overlay_path is not None and _runtime_is_apptainer(
+    def _overlay_no_mounts(self) -> tuple[str, ...]:
+        # See ``_HOST_LOCALTIME`` and ``_IMAGE_TMP``. Only Apptainer, where
+        # this was measured, drops the binds; SingularityCE keeps its default
+        # binds.
+        if self._overlay_path is None or not _runtime_is_apptainer(
             self._instance_runtime()
-        )
+        ):
+            return ()
+        if not self._fakeroot:
+            return (_HOST_LOCALTIME,)
+        return (_HOST_LOCALTIME, _IMAGE_TMP)
+
+    @property
+    def _keeps_image_tmp(self) -> bool:
+        return _IMAGE_TMP in self._overlay_no_mounts
 
     @property
     def _uses_private_home(self) -> bool:
@@ -2890,7 +2897,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         # Over a disk overlay that keeps the image's /tmp, the workdir stays
         # in the overlay too: a bind there would be a separate mount, so
         # os.rename between it and /tmp would still fail with EXDEV.
-        if workdir != PurePosixPath("/") and not self._keeps_image_paths:
+        if workdir != PurePosixPath("/") and not self._keeps_image_tmp:
             candidates.append((root / "workdir", workdir))
         candidates.extend(
             (root / target.relative_to("/"), target)
@@ -3348,7 +3355,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             self._instance_start_attempted = True
             await self._run(*self._instance_start_command(network_policy))
         self._instance_started = True
-        if self._keeps_image_paths:
+        if self._keeps_image_tmp:
             # Without its bind, the workdir that every exec starts in exists
             # only if the image has it; Docker creates a missing one.
             await self._run(

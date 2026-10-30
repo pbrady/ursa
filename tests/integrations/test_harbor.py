@@ -530,7 +530,7 @@ async def test_fakeroot_overlay_provides_a_writable_container_root(
 
         assert result.return_code == 0
         assert read_back.stdout == "overlay"
-        if environment._keeps_image_paths:
+        if environment._keeps_image_tmp:
             assert renamed.stdout == "overlay", renamed.stderr
     finally:
         await _cleanup_environment(environment)

@@ -1411,17 +1411,24 @@ def test_instance_home_is_private_unless_fakeroot_has_an_overlay(
 
 
 @pytest.mark.parametrize(
-    ("runtime", "overlay", "dropped"),
+    ("runtime", "overlay", "fakeroot", "expected"),
     [
-        ("apptainer", True, True),
-        ("apptainer", False, False),
-        ("fake-singularity", True, False),
+        ("apptainer", True, True, ["/etc/localtime", "tmp"]),
+        # Without fakeroot the invoking user cannot write the image's
+        # root-owned /tmp or workdir through the overlay.
+        ("apptainer", True, False, ["/etc/localtime"]),
+        ("apptainer", False, True, []),
+        ("fake-singularity", True, True, []),
     ],
 )
 def test_apptainer_overlay_keeps_the_image_localtime_and_tmp(
-    tmp_path: Path, runtime: str, overlay: bool, dropped: bool
+    tmp_path: Path,
+    runtime: str,
+    overlay: bool,
+    fakeroot: bool,
+    expected: list[str],
 ):
-    environment = _environment(tmp_path, fakeroot=True)
+    environment = _environment(tmp_path, fakeroot=fakeroot)
     environment._runtime_path = str(tmp_path / runtime)
     environment._workdir = "/app"
     environment._prepare_runtime_workdir()
@@ -1441,11 +1448,11 @@ def test_apptainer_overlay_keeps_the_image_localtime_and_tmp(
         for index, option in enumerate(start)
         if option == "--no-mount"
     ]
-    assert no_mounts == (["/etc/localtime", "tmp"] if dropped else [])
+    assert no_mounts == expected
     # A bind over /app would be a mount of its own, and renames from it to
     # the overlay's /tmp fail with EXDEV too.
     workdir_bind = f"{staging / 'harbor-writable' / 'workdir'}:/app"
-    assert (workdir_bind in start) is not dropped
+    assert (workdir_bind in start) is ("tmp" not in expected)
     environment._cleanup_staging()
 
 
@@ -1475,7 +1482,7 @@ async def test_compose_main_overlay_keeps_the_image_localtime_and_tmp(
         image_resolver=resolve,
         staging_dir=staging,
         main_overlay=tmp_path / "overlay.img",
-        keep_image_paths=keep,
+        main_no_mounts=("/etc/localtime", "tmp") if keep else (),
     )
 
     instances = yaml.safe_load(output.read_text())["instances"]
@@ -1586,14 +1593,14 @@ async def test_instance_start_detects_apptainer_fakeroot_command(
     )
 
     instance = f"instance://{environment._instance_name}"
-    # Over Apptainer's overlay the workdir has no bind, so the start creates
-    # it before the first exec that starts in it.
+    # Over Apptainer's overlay with fakeroot the workdir has no bind, so the
+    # start creates it before the first exec that starts in it.
     created = [
         index
         for index, command in enumerate(commands)
         if command[-3:] == ["mkdir", "-p", environment._workdir]
     ]
-    assert created == ([1] if runtime == "apptainer" else [])
+    assert created == ([1] if runtime == "apptainer" and fakeroot else [])
     for index in created:
         assert _option_value(commands[index], "--pwd") == "/"
     probed = [

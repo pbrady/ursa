@@ -280,13 +280,15 @@ Apptainer also mounts directories of the instance's `--workdir` over `/tmp`
 and `/var/tmp`. They are a separate filesystem from the rest of the
 container, so `os.rename` between `/tmp` and, say, `/app` fails with
 "Invalid cross-device link" (EXDEV), as in the verifier of
-`path-tracing-reverse`. With the writable overlay the adapter also passes
-`--no-mount tmp` to Apptainer, so `/tmp` and `/var/tmp` are the image's own
-directories in the overlay, as under Docker, and count toward the task's
-`storage_mb`. The task's workdir, such as `/app`, then also stays in the
-overlay rather than in a bind mount of its own, which would make the same
-rename fail. Without the overlay, and on SingularityCE, `/tmp` and `/var/tmp`
-stay in the workdir and the task's workdir is a bind mount.
+`path-tracing-reverse`. With the writable overlay and fakeroot the adapter
+also passes `--no-mount tmp` to Apptainer, so `/tmp` and `/var/tmp` are the
+image's own directories in the overlay, as under Docker, and count toward the
+task's `storage_mb`. The task's workdir, such as `/app`, then also stays in
+the overlay rather than in a bind mount of its own, which would make the same
+rename fail. Without the overlay, with `singularity_fakeroot=false` (the
+invoking user cannot write the image's root-owned directories through the
+overlay), and on SingularityCE, `/tmp` and `/var/tmp` stay in the workdir and
+the task's workdir is a bind mount.
 
 An unprivileged (user-space) Apptainer installation has extra requirements:
 
