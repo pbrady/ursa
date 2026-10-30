@@ -426,7 +426,7 @@ def test_disk_overlay_layout_follows_the_runtime(
 
     overlay = scratch / "overlay.img"
     assert environment._overlay_path == overlay
-    assert overlay.stat().st_size == 1024 * 1024 * 1024
+    assert overlay.stat().st_size == 10240 * 1024 * 1024
     argv, *listing = record.read_text().splitlines()
     if layout:
         assert argv == f"-q -d {scratch / 'overlay-layout'} {overlay}"

@@ -124,6 +124,9 @@ _IMAGE_TMP = "tmp"
 # How long a timed-out or cancelled exec waits for its output pipes to close
 # after its process tree is killed. Background jobs it started keep them open.
 _EXEC_OUTPUT_DRAIN_SEC = 10
+# Overlay size for tasks without storage_mb, matching what Terminal-Bench
+# tasks declare.
+_DEFAULT_OVERLAY_MB = 10240
 # Without /etc/subuid, Apptainer's fakeroot wraps every instance exec in the
 # fakeroot(1) command, whose faked daemon exits with that exec. Processes the
 # exec left running, such as a tmux server or a ``nohup`` job, keep the
@@ -2985,7 +2988,10 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 "Singularity --overlay requires mkfs.ext3 or mke2fs"
             )
 
-        storage_mb = self.task_env_config.storage_mb or 1024
+        # The image is sparse, so the size only caps what the task can write.
+        # 1 GiB was too small for agents that install a toolchain, such as
+        # Codex's Node and npm, on tasks that set no storage_mb.
+        storage_mb = self.task_env_config.storage_mb or _DEFAULT_OVERLAY_MB
         # SingularityCE 3.6 needs upper/ and work/ in the image, owned by the
         # invoking user. Apptainer with fakeroot creates them itself, and under
         # root-mapped fakeroot rejects pre-made ones as "upper dir is not
