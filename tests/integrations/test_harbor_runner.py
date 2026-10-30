@@ -31,6 +31,7 @@ from ursa.agents import BaseAgent
 from ursa.cli import agent_management
 from ursa.integrations import harbor as harbor_integration
 from ursa.integrations.harbor import UrsaHarborAgent, _jsonl_token_usage
+from ursa.integrations.harbor_runner import _agent_config
 from ursa.integrations.harbor_runner import _run as _runner_run
 from ursa.util import Checkpointer
 from ursa.util.events import AgentEvents
@@ -269,6 +270,64 @@ def test_web_tools_require_public_network(network_mode, use_web):
     assert UrsaHarborAgent._network_use_web(object()) is None
 
 
+@pytest.mark.parametrize(
+    ("configured", "network_mode", "override", "expected"),
+    [
+        (None, NetworkMode.PUBLIC, True, True),
+        # An explicit setting is left to the config...
+        ("false", NetworkMode.PUBLIC, None, False),
+        ("true", NetworkMode.PUBLIC, None, True),
+        # ...but no network always turns web tools off.
+        ("true", NetworkMode.NO_NETWORK, False, False),
+        (None, NetworkMode.NO_NETWORK, False, False),
+    ],
+)
+def test_public_network_enables_web_tools_only_when_not_configured(
+    tmp_path, configured, network_mode, override, expected
+):
+    config_file = _runtime_config(tmp_path / "ursa.yaml")
+    if configured is not None:
+        config_file.write_text(
+            config_file.read_text() + f"use_web: {configured}\n"
+        )
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent", config_file=config_file
+    )
+    environment = SimpleNamespace(
+        network_policy=NetworkPolicy(network_mode=network_mode)
+    )
+
+    use_web = agent._phase_use_web(agent._network_use_web(environment))
+    runtime_config, _ = agent._runtime_config(use_web=use_web)
+
+    assert use_web is override
+    assert runtime_config.get("use_web", False) is expected
+
+
+@pytest.mark.parametrize(
+    ("configured", "use_web", "expected"),
+    [
+        (None, True, True),
+        (False, True, False),
+        (True, False, False),
+        (False, None, False),
+    ],
+)
+def test_runner_turns_web_tools_on_only_for_unconfigured_agents(
+    configured, use_web, expected
+):
+    class WebAgent:
+        def __init__(self, use_web: bool = False):
+            self.use_web = use_web
+
+    options = {} if configured is None else {"use_web": configured}
+    config = SimpleNamespace(agent_config={"web": options})
+
+    selected = _agent_config(config, WebAgent, use_web=use_web)
+
+    assert selected.get("use_web", False) is expected
+
+
 @pytest.mark.asyncio
 async def test_harbor_web_tool_decision_updates_runtime_config(
     tmp_path, monkeypatch
@@ -303,6 +362,41 @@ async def test_harbor_web_tool_decision_updates_runtime_config(
 
     assert uploaded == [False]
     assert [payload["use_web"] for payload in payloads] == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_configured_use_web_returns_after_a_forced_off_phase(
+    tmp_path, monkeypatch
+):
+    config_file = _runtime_config(tmp_path / "ursa.yaml")
+    config_file.write_text(config_file.read_text() + "use_web: true\n")
+    agent = UrsaHarborAgent(
+        logs_dir=tmp_path / "agent", config_file=config_file
+    )
+    agent._remote_config_file = "/installed-agent/tmp/ursa-config.json"
+    # A no-network setup phase turned web tools off.
+    agent._runtime_use_web = False
+    uploaded: list[bool] = []
+    payloads: list[dict[str, Any]] = []
+
+    async def upload(_environment: Any, runtime_config: dict[str, Any]):
+        uploaded.append(runtime_config["use_web"])
+
+    async def run(_environment: Any, **kwargs: Any) -> Any:
+        encoded = shlex.split(kwargs["command"])[-1]
+        payloads.append(json.loads(base64.urlsafe_b64decode(encoded)))
+        return SimpleNamespace(stdout=None)
+
+    monkeypatch.setattr(agent, "_upload_runtime_config", upload)
+    monkeypatch.setattr(agent, "exec_as_agent", run)
+    environment = SimpleNamespace(
+        network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    await agent.run("solve it", environment, AgentContext())
+
+    assert uploaded == [True]
+    assert [payload["use_web"] for payload in payloads] == [None]
 
 
 def test_mcp_servers_are_forwarded_without_headers(tmp_path):

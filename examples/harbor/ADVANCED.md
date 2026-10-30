@@ -481,9 +481,12 @@ its writable overlay and Harbor bind mounts, so files installed or changed
 during setup remain available in later phases.
 
 The effective Harbor policy is also projected into URSA's `use_web` setting
-for each agent phase: `public` enables web tools, while `no-network` and
-`allowlist` disable them, as for Harbor's built-in agents. Harbor still
-enforces the actual network boundary. Keep the writable overlay enabled (the
+for each agent phase: `no-network` and `allowlist` always disable web tools,
+as for Harbor's built-in agents, while `public` enables them only where the
+URSA config leaves `use_web` unset. An explicit top-level `use_web`, such as
+the `use_web: false` in this directory's `ursa.yaml`, or an agent's own
+`agent_config.<agent>.use_web: false`, is kept on a public network. Harbor
+still enforces the actual network boundary. Keep the writable overlay enabled (the
 default); setting the `singularity_overlay` environment kwarg to `false`
 disables runtime policy changes, and Harbor then rejects tasks whose phases
 use different policies.

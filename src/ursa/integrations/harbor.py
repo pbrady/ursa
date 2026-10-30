@@ -555,6 +555,19 @@ class UrsaHarborAgent(BaseInstalledAgent):
         # Match Harbor: an allowlist may contain only the inference host.
         return policy.network_mode == NetworkMode.PUBLIC
 
+    def _phase_use_web(self, allowed: bool | None) -> bool | None:
+        """Return the ``use_web`` override for Harbor's web-tool decision.
+
+        Harbor's decision always turns web tools off, but turns them on only
+        when no URSA config layer sets ``use_web`` itself; ``None`` keeps the
+        configured value.
+        """
+        if allowed and any(
+            "use_web" in layer for layer in self._config_layers()
+        ):
+            return None
+        return allowed
+
     async def set_web_tools_disabled(
         self, disabled: bool, environment: BaseEnvironment
     ) -> None:
@@ -891,7 +904,9 @@ class UrsaHarborAgent(BaseInstalledAgent):
     async def install(self, environment: BaseEnvironment) -> None:
         # Reject host-side configuration errors before doing any work in the
         # benchmark container.
-        self._runtime_use_web = self._network_use_web(environment)
+        self._runtime_use_web = self._phase_use_web(
+            self._network_use_web(environment)
+        )
         runtime_config, self._secret_env = self._runtime_config(
             use_web=self._runtime_use_web
         )
@@ -992,14 +1007,12 @@ class UrsaHarborAgent(BaseInstalledAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        use_web = (
+        use_web = self._phase_use_web(
             self._network_use_web(environment)
             if self._web_tools_disabled is None
             else not self._web_tools_disabled
         )
-        if use_web is not None and use_web != getattr(
-            self, "_runtime_use_web", None
-        ):
+        if use_web != getattr(self, "_runtime_use_web", None):
             runtime_config, self._secret_env = self._runtime_config(
                 use_web=use_web
             )
