@@ -23,6 +23,7 @@ from harbor.models.trial.paths import TrialPaths  # noqa: E402
 from ursa.integrations.harbor import UrsaHarborAgent  # noqa: E402
 from ursa.integrations.harbor_singularity import (  # noqa: E402
     DockerfileSingularityEnvironment,
+    _runtime_lacks_setuid_starter,
 )
 
 SINGULARITY = shutil.which("apptainer") or shutil.which("singularity")
@@ -247,6 +248,16 @@ def _require_fakeroot(image: Path) -> None:
     if result.returncode != 0:
         pytest.skip(
             f"Singularity fakeroot is unavailable: {result.stderr.strip()}"
+        )
+
+
+def _require_compose_bridge() -> None:
+    # The environment refuses a bridged Compose project before building on
+    # the same evidence; root is never refused.
+    if os.geteuid() != 0 and _runtime_lacks_setuid_starter(SINGULARITY):
+        pytest.skip(
+            "Compose sidecars need bridge networking, which this unprivileged "
+            "Apptainer installation (no setuid starter) does not offer"
         )
 
 
@@ -590,6 +601,7 @@ async def test_compose_sidecar_lifecycle_and_file_transfer(
     ubuntu_sif: Path,
 ):
     _require_fakeroot(ubuntu_sif)
+    _require_compose_bridge()
     environment = await _start_environment(
         tmp_path,
         ubuntu_sif,
