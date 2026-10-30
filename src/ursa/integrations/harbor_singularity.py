@@ -126,12 +126,17 @@ _EXEC_OUTPUT_DRAIN_SEC = 10
 # and replaced if it has died, and preloads libfakeroot for that daemon.
 # Without the fakeroot command's files it only clears FAKEROOTKEY.
 _FAKEROOT_COMMAND_MARKER = "ursa-fakeroot-command"
+# Records the shared faked's ``key:pid``. The instance's /tmp lives in its
+# --workdir, which outlives an instance restart, while the daemon does not,
+# so the probe that runs first in every new instance removes the record.
+_SHARED_FAKED_STATE = "/tmp/.ursa-faked"
 _FAKEROOT_COMMAND_PROBE = (
+    f"rm -f {_SHARED_FAKED_STATE}; "
     f'if [ -n "${{FAKEROOTKEY-}}" ]; then echo {_FAKEROOT_COMMAND_MARKER}; fi'
 )
 _SHARED_FAKED_SCRIPT = (
     "unset FAKEROOTKEY; "
-    "libs=/.singularity.d/libs; state=/tmp/.ursa-faked; "
+    f"libs=/.singularity.d/libs; state={_SHARED_FAKED_STATE}; "
     'if [ -x "$libs/faked" ] && [ -r "$libs/libfakeroot.so" ]; then '
     'key_pid=$(cat "$state" 2>/dev/null); '
     "case $key_pid in "
@@ -3379,6 +3384,14 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             self._workdir,
             f"instance://{self._instance_name}",
         ]
+        if self._shared_faked:
+            # Run the image's shell action under the shared faked, so the
+            # shell sees the ownership agent commands set and what it leaves
+            # running keeps working after it exits.
+            command = [
+                *self._instance_exec_prefix(),
+                "/.singularity.d/actions/shell",
+            ]
         environment = {
             key: value
             for key, value in os.environ.items()

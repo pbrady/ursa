@@ -299,9 +299,11 @@ An unprivileged (user-space) Apptainer installation has extra requirements:
   then hang on their next `stat` or `chown`. When the instance's first
   command shows that wrapper (its environment has `FAKEROOTKEY`), the adapter
   keeps one `faked` per instance instead, started at instance start and
-  restarted if it dies, and runs every command under it, so ownership set by
-  one command is also seen by later ones. Fakeroot with `/etc/subuid` entries
-  has no wrapper and is left as it is.
+  restarted if it dies, and runs every command and the `attach` shell under
+  it, so ownership set by one command is also seen by later ones. `faked`
+  keeps that ownership in memory, so it is lost when the instance restarts
+  for a network-policy change. Fakeroot with `/etc/subuid` entries has no
+  wrapper and is left as it is.
 - Non-root users get only `--network none`, so Compose projects with sidecars
   or published ports cannot start: Apptainer refuses `--net` with "network
   requires root or a suid installation with /etc/subuid --fakeroot".

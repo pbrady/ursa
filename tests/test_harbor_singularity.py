@@ -1669,15 +1669,20 @@ async def test_exec_timeout_returns_while_a_background_job_holds_output(
 
 @pytest.mark.parametrize("key", ["1151152171", "", None])
 async def test_fakeroot_command_probe_reports_only_a_wrapped_exec(
-    key: str | None,
+    tmp_path: Path, key: str | None
 ):
     env = {"PATH": "/usr/bin:/bin"}
     if key is not None:
         env["FAKEROOTKEY"] = key
+    # A record left in /tmp by the faked of an instance that was restarted.
+    state = tmp_path / "ursa-faked"
+    state.write_text("1151152171:68\n")
     process = await asyncio.create_subprocess_exec(
         "/bin/sh",
         "-c",
-        harbor_singularity._FAKEROOT_COMMAND_PROBE,
+        harbor_singularity._FAKEROOT_COMMAND_PROBE.replace(
+            harbor_singularity._SHARED_FAKED_STATE, str(state)
+        ),
         stdout=asyncio.subprocess.PIPE,
         env=env,
     )
@@ -1687,6 +1692,37 @@ async def test_fakeroot_command_probe_reports_only_a_wrapped_exec(
     assert stdout.decode().split() == (
         [harbor_singularity._FAKEROOT_COMMAND_MARKER] if key else []
     )
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("shared", [True, False])
+async def test_attach_shell_uses_the_shared_faked_when_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool
+):
+    environment = _environment(tmp_path, fakeroot=True)
+    _prepare_started_environment(environment, tmp_path)
+    environment._runtime_path = str(tmp_path / "apptainer")
+    environment._shared_faked = shared
+    observed: list[list[str]] = []
+
+    def execvpe(_file: str, args: list[str], _env: dict[str, str]) -> None:
+        observed.append(list(args))
+
+    monkeypatch.setattr(harbor_singularity.os, "execvpe", execvpe)
+
+    await environment.attach()
+
+    [command] = observed
+    instance = command.index(f"instance://{environment._instance_name}")
+    if shared:
+        assert command == [
+            *environment._instance_exec_prefix(),
+            "/.singularity.d/actions/shell",
+        ]
+    else:
+        assert command[1] == "shell"
+        assert command[instance + 1 :] == []
+    environment._cleanup_staging()
 
 
 async def test_shared_faked_script_runs_the_command_without_fakeroot():
