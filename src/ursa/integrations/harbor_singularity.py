@@ -107,6 +107,11 @@ _FAKEROOT_COMMAND_FAILURE_MARKERS = (
     "error while starting the `faked' daemon",
     "required by /.singularity.d/libs/libfakeroot",
 )
+# Apptainer binds the host's /etc/localtime by default (a ``bind path`` in
+# apptainer.conf). Over a disk overlay, tzdata's postinst then cannot replace
+# it ("Device or resource busy"), so apt-get install of python3 and other
+# packages that need tzdata fails. Docker leaves the image's file in place.
+_HOST_LOCALTIME = "/etc/localtime"
 # Without /etc/subuid, Apptainer's fakeroot wraps every instance exec in the
 # fakeroot(1) command, whose faked daemon exits with that exec. Processes the
 # exec left running, such as a tmux server or a ``nohup`` job, keep the
@@ -935,6 +940,7 @@ async def docker_compose_to_singularity_compose(
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
     interpolation_environment: Mapping[str, str] | None = None,
     home_root: Path | None = None,
+    keep_image_localtime: bool = False,
 ) -> dict[str, list[str]]:
     """Convert one or more Docker Compose files into a singularity-compose file."""
     paths = (
@@ -1001,6 +1007,8 @@ async def docker_compose_to_singularity_compose(
             start_options.insert(0, "fakeroot")
         if name == "main" and main_overlay is not None:
             start_options.append(f"overlay={main_overlay}")
+            if keep_image_localtime:
+                start_options.append(f"no-mount={_HOST_LOCALTIME}")
         elif main_overlay is not None:
             # ``singularity-compose up --read_only`` is required to prevent
             # its implicit tmpfs overlay from conflicting with main's disk
@@ -2372,6 +2380,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 if self._uses_private_home
                 else None
             ),
+            keep_image_localtime=self._keeps_image_localtime,
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -2589,6 +2598,8 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             command.insert(3, "--fakeroot")
         if self._overlay_path is not None:
             command.extend(["--overlay", str(self._overlay_path)])
+        if self._keeps_image_localtime:
+            command.extend(["--no-mount", _HOST_LOCALTIME])
         for source, target in self._harbor_writable_binds():
             command.extend(["-B", f"{source}:{target}"])
         if network_policy.network_mode == NetworkMode.NO_NETWORK:
@@ -2607,6 +2618,14 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             command.extend(["-B", bind])
         command.extend([str(self._sif_path), self._instance_name])
         return command
+
+    @property
+    def _keeps_image_localtime(self) -> bool:
+        # See ``_HOST_LOCALTIME``. Only Apptainer, where this was measured,
+        # drops the bind; SingularityCE keeps its default binds.
+        return self._overlay_path is not None and _runtime_is_apptainer(
+            self._instance_runtime()
+        )
 
     @property
     def _uses_private_home(self) -> bool:

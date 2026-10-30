@@ -268,6 +268,14 @@ prefers `apptainer` when both are on `PATH`. It detects Apptainer behind a
 command. Image pulls, `--fakeroot`, and instance commands use the same syntax
 on both runtimes.
 
+Apptainer bind-mounts the host's `/etc/localtime` by default (a `bind path`
+in `apptainer.conf`). With the writable overlay the adapter starts Apptainer
+instances with `--no-mount /etc/localtime`, so the container keeps the
+image's time zone, as under Docker. With the bind in place, the post-install
+script of `tzdata`, which `python3` and many other packages depend on, fails
+with "Device or resource busy" when it replaces the file, and `apt-get
+install` fails with it.
+
 An unprivileged (user-space) Apptainer installation has extra requirements:
 
 - `squashfuse` mounts SIF images; without it, Apptainer extracts the image to

@@ -1404,6 +1404,75 @@ def test_instance_home_is_private_unless_fakeroot_has_an_overlay(
 
 
 @pytest.mark.parametrize(
+    ("runtime", "overlay", "dropped"),
+    [
+        ("apptainer", True, True),
+        ("apptainer", False, False),
+        ("fake-singularity", True, False),
+    ],
+)
+def test_apptainer_overlay_keeps_the_image_localtime(
+    tmp_path: Path, runtime: str, overlay: bool, dropped: bool
+):
+    environment = _environment(tmp_path, fakeroot=True)
+    environment._runtime_path = str(tmp_path / runtime)
+    environment._prepare_runtime_workdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    environment._staging_dir = staging
+    environment._sif_path = tmp_path / "image.sif"
+    if overlay:
+        environment._overlay_path = tmp_path / "overlay.img"
+
+    start = environment._instance_start_command()
+
+    # tzdata's postinst cannot replace a bind-mounted /etc/localtime.
+    if dropped:
+        assert _option_value(start, "--no-mount") == "/etc/localtime"
+    else:
+        assert "--no-mount" not in start
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize("keep", [True, False])
+async def test_compose_main_overlay_keeps_the_image_localtime(
+    tmp_path: Path, keep: bool
+):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  main:\n"
+        "    image: ubuntu:24.04\n"
+        "  helper:\n"
+        "    image: redis:7\n"
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "singularity-compose.yml"
+
+    async def resolve(_name: str, service: dict[str, object]) -> str:
+        return str(service["image"])
+
+    await docker_compose_to_singularity_compose(
+        compose,
+        output,
+        identity="unit",
+        image_resolver=resolve,
+        staging_dir=staging,
+        main_overlay=tmp_path / "overlay.img",
+        keep_image_localtime=keep,
+    )
+
+    instances = yaml.safe_load(output.read_text())["instances"]
+    options = {
+        key.split("-")[1]: instance["start"]["options"]
+        for key, instance in instances.items()
+    }
+    assert ("no-mount=/etc/localtime" in options["main"]) is keep
+    assert "no-mount=/etc/localtime" not in options["helper"]
+
+
+@pytest.mark.parametrize(
     ("fakeroot", "overlay", "env", "expected"),
     [
         (False, False, None, "/harbor-home"),
