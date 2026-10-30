@@ -19,20 +19,23 @@ from harbor.models.task.config import (
     NetworkMode,
     NetworkPolicy,
 )
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import (
     FakeMessagesListChatModel,
 )
 from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_core.tools import tool
 from langgraph.checkpoint.base import empty_checkpoint
 
-from ursa.agents import BaseAgent
+from ursa.agents import BaseAgent, ExecutionAgent
 from ursa.cli import agent_management
 from ursa.integrations import harbor as harbor_integration
 from ursa.integrations.harbor import UrsaHarborAgent, _jsonl_token_usage
 from ursa.integrations.harbor_runner import _agent_config
 from ursa.integrations.harbor_runner import _run as _runner_run
+from ursa.observability.jsonl_logger import JSONLLogEventHandler
 from ursa.util import Checkpointer
 from ursa.util.events import AgentEvents
 
@@ -758,6 +761,63 @@ def test_jsonl_token_usage_streams_and_ignores_invalid_records(tmp_path):
             '{"input_tokens":9007199254740993}}\n'
         )
     assert _jsonl_token_usage(path) == (9007199254740993, None, None)
+
+
+class QueuedChatModel(BaseChatModel):
+    """Answer each call, plain or structured, from one shared queue."""
+
+    responses: list[AIMessage]
+
+    @property
+    def _llm_type(self) -> str:
+        return "queued"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(
+            generations=[ChatGeneration(message=self.responses.pop(0))]
+        )
+
+    def bind_tools(self, tools, **kwargs):
+        return self.bind(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_structured_review_calls_are_logged_and_counted(tmp_path):
+    usage = {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+    responses = [
+        AIMessage(content="done", usage_metadata=usage),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "ReviewAssessment",
+                    "args": {"is_complete": True, "reason": "complete"},
+                    "id": "review",
+                }
+            ],
+            usage_metadata=usage,
+        ),
+        AIMessage(content="recap", usage_metadata=usage),
+    ]
+    agent = ExecutionAgent(
+        llm=QueuedChatModel(responses=responses), workspace=tmp_path / "ws"
+    )
+    jsonl = tmp_path / "ursa.jsonl"
+
+    with jsonl.open("w", encoding="utf-8") as stream:
+        await agent.ainvoke(
+            "solve it", config={"callbacks": [JSONLLogEventHandler(stream)]}
+        )
+
+    # The review goes through invoke_structured with the agent's own config.
+    review = [
+        record
+        for record in _records(jsonl)
+        if record["type"] == "chat" and "review" in record["tags"]
+    ]
+    assert [record["event"] for record in review] == ["start", "end"]
+    # The executor, the review, and the recap.
+    assert _jsonl_token_usage(jsonl) == (30, None, 6)
 
 
 @pytest.mark.asyncio
