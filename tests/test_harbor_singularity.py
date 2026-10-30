@@ -3094,8 +3094,9 @@ async def test_force_build_builds_dockerfile_despite_prebuilt_image(
 async def test_prebuild_refresh_repulls_prebuilt_image_without_building(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    # ``ursa harbor prebuild --force`` must refresh the SIF a normal trial
-    # pulls, not build the Dockerfile that every Terminal-Bench task ships.
+    # ``python -m ursa.integrations.harbor prebuild --force`` must refresh
+    # the SIF a normal trial pulls, not build the Dockerfile that every
+    # Terminal-Bench task ships.
     environment = _image_environment(tmp_path, "alexgshaw/x:20251031")
     log = _install_pull_runtime(environment, tmp_path, monkeypatch)
 
