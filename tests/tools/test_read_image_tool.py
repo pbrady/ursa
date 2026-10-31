@@ -388,3 +388,77 @@ def test_read_image_tool_sends_ppm_as_png(
     assert result[0] == {"type": "text", "text": "Image file: vnc.ppm"}
     assert result[1]["mime_type"] == "image/png"
     assert base64.b64decode(result[1]["base64"]).startswith(b"\x89PNG")
+
+
+def _decoded(block) -> Image.Image:
+    image = Image.open(io.BytesIO(base64.b64decode(block["base64"])))
+    image.load()
+    return image
+
+
+@pytest.mark.parametrize(
+    ("samples", "extrema"),
+    [
+        # 16-bit PGM using only 0..1000 of 0..65535: stretched, not near-black
+        ([0, 250, 500, 1000], (0, 255)),
+        # a flat white 16-bit frame stays white
+        ([65535] * 4, (255, 255)),
+        ([0] * 4, (0, 0)),
+    ],
+)
+def test_image_block_from_file_stretches_16_bit_grayscale(
+    tmp_path: Path, samples: list[int], extrema: tuple[int, int]
+):
+    target = tmp_path / "depth.pgm"
+    target.write_bytes(
+        b"P5\n2 2\n65535\n" + b"".join(v.to_bytes(2, "big") for v in samples)
+    )
+
+    image = _decoded(image_block_from_file(target))
+
+    assert (image.format, image.mode) == ("PNG", "L")
+    assert image.getextrema() == extrema
+
+
+def test_image_block_from_file_does_not_take_lab_a_band_for_alpha(
+    tmp_path: Path,
+):
+    target = tmp_path / "lab.tiff"
+    Image.new("LAB", (3, 2), color=(50, 0, 0)).save(target)
+
+    assert _decoded(image_block_from_file(target)).mode == "RGB"
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
+def test_image_block_from_file_refuses_truncated_pass_through_image(
+    tmp_path: Path, fmt: str
+):
+    # e.g. a screenshot read while it is still being written: the header
+    # parses, so it must be decoded to be caught before the API sees it
+    target = tmp_path / f"screen.{fmt.lower()}"
+    Image.effect_noise((256, 256), 50).convert("RGB").save(target, format=fmt)
+    target.write_bytes(target.read_bytes()[:3000])
+
+    with pytest.raises(ImageReadError, match="truncated or corrupt"):
+        image_block_from_file(target)
+
+
+def test_read_image_tool_returns_text_error_for_a_directory(
+    tmp_path: Path, chat_model: BaseChatModel
+):
+    (tmp_path / "shots.png").mkdir()
+
+    result = read_image_tool.func(
+        image_path="shots.png",
+        runtime=make_runtime(
+            tmp_path, llm=chat_model, tool_call_id="read-dir-call"
+        ),
+    )
+
+    assert result == [
+        {
+            "type": "text",
+            "text": "Could not read image file shots.png: cannot read file: "
+            "Is a directory",
+        }
+    ]
