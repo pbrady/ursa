@@ -435,13 +435,16 @@ def test_patch_dangling_tool_calls_emits_events(
     assert "[Dangling Tool Call Warning]" not in capsys.readouterr().out
 
 
-def _incomplete_function_call_message(*tool_calls) -> AIMessage:
+def _incomplete_function_call_message(
+    *tool_calls, suffix: str = ""
+) -> AIMessage:
     """Return what langchain-openai makes of an incomplete Responses output.
 
     The model's ``edit_code`` call ran to the output token limit on
     whitespace, so its arguments are not JSON and the call lands in
     ``invalid_tool_calls`` while its ``function_call`` item stays in the
-    content that goes back to the API.
+    content that goes back to the API. ``suffix`` makes the response and
+    call IDs distinct, as each new response's are.
     """
     from langchain_openai.chat_models.base import (
         _construct_lc_result_from_responses_api,
@@ -461,14 +464,14 @@ def _incomplete_function_call_message(*tool_calls) -> AIMessage:
     ]
     output.append({
         "type": "function_call",
-        "id": "fc_P1RH",
-        "call_id": "call_P1RH",
+        "id": f"fc_P1RH{suffix}",
+        "call_id": f"call_P1RH{suffix}",
         "name": "edit_code",
         "arguments": " \n" * 200,
         "status": "incomplete",
     })
     response = Response.model_validate({
-        "id": "resp_incomplete",
+        "id": f"resp_incomplete{suffix}",
         "object": "response",
         "created_at": 0,
         "model": "gpt-test",
@@ -663,4 +666,116 @@ def test_review_and_recap_answer_persisted_truncated_call(
 
     assert review_requests and recorded_requests
     for request in [*review_requests, *recorded_requests]:
+        _assert_function_calls_answered(request)
+
+
+def test_execution_agent_answers_truncated_chat_completions_call(
+    recorded_requests, monkeypatch, tmpdir: Path
+):
+    """Chat Completions sends invalid tool calls back as tool_calls too."""
+    from langchain_openai.chat_models.base import (
+        _convert_dict_to_message,
+        _convert_message_to_dict,
+    )
+
+    review_requests = []
+
+    def fake_invoke_structured(*args, **kwargs):
+        review_requests.append(args[2])
+        return ReviewAssessment(is_complete=True, reason="done")
+
+    monkeypatch.setattr(
+        "ursa.agents.execution_agent.invoke_structured",
+        fake_invoke_structured,
+    )
+    truncated = _convert_dict_to_message({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_pwd",
+                "type": "function",
+                "function": {
+                    "name": "fake_run_command",
+                    "arguments": json.dumps({"query": "pwd"}),
+                },
+            },
+            {
+                "id": "call_P1RH",
+                "type": "function",
+                "function": {"name": "edit_code", "arguments": " \n" * 200},
+            },
+        ],
+    })
+    assert [call["id"] for call in truncated.tool_calls] == ["call_pwd"]
+    assert [call["id"] for call in truncated.invalid_tool_calls] == [
+        "call_P1RH"
+    ]
+    execution_agent = ExecutionAgent(
+        llm=RecordingFakeChatModel(
+            messages=iter([
+                truncated,
+                AIMessage(content="done"),
+                AIMessage(content="recap"),
+            ])
+        ),
+        workspace=tmpdir,
+    )
+
+    execution_agent.invoke("run pwd and edit the script")
+
+    assert len(recorded_requests) == 3
+    for request in [*recorded_requests[1:], *review_requests]:
+        payload = [_convert_message_to_dict(message) for message in request]
+        calls = {
+            call["id"]
+            for message in payload
+            for call in message.get("tool_calls") or []
+        }
+        outputs = {
+            message["tool_call_id"]
+            for message in payload
+            if message["role"] == "tool"
+        }
+        assert calls == {"call_pwd", "call_P1RH"}
+        assert calls <= outputs
+
+
+def test_next_plan_step_on_thread_answers_truncated_call(
+    recorded_requests, monkeypatch, tmpdir: Path
+):
+    """The next plan step reuses the thread that holds the truncated call."""
+    review_requests = []
+
+    def fake_invoke_structured(*args, **kwargs):
+        review_requests.append(args[2])
+        return ReviewAssessment(is_complete=True, reason="done")
+
+    monkeypatch.setattr(
+        "ursa.agents.execution_agent.invoke_structured",
+        fake_invoke_structured,
+    )
+    execution_agent = ExecutionAgent(
+        llm=RecordingFakeChatModel(
+            messages=iter([
+                *(
+                    _incomplete_function_call_message(suffix=str(n))
+                    for n in range(1 + MAX_INVALID_TOOL_CALL_RETRIES)
+                ),
+                AIMessage(content="step 1 recap"),
+                AIMessage(content="step 2 done"),
+                AIMessage(content="step 2 recap"),
+            ])
+        ),
+        workspace=tmpdir,
+        checkpointer=Checkpointer.from_workspace(Path(tmpdir) / "checkpoints"),
+        thread_id="plan-steps",
+    )
+
+    execution_agent.invoke("step 1: edit the video script")
+    result = execution_agent.invoke("step 2: run the script")
+
+    assert result["messages"][-1].text == "step 2 recap"
+    assert len(recorded_requests) == 1 + MAX_INVALID_TOOL_CALL_RETRIES + 3
+    for request in [*recorded_requests[1:], *review_requests]:
         _assert_function_calls_answered(request)
