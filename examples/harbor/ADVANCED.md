@@ -324,7 +324,10 @@ An unprivileged (user-space) Apptainer installation has extra requirements:
   install` fails with "setgroups 65534 failed" when apt drops to `_apt`.
   With the writable overlay the adapter therefore writes
   `APT::Sandbox::User "root";` to `/etc/apt/apt.conf.d/00ursa-fakeroot`, so
-  apt never drops to `_apt`, and, when the image has `/usr/bin/sudo` (or an
+  apt never drops to `_apt`. The same file sets a 20 s `Acquire` timeout, 5
+  retries and IPv4 only, so apt gives up on a mirror connection that never
+  gets an answer and tries another; on Darwin such connections stalled
+  installs past Harbor's setup timeout. And, when the image has `/usr/bin/sudo` (or an
   `apt-get install` adds it), shadows it with a shim at
   `/usr/local/sbin/sudo`. Inside the instance every command already runs as
   root, so for a root caller the shim runs the command with its environment

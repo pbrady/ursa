@@ -1900,7 +1900,10 @@ async def test_fakeroot_command_setup_shadows_only_an_image_sudo(
         assert await process.wait() == 0
 
     config = root / harbor_singularity._APT_FAKEROOT_CONFIG.lstrip("/")
-    assert 'APT::Sandbox::User "root";' in config.read_text().splitlines()
+    lines = config.read_text().splitlines()
+    assert 'APT::Sandbox::User "root";' in lines
+    assert 'Acquire::http::Timeout "20";' in lines
+    assert 'Acquire::Retries "5";' in lines
     stash = root / harbor_singularity._SUDO_SHIM_STASH.lstrip("/")
     assert stash.read_text() == harbor_singularity._SUDO_SHIM + "\n"
     if other_sudo:
