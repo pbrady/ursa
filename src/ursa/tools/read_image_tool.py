@@ -123,6 +123,8 @@ def image_block_from_file(
         file_size = filename.stat().st_size
     except FileNotFoundError:
         raise ImageReadError("file not found") from None
+    except OSError as e:
+        raise ImageReadError(f"cannot read file: {e.strerror or e}") from None
     if file_size > max_bytes:
         raise ImageReadError(
             f"File too large: {file_size / 1024 / 1024:.2f}MB "
@@ -136,7 +138,13 @@ def image_block_from_file(
             pixmap = page.get_pixmap()
             image_bytes = pixmap.tobytes("png")
     else:
-        image_bytes = filename.read_bytes()
+        try:
+            image_bytes = filename.read_bytes()
+        except OSError as e:
+            # e.g. a directory, or a file the agent may not read
+            raise ImageReadError(
+                f"cannot read file: {e.strerror or e}"
+            ) from None
 
     image_bytes, mime_type = _normalize_image(image_bytes, filename, mime_type)
     if len(image_bytes) > max_bytes:
@@ -176,6 +184,10 @@ def _normalize_image(
                 and not getattr(image, "is_animated", False)
                 and max(width, height) <= MAX_IMAGE_SIDE_PX
             ):
+                # Decode it once (at most 2048x2048), so a truncated file,
+                # e.g. a screenshot read while still being written, is
+                # refused here rather than by the API.
+                image.load()
                 return image_bytes, PASS_THROUGH_FORMATS[image_format]
             return _to_png(image), "image/png"
     except ImageReadError:
@@ -185,13 +197,18 @@ def _normalize_image(
             "image dimensions too large to decode; downscale it to at most "
             f"{MAX_IMAGE_SIDE_PX} px per side first"
         ) from None
-    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
-        # Pillow raises UnidentifiedImageError for an unknown format, and
-        # OSError, SyntaxError or ValueError for a truncated or corrupt file.
+    except UnidentifiedImageError:
         kind = guessed_mime or f"'{filename.suffix or filename.name}'"
         raise ImageReadError(
             f"unsupported or unreadable image format {kind}; "
             "convert it to PNG first"
+        ) from None
+    except (OSError, SyntaxError, ValueError):
+        # Pillow raises these for a truncated or corrupt file of a format it
+        # knows.
+        raise ImageReadError(
+            "the image data is truncated or corrupt; if the file is still "
+            "being written, read it again once it is complete"
         ) from None
 
 
@@ -199,17 +216,30 @@ def _to_png(image: Image.Image) -> bytes:
     """Encode the first frame of ``image`` as PNG within the side limit."""
     image.seek(0)
     if image.mode in _HIGH_DEPTH_GRAY_MODES:
-        # Stretch to 8 bits; a plain convert("L") clips at 255, which turns
-        # most 16-bit and float images white.
+        # Downscale in float first, so the stretch below works on at most
+        # 2048x2048 px rather than on another full-size float copy.
         image = image.convert("F")
+        image.thumbnail((MAX_IMAGE_SIDE_PX, MAX_IMAGE_SIDE_PX))
+        # Stretch to 8 bits; a plain convert("L") clips at 255, which turns
+        # most 16-bit and float images white. A flat image has no range to
+        # stretch: it is black if it is all zero (or below), else white.
         low, high = image.getextrema()
-        scale = 255.0 / (high - low) if high > low else 0.0
-        image = image.point(lambda v: (v - low) * scale).convert("L")
-    elif image.mode not in _PNG_MODES:
-        image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+        if high > low:
+            scale = 255.0 / (high - low)
+            image = image.point(lambda v: (v - low) * scale)
+        else:
+            image = Image.new("F", image.size, 255.0 if low > 0 else 0.0)
+        image = image.convert("L")
     else:
-        image = image.copy()
-    image.thumbnail((MAX_IMAGE_SIDE_PX, MAX_IMAGE_SIDE_PX))
+        if image.mode not in _PNG_MODES:
+            # has_transparency_data, not an "A" band: LAB's A is a colour
+            # channel, not alpha.
+            image = image.convert(
+                "RGBA" if image.has_transparency_data else "RGB"
+            )
+        # In place: the file's own image is not used again, and a copy of a
+        # 100 Mpx canvas would cost another 400 MB.
+        image.thumbnail((MAX_IMAGE_SIDE_PX, MAX_IMAGE_SIDE_PX))
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
