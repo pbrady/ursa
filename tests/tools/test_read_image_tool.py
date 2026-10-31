@@ -1,4 +1,5 @@
 import base64
+import io
 import os
 import random
 import subprocess
@@ -13,6 +14,8 @@ from pydantic import BaseModel
 from tests.tools.utils import make_runtime
 from ursa.cli.config import ChatModelConfig
 from ursa.tools.read_image_tool import (
+    MAX_IMAGE_SIDE_PX,
+    ImageReadError,
     image_block_from_file,
     read_image_tool,
 )
@@ -247,4 +250,141 @@ def test_svg_conversion_labels_original_filename(
     assert result[0] == {"type": "text", "text": "Image file: plot.svg"}
     assert result[1]["mime_type"] == "image/png"
     assert "file_id" not in result[1]
+    assert base64.b64decode(result[1]["base64"]).startswith(b"\x89PNG")
+
+
+def test_image_block_from_file_passes_png_through_unchanged(tmp_path: Path):
+    target = tmp_path / "pixel.png"
+    Image.new("RGB", (3, 2), color=(0, 255, 0)).save(target)
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    assert base64.b64decode(result["base64"]) == target.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("suffix", "mime_type"),
+    [(".jpg", "image/jpeg"), (".gif", "image/gif"), (".webp", "image/webp")],
+)
+def test_image_block_from_file_passes_accepted_formats_through(
+    tmp_path: Path, suffix: str, mime_type: str
+):
+    target = tmp_path / f"pixel{suffix}"
+    Image.new("RGB", (3, 2), color=(0, 0, 255)).save(target)
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == mime_type
+    assert base64.b64decode(result["base64"]) == target.read_bytes()
+
+
+@pytest.mark.parametrize("suffix", [".ppm", ".pgm", ".pbm", ".bmp", ".tiff"])
+def test_image_block_from_file_converts_other_rasters_to_png(
+    tmp_path: Path, suffix: str
+):
+    # e.g. the .ppm screenshots QEMU's VNC writes, which OpenAI answers with
+    # a 400 "does not represent a valid image" when sent as image/x-portable-*
+    target = tmp_path / f"screen{suffix}"
+    mode = {".pgm": "L", ".pbm": "1"}.get(suffix, "RGB")
+    Image.new(mode, (5, 4), color=1).save(target)
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    decoded = Image.open(io.BytesIO(base64.b64decode(result["base64"])))
+    assert decoded.format == "PNG"
+    assert decoded.size == (5, 4)
+
+
+def test_image_block_from_file_converts_ppm_named_png(tmp_path: Path):
+    # The format comes from the bytes, not the suffix
+    target = tmp_path / "screen.png"
+    Image.new("RGB", (5, 4), color=(9, 9, 9)).save(target, format="PPM")
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    assert base64.b64decode(result["base64"]).startswith(b"\x89PNG")
+
+
+def test_image_block_from_file_downscales_large_images(tmp_path: Path):
+    target = tmp_path / "wide.png"
+    Image.new("RGB", (MAX_IMAGE_SIDE_PX * 2, 100)).save(target)
+
+    result = image_block_from_file(target)
+
+    decoded = Image.open(io.BytesIO(base64.b64decode(result["base64"])))
+    assert result["mime_type"] == "image/png"
+    assert decoded.size == (MAX_IMAGE_SIDE_PX, 50)
+
+
+def test_image_block_from_file_converts_animated_gif(tmp_path: Path):
+    target = tmp_path / "anim.gif"
+    frames = [Image.new("RGB", (4, 4), color=c) for c in ("red", "blue")]
+    frames[0].save(target, save_all=True, append_images=frames[1:])
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+
+
+def test_image_block_from_file_refuses_unknown_format(tmp_path: Path):
+    target = tmp_path / "data.xyz"
+    target.write_bytes(b"not an image at all")
+
+    with pytest.raises(ImageReadError, match="convert it to PNG first"):
+        image_block_from_file(target)
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "expected"),
+    [
+        ("data.xyz", b"not an image", "unsupported or unreadable image format"),
+        ("broken.png", b"\x89PNG garbage", "image/png; convert it to PNG"),
+        ("missing.png", None, "file not found"),
+    ],
+)
+def test_read_image_tool_returns_text_error_for_unreadable_files(
+    tmp_path: Path,
+    chat_model: BaseChatModel,
+    name: str,
+    content: bytes | None,
+    expected: str,
+):
+    if content is not None:
+        (tmp_path / name).write_bytes(content)
+
+    result = read_image_tool.func(
+        image_path=name,
+        runtime=make_runtime(
+            tmp_path,
+            llm=chat_model,
+            tool_call_id="read-bad-image-call",
+        ),
+    )
+
+    assert len(result) == 1
+    assert result[0]["type"] == "text"
+    assert result[0]["text"].startswith(f"Could not read image file {name}: ")
+    assert expected in result[0]["text"]
+
+
+def test_read_image_tool_sends_ppm_as_png(
+    tmp_path: Path, chat_model: BaseChatModel
+):
+    target = tmp_path / "vnc.ppm"
+    Image.new("RGB", (6, 3), color=(1, 2, 3)).save(target)
+
+    result = read_image_tool.func(
+        image_path=target.name,
+        runtime=make_runtime(
+            tmp_path,
+            llm=chat_model,
+            tool_call_id="read-ppm-call",
+        ),
+    )
+
+    assert result[0] == {"type": "text", "text": "Image file: vnc.ppm"}
+    assert result[1]["mime_type"] == "image/png"
     assert base64.b64decode(result[1]["base64"]).startswith(b"\x89PNG")
