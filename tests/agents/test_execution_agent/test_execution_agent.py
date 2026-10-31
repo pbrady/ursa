@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterator
 from math import sqrt
 from pathlib import Path
@@ -14,7 +15,11 @@ from langchain_core.messages import (
 )
 
 from ursa.agents import ExecutionAgent
-from ursa.agents.execution_agent import ReviewAssessment, review_complete
+from ursa.agents.execution_agent import (
+    MAX_INVALID_TOOL_CALL_RETRIES,
+    ReviewAssessment,
+    review_complete,
+)
 from ursa.util import Checkpointer
 
 
@@ -428,3 +433,234 @@ def test_patch_dangling_tool_calls_emits_events(
     assert events[0][1]["stage"] == "dangling_tool_calls"
     assert events[0][1]["tool_call_ids"] == ["call-1"]
     assert "[Dangling Tool Call Warning]" not in capsys.readouterr().out
+
+
+def _incomplete_function_call_message(*tool_calls) -> AIMessage:
+    """Return what langchain-openai makes of an incomplete Responses output.
+
+    The model's ``edit_code`` call ran to the output token limit on
+    whitespace, so its arguments are not JSON and the call lands in
+    ``invalid_tool_calls`` while its ``function_call`` item stays in the
+    content that goes back to the API.
+    """
+    from langchain_openai.chat_models.base import (
+        _construct_lc_result_from_responses_api,
+    )
+    from openai.types.responses import Response
+
+    output = [
+        {
+            "type": "function_call",
+            "id": f"fc_{call['id']}",
+            "call_id": call["id"],
+            "name": call["name"],
+            "arguments": json.dumps(call["args"]),
+            "status": "completed",
+        }
+        for call in tool_calls
+    ]
+    output.append({
+        "type": "function_call",
+        "id": "fc_P1RH",
+        "call_id": "call_P1RH",
+        "name": "edit_code",
+        "arguments": " \n" * 200,
+        "status": "incomplete",
+    })
+    response = Response.model_validate({
+        "id": "resp_incomplete",
+        "object": "response",
+        "created_at": 0,
+        "model": "gpt-test",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": output,
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+    })
+    message = _construct_lc_result_from_responses_api(response)
+    return message.generations[0].message
+
+
+def _assert_function_calls_answered(messages) -> None:
+    """Assert every function_call in a Responses request has an output."""
+    from langchain_openai.chat_models.base import (
+        _construct_responses_api_input,
+    )
+
+    items = _construct_responses_api_input(messages)
+    calls = {i["call_id"] for i in items if i.get("type") == "function_call"}
+    outputs = {
+        i["call_id"] for i in items if i.get("type") == "function_call_output"
+    }
+    assert calls <= outputs, f"orphan function_call: {calls - outputs}"
+
+
+class RecordingFakeChatModel(GenericFakeChatModel):
+    """Record every message list the model is sent; bind_tools() is a no-op."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, *args, **kwargs):
+        REQUESTS.append(list(messages))
+        return super()._generate(messages, *args, **kwargs)
+
+
+REQUESTS: list[list] = []
+
+
+@pytest.fixture
+def recorded_requests():
+    REQUESTS.clear()
+    yield REQUESTS
+    REQUESTS.clear()
+
+
+def test_incomplete_responses_function_call_is_invalid():
+    message = _incomplete_function_call_message()
+
+    assert message.tool_calls == []
+    assert [call["id"] for call in message.invalid_tool_calls] == ["call_P1RH"]
+    assert message.response_metadata["status"] == "incomplete"
+    with pytest.raises(AssertionError, match="orphan function_call"):
+        _assert_function_calls_answered([message])
+
+
+def test_execution_agent_answers_truncated_tool_call(
+    recorded_requests, monkeypatch, tmpdir: Path
+):
+    review_requests = []
+
+    def fake_invoke_structured(*args, **kwargs):
+        review_requests.append(args[2])
+        return ReviewAssessment(is_complete=True, reason="done")
+
+    monkeypatch.setattr(
+        "ursa.agents.execution_agent.invoke_structured",
+        fake_invoke_structured,
+    )
+    execution_agent = ExecutionAgent(
+        llm=RecordingFakeChatModel(
+            messages=iter([
+                _incomplete_function_call_message(),
+                AIMessage(content="edited after reissuing the call"),
+                AIMessage(content="recap"),
+            ])
+        ),
+        workspace=tmpdir,
+    )
+
+    result = execution_agent.invoke("edit the video script")
+
+    # The truncated call sends the executor back to the model rather than
+    # to review, with an error tool output that asks for a complete call.
+    assert len(recorded_requests) == 3
+    retry_request = recorded_requests[1]
+    error = next(m for m in retry_request if isinstance(m, ToolMessage))
+    assert error.tool_call_id == "call_P1RH"
+    assert error.status == "error"
+    assert "Reissue it with complete JSON arguments" in error.text
+    for request in [*recorded_requests[1:], *review_requests]:
+        _assert_function_calls_answered(request)
+    _assert_function_calls_answered(result["messages"])
+    assert result["messages"][-1].text == "recap"
+
+
+def test_execution_agent_answers_truncated_call_beside_valid_call(
+    recorded_requests, monkeypatch, tmpdir: Path
+):
+    monkeypatch.setattr(
+        "ursa.agents.execution_agent.invoke_structured",
+        lambda *args, **kwargs: ReviewAssessment(
+            is_complete=True, reason="done"
+        ),
+    )
+    execution_agent = ExecutionAgent(
+        llm=RecordingFakeChatModel(
+            messages=iter([
+                _incomplete_function_call_message({
+                    "name": "fake_run_command",
+                    "args": {"query": "pwd"},
+                    "id": "call_pwd",
+                }),
+                AIMessage(content="done"),
+                AIMessage(content="recap"),
+            ])
+        ),
+        workspace=tmpdir,
+    )
+
+    execution_agent.invoke("run pwd and edit the script")
+
+    retry_request = recorded_requests[1]
+    outputs = {
+        m.tool_call_id: m for m in retry_request if isinstance(m, ToolMessage)
+    }
+    assert outputs["call_pwd"].text == "STDOUT:\nstubbed output\nSTDERR:\n"
+    assert outputs["call_P1RH"].status == "error"
+    for request in recorded_requests[1:]:
+        _assert_function_calls_answered(request)
+
+
+def test_execution_agent_stops_retrying_repeated_truncated_calls(
+    recorded_requests, monkeypatch, tmpdir: Path
+):
+    def truncated_calls():
+        while True:
+            yield _incomplete_function_call_message()
+
+    monkeypatch.setattr(
+        "ursa.agents.execution_agent.invoke_structured",
+        lambda *args, **kwargs: ReviewAssessment(
+            is_complete=True, reason="done"
+        ),
+    )
+    execution_agent = ExecutionAgent(
+        llm=RecordingFakeChatModel(messages=truncated_calls()),
+        workspace=tmpdir,
+    )
+
+    execution_agent.invoke("edit the video script")
+
+    # One first try, MAX_INVALID_TOOL_CALL_RETRIES retries, then the recap.
+    assert len(recorded_requests) == 1 + MAX_INVALID_TOOL_CALL_RETRIES + 1
+    for request in recorded_requests[1:]:
+        _assert_function_calls_answered(request)
+
+
+def test_review_and_recap_answer_persisted_truncated_call(
+    recorded_requests, monkeypatch, tmpdir: Path
+):
+    """A checkpoint saved before the fix still holds the unanswered call."""
+    review_requests = []
+
+    def fake_invoke_structured(*args, **kwargs):
+        review_requests.append(args[2])
+        return ReviewAssessment(is_complete=True, reason="done")
+
+    monkeypatch.setattr(
+        "ursa.agents.execution_agent.invoke_structured",
+        fake_invoke_structured,
+    )
+    execution_agent = ExecutionAgent(
+        llm=RecordingFakeChatModel(messages=_message_stream("recap")),
+        workspace=tmpdir,
+    )
+    state = {
+        "messages": [
+            HumanMessage(content="edit the video script"),
+            _incomplete_function_call_message(),
+            HumanMessage(content="next step"),
+            AIMessage(content="step done"),
+        ],
+        "symlinkdir": {},
+    }
+
+    execution_agent.review_work(state)
+    execution_agent.recap(state)
+
+    assert review_requests and recorded_requests
+    for request in [*review_requests, *recorded_requests]:
+        _assert_function_calls_answered(request)
