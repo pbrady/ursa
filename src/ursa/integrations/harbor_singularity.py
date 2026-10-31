@@ -327,6 +327,8 @@ _FAKEROOT_COMMAND_SETUP = (
     "'Acquire::https::Timeout \"20\";' "
     "'Acquire::Retries \"5\";' "
     "'Acquire::ForceIPv4 \"true\";' "
+    "'// Written by URSA: no HTTP pipelining; apt can deadlock when a mirror closes a pipelined connection.' "
+    "'Acquire::http::Pipeline-Depth \"0\";' "
     f"'DPkg::Post-Invoke {{ \"[ -e {_SUDO_SHIM_PATH} ] || "
     f"! [ -x /usr/bin/sudo ] || cp {_SUDO_SHIM_STASH} {_SUDO_SHIM_PATH} || "
     "true\"; };' "
