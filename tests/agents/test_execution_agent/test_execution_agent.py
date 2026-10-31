@@ -779,3 +779,34 @@ def test_next_plan_step_on_thread_answers_truncated_call(
     assert len(recorded_requests) == 1 + MAX_INVALID_TOOL_CALL_RETRIES + 3
     for request in [*recorded_requests[1:], *review_requests]:
         _assert_function_calls_answered(request)
+
+
+def test_recap_keeps_its_response_when_history_was_rewritten(
+    recorded_requests, tmpdir: Path
+):
+    """A recap that patches the history still adds the recap to it."""
+    from langgraph.types import Overwrite
+
+    execution_agent = ExecutionAgent(
+        llm=RecordingFakeChatModel(messages=_message_stream("recap")),
+        workspace=tmpdir,
+    )
+    state = {
+        "messages": [
+            HumanMessage(content="edit the video script"),
+            _incomplete_function_call_message(),
+            HumanMessage(content="next step"),
+            AIMessage(content="step done"),
+        ],
+        "symlinkdir": {},
+    }
+
+    update = execution_agent.recap(state)
+
+    # The history needed a patch, so the recap overwrites the message
+    # channel; an Overwrite of the whole state dropped the recap.
+    assert isinstance(update["messages"], Overwrite)
+    messages = update["messages"].value
+    assert messages[-1].text == "recap"
+    assert messages[-2].text == execution_agent.recap_prompt
+    _assert_function_calls_answered(messages)

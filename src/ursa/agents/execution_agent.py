@@ -649,7 +649,7 @@ class ExecutionAgent(AgentWithTools, BaseAgent[ExecutionState]):
             new_state["messages"].append(response)
             if self.log_state:
                 self.write_state("execution_agent.json", new_state)
-            return Overwrite(new_state)
+            return {"messages": Overwrite(new_state["messages"])}
         else:
             if self.log_state:
                 new_state["messages"].append(response)
