@@ -271,6 +271,14 @@ class DeepReviewAgent(AgentWithTools, BaseAgent[DeepReviewState]):
             ]
             messages.extend(new_phase_messages)
 
+        # Answer any tool call the history leaves unanswered, such as an
+        # invalid one cut off at the output limit, which ends its phase
+        # without running: providers refuse a request whose tool call has no
+        # tool output. Like the role prompt, this goes on the outbound
+        # request only.
+        patched, _ = self._patch_dangling({"messages": messages}, config=config)
+        messages = list(patched["messages"])
+
         # The phase's role prompt is prepended per request and never
         # persisted: providers such as Anthropic require system messages
         # to form a leading prefix, so the accumulated channel must stay
