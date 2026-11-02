@@ -52,10 +52,24 @@ network_mode = "public"
 
 
 def test_harbor_validate_help_exposes_paths():
-    result = runner.invoke(harbor_integration.app, ["validate", "--help"])
+    # Rich sizes help to the terminal, which defaults to 80 columns without a
+    # TTY (e.g. under Slurm), and Typer versions spell the metavar as PATHS or
+    # {paths}. Pin a wide plain console and compare case-insensitively.
+    result = runner.invoke(
+        harbor_integration.app,
+        ["validate", "--help"],
+        env={"COLUMNS": "200", "TERM": "dumb"},
+    )
 
     assert result.exit_code == 0
-    assert "PATHS" in result.stdout
+    usage = next(
+        line for line in result.stdout.splitlines() if "Usage:" in line
+    )
+    assert "paths" in usage.lower()
+    assert (
+        "Task files, task directories, or roots to scan recursively"
+        in result.stdout
+    )
 
 
 def test_validate_harbor_paths_reports_success(tmp_path):
@@ -117,30 +131,55 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
 ):
     task = _task(tmp_path)
     cache = tmp_path / "sif-cache"
-    observed: list[tuple[Path, Path, bool]] = []
+    observed: list[tuple[Path, Path, bool, bool, str]] = []
 
     async def build(
         self: DockerfileSingularityEnvironment,
         force_build: bool = False,
+        *,
+        refresh: bool = False,
     ) -> list[Path]:
+        # A refresh never becomes Harbor's force_build.
+        assert not force_build
         observed.append((
             self.environment_dir,
             self._image_cache_dir,
-            force_build,
+            refresh,
+            self._enable_environment_dir_upload,
+            self._builder_setting,
         ))
         return [cache / f"{self.environment_dir.name}.sif"]
 
     monkeypatch.setattr(DockerfileSingularityEnvironment, "build_sifs", build)
 
     paths = await prebuild_harbor_task(
-        task, force_build=True, image_cache_dir=cache
+        task, refresh=True, image_cache_dir=cache, builder="apptainer"
     )
 
     assert observed == [
-        (task / "environment", cache, True),
-        (task / "tests", cache, True),
+        (task / "environment", cache, True, True, "apptainer"),
+        # The tests image bundles its own files, as in a Harbor trial.
+        (task / "tests", cache, True, False, "apptainer"),
     ]
     assert paths == [cache / "environment.sif", cache / "tests.sif"]
+
+
+def test_separate_verifier_without_tests_image_uses_task_environment(
+    tmp_path,
+):
+    task_dir = _task(tmp_path)
+    (task_dir / "tests" / "Dockerfile").unlink()
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\n")
+
+    environments = _task_environments(Task(task_dir), purpose="validate")
+
+    assert [environment.environment_dir for environment in environments] == [
+        task_dir / "environment",
+        task_dir / "environment",
+    ]
+    verifier = environments[1]
+    assert verifier._enable_environment_dir_upload is True
+    assert verifier.network_policy.network_mode == NetworkMode.NO_NETWORK
 
 
 def test_harbor_prebuild_command_reports_built_sifs(tmp_path, monkeypatch):
@@ -151,10 +190,11 @@ def test_harbor_prebuild_command_reports_built_sifs(tmp_path, monkeypatch):
     async def build(
         task_dir: Path,
         *,
-        force_build: bool,
+        refresh: bool,
         image_cache_dir: Path | None,
+        builder: str | None,
     ) -> list[Path]:
-        observed.append((task_dir, force_build, image_cache_dir))
+        observed.append((task_dir, refresh, image_cache_dir, builder))
         return [cache / "agent.sif", cache / "verifier.sif"]
 
     monkeypatch.setattr(
@@ -168,12 +208,14 @@ def test_harbor_prebuild_command_reports_built_sifs(tmp_path, monkeypatch):
             "--force",
             "--image-cache-dir",
             str(cache),
+            "--builder",
+            "apptainer",
             str(task),
         ],
     )
 
     assert result.exit_code == 0
-    assert observed == [(task, True, cache)]
+    assert observed == [(task, True, cache, "apptainer")]
     assert f"OK   {task}: 2 SIF file(s)" in result.stdout
     assert "Pre-built 2 SIF file(s) for 1 Harbor task(s)." in result.stdout
 

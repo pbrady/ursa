@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +25,7 @@ from harbor.models.trial.paths import TrialPaths  # noqa: E402
 from ursa.integrations.harbor import UrsaHarborAgent  # noqa: E402
 from ursa.integrations.harbor_singularity import (  # noqa: E402
     DockerfileSingularityEnvironment,
+    _runtime_lacks_setuid_starter,
 )
 
 SINGULARITY = shutil.which("apptainer") or shutil.which("singularity")
@@ -250,6 +253,16 @@ def _require_fakeroot(image: Path) -> None:
         )
 
 
+def _require_compose_bridge() -> None:
+    # The environment refuses a bridged Compose project before building on
+    # the same evidence; root is never refused.
+    if os.geteuid() != 0 and _runtime_lacks_setuid_starter(SINGULARITY):
+        pytest.skip(
+            "Compose sidecars need bridge networking, which this unprivileged "
+            "Apptainer installation (no setuid starter) does not offer"
+        )
+
+
 async def _cleanup_environment(
     environment: DockerfileSingularityEnvironment,
     known_instances: set[str] | None = None,
@@ -395,6 +408,23 @@ async def test_timeout_kills_the_command_but_keeps_instance_usable(
     assert follow_up.stdout == "still-running"
 
 
+async def test_timeout_returns_while_a_background_job_holds_output(
+    environment: DockerfileSingularityEnvironment,
+):
+    # The shell exits at once, but its background job keeps the exec's
+    # output pipes open, so only the timeout can end the exec.
+    started = time.monotonic()
+    result = await environment.exec("sleep 120 & echo started", timeout_sec=2)
+    elapsed = time.monotonic() - started
+    await environment.exec("pkill -x sleep || true")
+
+    assert result.return_code == 124
+    assert "timed out" in result.stderr
+    assert elapsed < 60
+    follow_up = await environment.exec("printf still-running")
+    assert follow_up.stdout == "still-running"
+
+
 class _LoopbackHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         body = b"local-only"
@@ -489,9 +519,19 @@ async def test_fakeroot_overlay_provides_a_writable_container_root(
             "/created-at-runtime/value"
         )
         read_back = await environment.exec("cat /created-at-runtime/value")
+        # Apptainer keeps the image's /tmp in the overlay, so a rename across
+        # it, as path-tracing-reverse's verifier does, works as under Docker.
+        # mv would fall back to a copy; perl-base is in every Ubuntu image.
+        renamed = await environment.exec(
+            'cd /created-at-runtime && perl -e \'rename("value", '
+            '"/tmp/value") && rename("/tmp/value", "back") or die "$!\\n"\' '
+            "&& cat back"
+        )
 
         assert result.return_code == 0
         assert read_back.stdout == "overlay"
+        if environment._keeps_image_tmp:
+            assert renamed.stdout == "overlay", renamed.stderr
     finally:
         await _cleanup_environment(environment)
 
@@ -590,6 +630,7 @@ async def test_compose_sidecar_lifecycle_and_file_transfer(
     ubuntu_sif: Path,
 ):
     _require_fakeroot(ubuntu_sif)
+    _require_compose_bridge()
     environment = await _start_environment(
         tmp_path,
         ubuntu_sif,
@@ -659,6 +700,80 @@ async def test_compose_sidecar_lifecycle_and_file_transfer(
             assert probe.returncode != 0
     finally:
         await _cleanup_environment(environment, instances)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="requires a genuinely unprivileged host user",
+)
+async def test_unprivileged_instance_has_a_writable_home(
+    tmp_path: Path, ubuntu_sif: Path
+):
+    environment = await _start_environment(tmp_path, ubuntu_sif)
+
+    try:
+        result = await environment.exec(
+            'mkdir -p "$HOME/.local/bin" && touch "$HOME/.local/bin/env" '
+            '&& echo "$HOME"'
+        )
+        override = await environment.exec('echo "$HOME"', env={"HOME": "/tmp"})
+
+        assert result.return_code == 0, result.stderr
+        assert result.stdout.strip() == "/harbor-home"
+        assert override.stdout.strip() == "/tmp"
+    finally:
+        await _cleanup_environment(environment)
+
+
+async def _drive_background_shell(
+    environment: DockerfileSingularityEnvironment,
+) -> None:
+    """Drive a shell started by one exec from later execs, as terminus-2
+    drives its tmux shell."""
+    started = await environment.exec(
+        "rm -f /tmp/shell.in /tmp/shell.out; mkfifo /tmp/shell.in; "
+        "nohup bash -c 'exec bash <>/tmp/shell.in' >/tmp/shell.out 2>&1 &"
+    )
+    assert started.return_code == 0, started.stderr
+    steps = [
+        ("ls", "ls -la / >/dev/null"),
+        ("stat", "stat -c %U /etc/hostname >/dev/null"),
+        ("write", "cat > /tmp/heredoc.txt <<'EOF'\nwritten\nEOF"),
+        ("chown", "chown 1000 /tmp/heredoc.txt"),
+    ]
+    for name, command in steps:
+        marker = f"{name}-done"
+        # The marker goes on its own line so it cannot end a heredoc.
+        lines = shlex.quote(f"{command}\necho {marker}")
+        sent = await environment.exec(
+            f"printf '%s\\n' {lines} "
+            "> /tmp/shell.in; "
+            "for i in $(seq 100); do "
+            f"grep -qx {marker} /tmp/shell.out && break; sleep 0.1; done; "
+            f"grep -x {marker} /tmp/shell.out",
+            timeout_sec=60,
+        )
+        assert sent.stdout.strip() == marker, (name, sent.stdout, sent.stderr)
+    finished = await environment.exec(
+        "cat /tmp/heredoc.txt; stat -c %u /tmp/heredoc.txt"
+    )
+    assert finished.stdout.split() == ["written", "1000"], finished.stderr
+
+
+async def test_fakeroot_background_shell_serves_later_execs(
+    tmp_path: Path, ubuntu_sif: Path
+):
+    # Apptainer's per-exec faked used to exit with the exec that started a
+    # background shell, after which the shell blocked on its first stat.
+    _require_fakeroot(ubuntu_sif)
+    environment = await _start_environment(
+        tmp_path, ubuntu_sif, fakeroot=True, overlay=True
+    )
+
+    try:
+        await _drive_background_shell(environment)
+    finally:
+        await _cleanup_environment(environment)
 
 
 @pytest.mark.parametrize("fakeroot", [True, False])

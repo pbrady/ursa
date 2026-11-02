@@ -55,7 +55,9 @@ def _agent_config(
         "use_web" in inspect.signature(base).parameters
         for base in agent_class.__mro__
     )
-    if use_web is not None and supports_web:
+    # Harbor's decision turns web tools on only where the config leaves
+    # use_web unset; it always turns them off.
+    if use_web is not None and supports_web and options.get("use_web", True):
         options["use_web"] = use_web
     return options
 
