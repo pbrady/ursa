@@ -4080,7 +4080,8 @@ async def test_stop_keeps_overlay_only_without_delete(
     environment = _environment(tmp_path, overlay=True)
     overlay = _prepare_started_environment(environment, tmp_path)
     writable = environment._staging_dir / "harbor-writable"
-    writable.mkdir()
+    (writable / "workdir").mkdir(parents=True)
+    (writable / "installed-agent").mkdir()
     scratch = environment._scratch_dir
     commands: list[list[str]] = []
 
@@ -4104,12 +4105,13 @@ async def test_stop_keeps_overlay_only_without_delete(
         assert commands[0][:3] == ["cp", "-a", "--sparse=always"]
         assert commands[0][-2:] == [str(overlay), str(debug / "overlay.img")]
         assert commands[1][-2:] == [
-            str(writable),
-            str(debug / "harbor-writable"),
+            str(writable / "workdir"),
+            str(debug / "harbor-writable" / "workdir"),
         ]
+        assert len(commands) == 2  # installed-agent is not copied
         kept = (debug / "kept.txt").read_text()
         assert "overlay.img: kept" in kept
-        assert "harbor-writable: kept" in kept
+        assert "harbor-writable/workdir: kept" in kept
     assert not scratch.exists()
 
 

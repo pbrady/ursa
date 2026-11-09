@@ -3787,9 +3787,17 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             sources.append((self._overlay_path, "overlay.img"))
         writable = self._scratch_dir / "staging" / "harbor-writable"
         if writable.exists():
-            sources.append((writable, "harbor-writable"))
+            # Not installed-agent: thousands of files that say nothing about
+            # the trial and took minutes to copy to a network filesystem.
+            sources += [
+                (child, f"harbor-writable/{child.name}")
+                for child in sorted(writable.iterdir())
+                if child.name != "installed-agent"
+            ]
         try:
-            self._debug_dir.mkdir(parents=True, exist_ok=True)
+            (self._debug_dir / "harbor-writable").mkdir(
+                parents=True, exist_ok=True
+            )
         except OSError as exc:
             self.logger.warning("Could not create debug directory: %s", exc)
             return

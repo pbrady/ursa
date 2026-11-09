@@ -537,7 +537,8 @@ already gone. A separate verifier environment writes to
 Pass `harbor run --no-delete` to also keep the stopped instance's writable
 state: the overlay as `debug/overlay.img`, and Harbor's writable binds, which
 hold the workdir when it is not in the overlay and the logs when
-`auto_mounting` is off, as `debug/harbor-writable/`. `debug/kept.txt` lists
+`auto_mounting` is off, as `debug/harbor-writable/` (without the installed
+agent, which is large and says nothing about the trial). `debug/kept.txt` lists
 what was kept. The overlay stays sparse, which needs GNU `cp`. A copy that
 fails or passes its 10 minute limit is logged and recorded there and does not
 fail the trial. These files can hold anything the agent wrote, including
