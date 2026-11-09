@@ -127,6 +127,50 @@ _EXEC_OUTPUT_DRAIN_SEC = 10
 # Overlay size for tasks without storage_mb, matching what Terminal-Bench
 # tasks declare.
 _DEFAULT_OVERLAY_MB = 10240
+# Debugging records go to <trial_dir>/debug; a separate verifier environment
+# uses a subdirectory of it. Live-instance reads are bounded so they cannot
+# hold up a stop; see ``_best_effort``.
+_DEBUG_DIR = "debug"
+_PROCESS_SNAPSHOT_TIMEOUT_SEC = 15
+_DEBUG_COPY_TIMEOUT_SEC = 600
+_DEBUG_LOG_CHOWN_TIMEOUT_SEC = 15
+# One line per process, read from /proc because minimal images have no ps.
+# Never reads /proc/<pid>/environ. Reading cmdline blocks on a process stuck
+# holding its memory lock, the case this exists for, so that read is killed
+# after a second when the image has timeout(1) and comes last on the line.
+# Elapsed seconds assume the usual 100 ticks per second.
+_PROCESS_SNAPSHOT_SCRIPT = r"""exec 2>/dev/null
+t=
+timeout -s KILL 1 true && t='timeout -s KILL 1'
+read -r up _ </proc/uptime
+up=${up%.*}
+echo '# pid ppid state wchan elapsed_sec cmdline'
+for d in /proc/[0-9]*; do
+  p=${d##*/}
+  [ "$p" = "$$" ] && continue
+  read -r s <"$d/stat" || continue
+  comm=${s#*\(}
+  comm=${comm%\)*}
+  set -- ${s##*\) }
+  w=
+  read -r w <"$d/wchan" || :
+  e='?'
+  case $up:${20} in
+    *[!0-9:]*|:*|*:) ;;
+    *) e=$((up - ${20} / 100)) ;;
+  esac
+  c=$($t tr '\000\n' '  ' <"$d/cmdline" | cut -c1-300)
+  printf '%s %s %s %s %s %s\n' "$p" "$2" "$1" "${w:-?}" "$e" "${c:-[$comm]}"
+done
+"""
+# Command lines can carry what the environment was kept out for.
+_SECRET_IN_COMMAND_LINE = re.compile(
+    r"(?i)("
+    r"\b[a-z0-9_]*(?:key|token|secret|password|passwd|credential)[a-z0-9_]*="
+    r"|--[a-z0-9-]*(?:key|token|secret|password)[= ]"
+    r"|\bbearer\s+"
+    r")\S+"
+)
 # Without /etc/subuid, Apptainer's fakeroot wraps every instance exec in the
 # fakeroot(1) command, whose faked daemon exits with that exec. Processes the
 # exec left running, such as a tmux server or a ``nohup`` job, keep the
@@ -3354,6 +3398,14 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                     # Compose.
                     compose_arguments.append("--no-resolv")
                 self._instance_start_attempted = True
+                self._record_start_command([
+                    "singularity-compose",
+                    "--file",
+                    str(self._compose_file),
+                    "--project-name",
+                    self._compose_key("project"),
+                    *compose_arguments,
+                ])
                 compose_output = await self._run_compose(*compose_arguments)
             if not self._compose_uses_sudo:
                 # Instances started through sudo belong to root and are not
@@ -3366,7 +3418,9 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
                 self._add_compose_service_aliases()
         else:
             self._instance_start_attempted = True
-            await self._run(*self._instance_start_command(network_policy))
+            command = self._instance_start_command(network_policy)
+            self._record_start_command(command)
+            await self._run(*command)
         self._instance_started = True
         if self._keeps_image_tmp:
             # Without its bind, the workdir that every exec starts in exists
@@ -3466,6 +3520,7 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
             self._cleanup_staging()
             await self._release_sifs_in_use()
             return
+        await self._save_process_snapshot()
         stopped = True
         try:
             if self._uses_compose:
@@ -3577,18 +3632,248 @@ class DockerfileSingularityEnvironment(BaseEnvironment):
         self._overlay_path = None
         self._cleanup_runtime_workdir()
 
+    @property
+    def _debug_dir(self) -> Path:
+        root = self.trial_paths.trial_dir / _DEBUG_DIR
+        return (
+            root
+            if self.session_id.endswith("__env")
+            else root / self.session_id
+        )
+
+    def _write_debug_file(self, name: str, content: str) -> None:
+        try:
+            self._debug_dir.mkdir(parents=True, exist_ok=True)
+            (self._debug_dir / name).write_text(content)
+        except OSError as exc:
+            self.logger.warning("Could not write debug %s: %s", name, exc)
+
+    def _record_start_command(self, command: Sequence[str]) -> None:
+        """Save how the instance is started, before the attempt can fail.
+
+        Only arguments are saved: secrets reach an instance through its
+        environment, which stays out of the file and the log.
+        """
+        self.logger.info("Singularity image: %s", self._sif_path)
+        self.logger.info("Singularity start: %s", shlex.join(command))
+        lines = [
+            "#!/bin/sh",
+            "# Scratch and staging paths are removed when the trial stops.",
+        ]
+        if self._sif_path is not None:
+            lines.append(f"sif={shlex.quote(str(self._sif_path))}")
+        lines.append(shlex.join(command))
+        self._write_debug_file("start.sh", "\n".join(lines) + "\n")
+
+    async def _best_effort(
+        self, step: Awaitable[Any], timeout: float, description: str
+    ) -> bool:
+        """Run a debugging step to a hard deadline, logging any failure.
+
+        ``asyncio.wait`` returns at the deadline even if the step's own
+        cleanup is stuck, as it can be behind a process in D state.
+        """
+        task = asyncio.ensure_future(step)
+        try:
+            await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=1)
+            task.add_done_callback(
+                lambda done: done.cancelled() or done.exception()
+            )
+            self.logger.warning("Timed out after %gs: %s", timeout, description)
+            return False
+        if task.cancelled():
+            return False
+        if (error := task.exception()) is not None:
+            self.logger.warning("Failed: %s: %s", description, error)
+            return False
+        return True
+
+    async def _save_process_snapshot(self) -> None:
+        if not (self._instance_started or self._instance_start_attempted):
+            return
+        # Instances started through sudo belong to root.
+        if self._compose_uses_sudo:
+            return
+        await self._best_effort(
+            self._write_process_snapshot(),
+            _PROCESS_SNAPSHOT_TIMEOUT_SEC,
+            "saving a process snapshot",
+        )
+
+    async def _write_process_snapshot(self) -> None:
+        if not await self._instance_exists():
+            return
+        runtime = self._instance_runtime()
+        command = [runtime, "exec", "--cleanenv", "--pwd", "/"]
+        # A wedged shared faked blocks every preloaded stat, and the fakeroot
+        # command Apptainer wraps execs in needs a faked of its own. Setting
+        # FAKEROOTKEY skips that wrapper, and without ``_SHARED_FAKED_SCRIPT``
+        # nothing preloads libfakeroot, so this exec talks to no faked.
+        if self._fakeroot and _runtime_is_apptainer(runtime):
+            command.extend(["--env", "FAKEROOTKEY=ursa-no-fakeroot"])
+        command.extend([
+            f"instance://{self._instance_name}",
+            "/bin/sh",
+            "-c",
+            _PROCESS_SNAPSHOT_SCRIPT,
+        ])
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("SINGULARITYENV_", "APPTAINERENV_"))
+        }
+        self._debug_dir.mkdir(parents=True, exist_ok=True)
+        path = self._debug_dir / "processes.txt"
+        # Straight to a file: lines survive a kill, and no pipe can be held
+        # open by something the exec left behind.
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=output,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                env=environment,
+            )
+        try:
+            await process.wait()
+            if process.returncode:
+                self.logger.warning(
+                    "Process snapshot exited with code %s", process.returncode
+                )
+        finally:
+            if process.returncode is None:
+                with suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=1)
+            self._redact_debug_file(path)
+
+    def _redact_debug_file(self, path: Path) -> None:
+        try:
+            path.write_text(
+                _SECRET_IN_COMMAND_LINE.sub(
+                    r"\1<redacted>", path.read_text(errors="replace")
+                )
+            )
+        except OSError as exc:
+            self.logger.warning("Removing unredacted %s: %s", path.name, exc)
+            path.unlink(missing_ok=True)
+
+    async def _keep_debug_evidence(self, stopped: bool) -> None:
+        """Copy the stopped instance's writable state for ``--no-delete``."""
+        if self._scratch_dir is None:
+            return
+        if not stopped:
+            self._write_debug_file(
+                "kept.txt",
+                f"nothing copied: instance {self._instance_name} did not "
+                f"stop; runtime files remain in {self._scratch_dir}\n",
+            )
+            return
+        records = [
+            f"instance: {self._instance_name}",
+            f"sif: {self._sif_path} (shared cache, not copied)",
+        ]
+        sources = []
+        if self._overlay_path is not None and self._overlay_path.exists():
+            sources.append((self._overlay_path, "overlay.img"))
+        writable = self._scratch_dir / "staging" / "harbor-writable"
+        if writable.exists():
+            sources.append((writable, "harbor-writable"))
+        try:
+            self._debug_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.warning("Could not create debug directory: %s", exc)
+            return
+        for source, name in sources:
+            target = self._debug_dir / name
+            # GNU cp keeps a 10 GiB sparse overlay sparse; shutil.copy would
+            # write it out in full.
+            with suppress(OSError):
+                self._remove_staging_path(target)
+            copied = await self._best_effort(
+                self._run(
+                    "cp", "-a", "--sparse=always", str(source), str(target)
+                ),
+                _DEBUG_COPY_TIMEOUT_SEC,
+                f"keeping {name} from {source}",
+            )
+            if copied:
+                detail = ""
+                if target.is_file():
+                    with suppress(OSError):
+                        detail = (
+                            f" ({target.stat().st_blocks * 512} bytes on disk)"
+                        )
+                records.append(f"{name}: kept{detail}")
+            else:
+                with suppress(OSError):
+                    self._remove_staging_path(target)
+                records.append(f"{name}: not kept (see trial.log)")
+        self._write_debug_file("kept.txt", "\n".join(records) + "\n")
+        self.logger.info(
+            "Kept debug evidence in %s: %s", self._debug_dir, "; ".join(records)
+        )
+
+    @override
+    async def prepare_logs_for_host(self) -> None:
+        """Hand log binds back to the host user, as Docker's chown does.
+
+        Only subuid-mapped fakeroot needs this: there container users other
+        than root write as subordinate host ids. Root-mapped fakeroot has
+        only the invoking user's id, and without fakeroot so does everyone.
+        """
+        logs = EnvironmentPaths.logs_dir
+        targets = [
+            str(mount["target"])
+            for mount in self._host_mounts
+            if not mount.get("read_only")
+            and PurePosixPath(mount["target"]).is_relative_to(logs)
+        ]
+        if (
+            not targets
+            or not self._instance_started
+            or not self._fakeroot
+            or self._shared_faked
+        ):
+            return
+        await self._best_effort(
+            self._exec_instance(
+                f"chown -Rh 0:0 -- {shlex.join(targets)}",
+                cwd="/",
+                env=None,
+                timeout_sec=int(_DEBUG_LOG_CHOWN_TIMEOUT_SEC),
+                user=None,
+                merge_persistent=False,
+            ),
+            _DEBUG_LOG_CHOWN_TIMEOUT_SEC + 1,
+            "handing log directories back to the host user",
+        )
+
     @override
     async def stop(self, delete: bool) -> None:
         async with self._lifecycle_lock:
             await self._stop(delete)
 
     async def _stop(self, delete: bool) -> None:
+        await self._save_process_snapshot()
+        await self.prepare_logs_for_host()
         stopped = True
         if self._uses_compose:
             if self._compose_file is not None:
                 stopped = await self._stop_compose(warn=True)
         elif self._instance_started or self._instance_start_attempted:
             stopped = await self._stop_instance(warn=True)
+        if not delete:
+            await self._keep_debug_evidence(stopped)
         if stopped:
             self._cleanup_compose_project()
             self._cleanup_staging()

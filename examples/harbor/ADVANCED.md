@@ -521,6 +521,34 @@ as for definition builds; when that config cannot be read, a relative
 metadata; the Singularity adapter rejects variable workdirs it cannot resolve
 before launch.
 
+### Debug a trial
+
+Every trial writes `<trial_dir>/debug/`. `start.sh` is the instance-start
+command and SIF path, shell-quoted, without environment values; the same
+command is logged at INFO in `trial.log`. `processes.txt` is a snapshot taken
+just before a live instance stops: pid, ppid, state, wchan, elapsed seconds,
+and the first 300 characters of the command line, read from `/proc` with values
+that look like secrets redacted. Use it to see what a timed-out or hung trial
+was stuck on. The snapshot gets 15 seconds, runs outside the fakeroot wrappers
+so a stuck faked cannot block it, and is skipped for an instance that is
+already gone. A separate verifier environment writes to
+`debug/<session id>/`.
+
+Pass `harbor run --no-delete` to also keep the stopped instance's writable
+state: the overlay as `debug/overlay.img`, and Harbor's writable binds, which
+hold the workdir when it is not in the overlay and the logs when
+`auto_mounting` is off, as `debug/harbor-writable/`. `debug/kept.txt` lists
+what was kept. The overlay stays sparse, which needs GNU `cp`. A copy that
+fails or passes its 10 minute limit is logged and recorded there and does not
+fail the trial. These files can hold anything the agent wrote, including
+credentials it cached under `/root`. A failed start has no overlay to keep,
+since the runtime files are removed before Harbor reports whether to delete
+them; `start.sh` and `processes.txt` still cover it.
+
+Pass `--ek auto_mounting=true` to bind the agent, verifier, and artifact log
+directories to the trial directory, so they can be tailed and survive a
+timeout or a killed job.
+
 ## Clean up
 
 Remove `jobs/` when local results are no longer needed. Remove the SIF cache
