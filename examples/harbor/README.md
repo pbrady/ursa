@@ -112,10 +112,10 @@ Use this environment for direct runs:
 --env ursa.integrations.harbor.singularity:DockerfileSingularityEnvironment
 ```
 
-It builds `environment/Dockerfile` with Buildah, Podman, or Docker and converts
-it to a SIF; no Apptainer definition is needed. Compute nodes need `apptainer`
-or `singularity` plus one builder (Docker also needs a running daemon and
-socket access). SIFs cache by build context in `$XDG_CACHE_HOME/ursa/harbor/sif`
+It builds `environment/Dockerfile` into a SIF; no hand-written Apptainer
+definition is needed. Compute nodes need `apptainer` or `singularity`, plus
+Buildah, Podman, or Docker unless Apptainer builds the Dockerfile itself (see
+[Dockerfile builds](#dockerfile-builds)). SIFs cache by build context in `$XDG_CACHE_HOME/ursa/harbor/sif`
 or `~/.cache/ursa/harbor/sif`; concurrent builds share a lock. Set
 `URSA_HARBOR_SIF_CACHE`, pass the environment constructor's
 `singularity_image_cache_dir`, or use `prebuild --image-cache-dir` to choose a
@@ -130,6 +130,77 @@ is used directly as a local SIF file. Pulled images are cached by reference, so
 a moving tag such as `latest` is fetched again only when refreshed:
 `--environment-kwarg singularity_force_pull=true` re-pulls (and rebuilds) the
 cached SIFs without turning a prebuilt-image task into a build.
+
+### Dockerfile builds
+
+The `singularity_builder` environment kwarg, or `URSA_HARBOR_SIF_BUILDER` when
+the kwarg is unset, chooses how a Dockerfile becomes a SIF:
+
+- `apptainer`: translate the Dockerfile into an Apptainer definition file and
+  build it with `apptainer build --fakeroot` in the build context. This needs
+  no other tools and no `/etc/subuid` entry, since Apptainer 1.1 and later
+  fall back to a root-mapped user namespace plus the host's `fakeroot`
+  command. It suits HPC hosts with an unprivileged (non-setuid) Apptainer and
+  no `/etc/subuid`.
+- `buildah`, `podman`, or `docker`: build an OCI image and convert it with
+  `<runtime> build`. Docker needs a running daemon and socket access. Rootless
+  Buildah and Podman run `RUN` steps only for users with `/etc/subuid` and
+  `/etc/subgid` entries; without them every step fails, for example with
+  "error setting supplemental groups list: operation not permitted".
+- `auto` (default): when the runtime is Apptainer (also when installed under
+  the `singularity` name), try `apptainer` first, then Buildah, Podman, and
+  Docker. SingularityCE keeps only the OCI builders, since its fakeroot builds
+  need subuid ranges as well. A Dockerfile the translation does not support
+  goes straight to the OCI builders. A builder that fails for a host reason,
+  such as unusable fakeroot or missing subuid ranges, is skipped for the rest
+  of the process instead of failing again for every task.
+
+An explicit builder is the only one tried, and it is an error when it is not
+available. On a host where Buildah works, `singularity_builder=buildah` keeps
+Docker's own build semantics. Definition and OCI builds are cached under
+different keys, and the definition key includes the translator version, so
+changing the builder rebuilds once; under `auto` a cached SIF from either
+builder is reused, before any builder is looked up, so a SIF prebuilt on a
+login node also serves compute nodes without a builder. When the Apptainer
+build fails and an OCI builder succeeds, the Apptainer build log is kept next
+to the SIF and named in a warning.
+
+The translation replays the Dockerfile from a generated script in `%post`, so
+`COPY` and `RUN` steps keep their order even though Apptainer copies `%files`
+before `%post`; build context files are staged in `%setup` and removed at the
+end of the build. It supports parser directives (`escape`), line continuations,
+`RUN` heredocs, `ARG` (including before `FROM`, Compose build `args`, BuildKit's
+platform arguments, and the predefined proxy arguments), `ENV`, `SHELL`,
+`WORKDIR`, `USER` for later build steps, `COPY` and `ADD` from the context with
+Docker's `.dockerignore` matching, `--chown` and `--chmod`, `ADD` of local tar
+archives and `http(s)` URLs, and multi-stage builds with `COPY --from` a stage
+or another image. As in Docker, variables expand against the base image's
+environment and build steps start in its `WORKDIR` and as its `USER`; the
+adapter reads the base image's config from its registry without credentials
+(allow the registry hosts on egress-restricted hosts). When the config cannot be
+read it warns, steps start in `/` as root, and the build is cached under its own
+key until the registry answers. `CMD`, `ENTRYPOINT`, `LABEL`, `EXPOSE`,
+`VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, and `ONBUILD` are ignored.
+
+It rejects, naming the line, `RUN --mount` other than `type=cache` (ignored),
+`RUN --network=none`, `COPY --parents` and `--exclude`, `COPY` and `ADD`
+heredocs, `ADD` of Git repositories or with `--checksum`, globs in
+`COPY --from`, `FROM scratch`, `FROM` an earlier stage, and variables in `COPY`
+sources that only the base image defines. Under `auto` such a Dockerfile is
+built by an OCI builder if one is installed. Other differences from Docker:
+
+- The final `USER` is not applied; Harbor chooses the container user. Only root
+  is mapped in the build namespace, so `RUN` after a non-root `USER`, and
+  `--chown` to another user, run or copy as root while `fakeroot` reports the
+  requested owner.
+- The host's `fakeroot` command cannot load in images whose C library is older
+  than the host's, or is musl, as in Alpine. The build is then retried with
+  `--ignore-fakeroot-command`; package managers that drop privileges, such as
+  `apt-get`, still fail in that mode, and the OCI builders are tried.
+- Apptainer builds in `APPTAINER_TMPDIR` (default `/tmp`), which must be a local
+  file system with room for the unpacked image; NFS and Lustre do not work for
+  fakeroot builds.
+- The contents of `ADD` URLs are not part of the cache key.
 
 `singularity_fakeroot` defaults to `None`: fakeroot is enabled with Apptainer,
 including Apptainer installed under the `singularity` name (detected from
@@ -208,6 +279,8 @@ Runs reuse these files from the same cache without contacting the registry.
 Use `prebuild --force` to rebuild Dockerfiles and refresh fetched images; it
 refreshes the SIFs a trial without `--force-build` uses, so a prebuilt
 `docker_image` is re-pulled rather than built.
+`prebuild --builder` sets the Dockerfile builder, like `singularity_builder`;
+use the same builder for the run so that it finds the prebuilt SIFs.
 
 ### Agent install layers
 
@@ -418,13 +491,20 @@ unprivileged user/network namespaces. The task image needs Python 3.8+ for the
 stdlib bridge; a cached URSA installation's interpreter is also supported.
 The proxy socket lives in a private directory and is removed on cleanup.
 
-Set `[environment].workdir` when a Dockerfile has a variable or inherited
-non-root `WORKDIR`; the adapter rejects unresolved workdirs before launch. A
+The trial's working directory follows the Dockerfile's `WORKDIR` lines, with
+variables from its `ARG` and `ENV` lines and Compose build `args`, for the
+Compose build `target` when one is set. A relative first `WORKDIR`, or one that
+uses a variable only the base image sets, is resolved against the base image's
+config as for definition builds; when that config cannot be read, a relative
+`WORKDIR` starts in `/` with a warning. Set `[environment].workdir` when a
+Dockerfile inherits a non-root workdir from its base image without a `WORKDIR`
+of its own; the adapter rejects workdirs it cannot resolve before launch. A
 pulled Compose `main.image`, or a prebuilt `docker_image` without a Dockerfile,
-starts in `/` with a warning unless `[environment].workdir` says otherwise. A
-prebuilt image that ships with its Dockerfile uses that Dockerfile's `WORKDIR`.
-Workdirs are resolved when the trial starts, for the image it uses: with
-`--force-build`, the Dockerfile's.
+starts in the `WorkingDir` of its registry config, as under Docker, or in `/`
+with a warning when that config cannot be read; `[environment].workdir`
+overrides either. A prebuilt image that ships with its Dockerfile uses that
+Dockerfile's `WORKDIR`. Workdirs are resolved when the trial starts, for the
+image it uses: with `--force-build`, the Dockerfile's.
 
 To verify the integrated lifecycle with an existing Python-enabled SIF, run:
 

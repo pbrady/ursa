@@ -67,6 +67,7 @@ def _make_environment(
     suffix: str,
     purpose: str,
     image_cache_dir: Path | str | None = None,
+    builder: str | None = None,
 ) -> DockerfileSingularityEnvironment:
     trial_directory = (
         ".ursa-validation" if purpose == "validate" else f".ursa-{purpose}"
@@ -80,6 +81,7 @@ def _make_environment(
         network_policy=network_policy,
         phase_network_policies=phase_network_policies,
         singularity_image_cache_dir=image_cache_dir,
+        singularity_builder=builder,
     )
 
 
@@ -88,6 +90,7 @@ def _task_environments(
     *,
     purpose: str,
     image_cache_dir: Path | str | None = None,
+    builder: str | None = None,
 ) -> list[DockerfileSingularityEnvironment]:
     trial_agent = AgentConfig()
     trial_environment = TrialEnvironmentConfig()
@@ -139,6 +142,7 @@ def _task_environments(
             suffix="agent",
             purpose=purpose,
             image_cache_dir=image_cache_dir,
+            builder=builder,
         )
     ]
 
@@ -158,6 +162,7 @@ def _task_environments(
                     suffix=f"verifier-{index}",
                     purpose=purpose,
                     image_cache_dir=image_cache_dir,
+                    builder=builder,
                 )
             )
     return environments
@@ -178,6 +183,7 @@ async def prebuild_harbor_task(
     agent_cache_dir: Path | str | None = None,
     agent_install_timeout_sec: float = 1800,
     fakeroot: bool | None = None,
+    builder: str | None = None,
     force_build: bool | None = None,
 ) -> list[Path]:
     """Cache task/verifier SIFs and optionally build complete agent install layers.
@@ -185,7 +191,10 @@ async def prebuild_harbor_task(
     The SIFs are the ones a trial without ``--force-build`` uses, so
     ``refresh`` rebuilds or re-pulls them (and the agent layers) without
     switching a prebuilt-image task to a Dockerfile build.
-    ``force_build`` is a deprecated alias for ``refresh``.
+    ``builder`` has the meaning of the ``singularity_builder`` environment
+    kwarg; Dockerfile SIFs from different builders are cached apart, so it
+    should match the setting later runs use. ``force_build`` is a
+    deprecated alias for ``refresh``.
 
     Each NAME[@VERSION] installer runs in a fresh disposable task environment.
     Only the completed install overlay survives; no inference or verification runs.
@@ -211,7 +220,10 @@ async def prebuild_harbor_task(
         agent_installer(spec, agent_kwargs)
     paths: dict[Path, None] = {}
     environments = _task_environments(
-        Task(task_dir), purpose="prebuild", image_cache_dir=image_cache_dir
+        Task(task_dir),
+        purpose="prebuild",
+        image_cache_dir=image_cache_dir,
+        builder=builder,
     )
     for environment in environments:
         paths.update(

@@ -1,14 +1,20 @@
 import asyncio
+import hashlib
+import io
+import json
 import logging
 import os
+import platform
 import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import archspec.cpu
 import pytest
 import yaml
 
@@ -40,6 +46,23 @@ def _runtime_detected_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
         harbor_singularity,
         "_runtime_is_apptainer",
         lambda runtime: Path(runtime).name == "apptainer",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep definition builds from reading base image configs online."""
+    monkeypatch.setattr(
+        harbor_singularity, "image_config", lambda image, machine: {}
+    )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_builder_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with the default builder and none marked unusable."""
+    monkeypatch.delenv("URSA_HARBOR_SIF_BUILDER", raising=False)
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_unusable_builders", {}
     )
 
 
@@ -314,7 +337,9 @@ def test_failed_overlay_creation_removes_partial_files(
 
 
 def test_compose_main_image_workdir(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # With a Dockerfile, Harbor builds main and main.image only names the
     # result, so the Dockerfile's WORKDIR applies.
@@ -322,8 +347,16 @@ def test_compose_main_image_workdir(
     built = _environment(tmp_path / "built", compose=True, workdir=None)
     assert built._workdir == "/workspace"
 
-    # Without one, main.image is pulled and starts in "/", with a warning
-    # that its WORKDIR is unknown.
+    # Without one, main.image is pulled and starts in its WorkingDir, as
+    # under Docker, or in "/" with a warning when its config is unreadable.
+    configs: list[dict[str, str] | None] = [{"WorkingDir": "/srv/app"}]
+    lookups: list[tuple[str, str]] = []
+
+    def lookup(image: str, machine: str) -> dict[str, str] | None:
+        lookups.append((image, machine))
+        return configs[0]
+
+    monkeypatch.setattr(harbor_singularity, "image_config", lookup)
     pulled = tmp_path / "pulled" / "environment"
     pulled.mkdir(parents=True)
     (pulled / "docker-compose.yaml").write_text(
@@ -341,8 +374,15 @@ def test_compose_main_image_workdir(
         persistent_env={},
         singularity_fakeroot=False,
     )
+    # Construction reads no registry; the start resolves the workdir.
+    assert lookups == []
+    assert environment._workdir == "/srv/app"
+    assert lookups == [("ubuntu:24.04", platform.machine())]
+
+    configs[0] = None
+    environment._workdir = None
     assert environment._workdir == "/"
-    assert "Cannot read the WORKDIR of ubuntu:24.04" in caplog.text
+    assert "Cannot read the config of ubuntu:24.04" in caplog.text
     assert "[environment].workdir" in caplog.text
 
 
@@ -674,6 +714,11 @@ async def test_build_attempt_logs_are_retained_only_after_all_builders_fail(
 ):
     environment = _environment(tmp_path)
     environment._runtime_path = f"/usr/bin/{runtime}"
+    # Under auto, Apptainer builds a definition first; this test covers the
+    # OCI builders' logs.
+    environment._builder_setting = (
+        "docker" if runtime == "apptainer" else "auto"
+    )
     output = tmp_path / "cached-image.sif"
 
     attempts = 0
@@ -721,6 +766,756 @@ async def test_build_attempt_logs_are_retained_only_after_all_builders_fail(
     assert (error in captured.err) is not fallback_succeeds
     assert output.with_suffix(".build.log").exists() is not fallback_succeeds
     assert ("switching to Apptainer" in caplog.text) is warning
+
+
+async def test_build_failure_names_shared_log_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    output = tmp_path / "cached-image.sif"
+
+    async def cache_path(*_args: object, **_kwargs: object) -> Path:
+        return output
+
+    async def invalid(_path: Path) -> bool:
+        return False
+
+    async def fail_build(
+        builder: str,
+        _output: Path,
+        _temporary: Path,
+        _force_build: bool,
+        _dockerfile_path: Path,
+        _context_dir: Path,
+        _build_args: tuple[str, ...],
+        _target: str | None,
+        build_log_path: Path,
+    ) -> None:
+        log_note = environment._record_command_failure(
+            build_log_path, (builder, "build"), return_code=1
+        )
+        raise RuntimeError(f"{Path(builder).name} build failed{log_note}")
+
+    monkeypatch.setattr(environment, "_dockerfile_cache_path", cache_path)
+    monkeypatch.setattr(environment, "_is_valid_sif", invalid)
+    monkeypatch.setattr(environment, "_build_with", fail_build)
+    monkeypatch.setattr(
+        harbor_singularity.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name != "buildah" else None,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment._build_dockerfile_sif(False)
+
+    message = str(raised.value)
+    build_log = output.with_suffix(".build.log").absolute()
+    assert "podman build failed" in message
+    assert "docker build failed" in message
+    assert message.count(f"Build log: {build_log}") == 1
+    assert message.endswith(f"Build log: {build_log}")
+
+
+async def test_build_discards_failed_attempt_log_after_fallback_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    environment = _environment(tmp_path)
+    output = tmp_path / "cached-image.sif"
+    attempts = 0
+
+    async def cache_path(*_args: object, **_kwargs: object) -> Path:
+        return output
+
+    async def invalid(_path: Path) -> bool:
+        return False
+
+    async def build(
+        _builder: str,
+        output: Path,
+        _temporary: Path,
+        _force_build: bool,
+        _dockerfile_path: Path,
+        _context_dir: Path,
+        _build_args: tuple[str, ...],
+        _target: str | None,
+        build_log_path: Path,
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            build_log_path.write_text("first builder failed\n")
+            raise RuntimeError("failed")
+        output.write_bytes(b"sif")
+
+    monkeypatch.setattr(environment, "_dockerfile_cache_path", cache_path)
+    monkeypatch.setattr(environment, "_is_valid_sif", invalid)
+    monkeypatch.setattr(environment, "_build_with", build)
+    monkeypatch.setattr(
+        harbor_singularity.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name != "podman" else None,
+    )
+
+    assert await environment._build_dockerfile_sif(False) == output
+
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert not captured.err
+    assert not output.with_suffix(".build.log").exists()
+
+
+async def test_build_with_records_builder_and_apptainer_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    output = tmp_path / "cached-image.sif"
+    temporary = tmp_path / "cached-image.tmp.sif"
+    build_log = tmp_path / "cached-image.build.log"
+    observed: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    async def capture(*command: str, **kwargs: object) -> None:
+        observed.append((command, kwargs))
+        if command[:2] == (environment._runtime_path, "build"):
+            Path(command[2]).write_bytes(b"sif")
+
+    monkeypatch.setattr(environment, "_run", capture)
+
+    await environment._build_with(
+        "docker",
+        output,
+        temporary,
+        False,
+        environment._dockerfile_path,
+        environment.environment_dir,
+        (),
+        None,
+        build_log,
+    )
+
+    builder_build = observed[0]
+    assert builder_build[0][:2] == ("docker", "build")
+    assert builder_build[1] == {"failure_log_path": build_log}
+    apptainer_build = next(
+        item
+        for item in observed
+        if item[0][:2] == (environment._runtime_path, "build")
+    )
+    assert apptainer_build[1] == {"failure_log_path": build_log}
+    save = next(item for item in observed if item[0][:2] == ("docker", "save"))
+    assert save[1] == {"failure_log_path": build_log}
+    assert output.read_bytes() == b"sif"
+
+
+def _fake_apptainer(
+    environment: DockerfileSingularityEnvironment,
+    tmp_path: Path,
+    *,
+    build: str = 'echo sif > "$output"',
+    version: str = "apptainer version 1.5.5",
+    name: str = "apptainer",
+) -> Path:
+    """Install a fake runtime that records its calls in ``calls``."""
+    runtime = tmp_path / "bin" / name
+    runtime.parent.mkdir(exist_ok=True)
+    calls = tmp_path / "calls"
+    runtime.write_text(
+        "#!/bin/sh\n"
+        f'printf \'%s|%s|%s\\n\' "$PWD" "${{APPTAINER_BINDPATH-}}" "$*" '
+        f">> {calls}\n"
+        "case $1 in\n"
+        f"--version) echo '{version}' ;;\n"
+        'sif) [ -s "$3" ] ;;\n'
+        "build)\n"
+        '    eval "output=\\${$(($# - 1))}"\n'
+        '    eval "definition=\\${$#}"\n'
+        f'    cp "$definition" {tmp_path}/last.def\n'
+        f"    rm -rf {tmp_path}/last-staging\n"
+        f'    cp -R "${{definition%/*}}" {tmp_path}/last-staging\n'
+        f"    {build}\n"
+        "    ;;\n"
+        "esac\n"
+    )
+    runtime.chmod(0o755)
+    environment._runtime_path = str(runtime)
+    environment._image_cache_dir = tmp_path / "cache"
+    return calls
+
+
+def _builds(calls: Path) -> list[list[str]]:
+    if not calls.is_file():
+        return []
+    return [
+        line.split("|")
+        for line in calls.read_text().splitlines()
+        if line.split("|")[2].startswith("build ")
+    ]
+
+
+def _oci_builders(
+    monkeypatch: pytest.MonkeyPatch, *names: str
+) -> tuple[list[tuple[str, Path]], Callable[..., Awaitable[None]]]:
+    """Make ``names`` the installed OCI builders.
+
+    Returns the builds recorded by the returned ``_build_with`` stand-in.
+    """
+    built: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        harbor_singularity.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in names else None,
+    )
+
+    async def build(builder: str, output: Path, *_args: object) -> None:
+        built.append((builder, output))
+        output.write_text("sif")
+
+    return built, build
+
+
+async def test_auto_builds_dockerfile_from_apptainer_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    calls = _fake_apptainer(environment, tmp_path)
+    built, build = _oci_builders(monkeypatch, "docker")
+    monkeypatch.setattr(environment, "_build_with", build)
+    monkeypatch.setenv("APPTAINER_BINDPATH", "/host:/host")
+
+    output = await environment._build_dockerfile_sif(False)
+
+    assert not built
+    [(cwd, bindpath, command)] = _builds(calls)
+    assert cwd == str(environment.environment_dir)
+    # The caller's binds would otherwise apply to %post.
+    assert bindpath == ""
+    arguments = command.split()
+    assert arguments[:2] == ["build", "--fakeroot"]
+    assert arguments[2] == str(output.with_suffix(".tmp.sif"))
+    assert arguments[3].endswith("/build.def")
+    assert (
+        (tmp_path / "last.def")
+        .read_text()
+        .startswith("Bootstrap: docker\nFrom: ubuntu:24.04\n")
+    )
+    assert output.read_text() == "sif\n"
+    assert output != await environment._dockerfile_cache_path()
+    assert not output.with_suffix(".build.log").exists()
+    assert not output.with_suffix(".tmp.sif").exists()
+
+    assert await environment._build_dockerfile_sif(False) == output
+    assert len(_builds(calls)) == 1
+
+
+async def test_definition_build_starts_in_base_image_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    (environment.environment_dir / "Dockerfile").write_text(
+        "FROM swebench/sweb.eval:latest\nRUN git add -A\n"
+    )
+    _fake_apptainer(environment, tmp_path)
+    _oci_builders(monkeypatch)
+    lookups = []
+
+    def config(image: str, machine: str) -> dict[str, str]:
+        lookups.append(image)
+        return {"WorkingDir": "/testbed", "User": "root"}
+
+    monkeypatch.setattr(harbor_singularity, "image_config", config)
+
+    await environment._build_dockerfile_sif(False)
+
+    assert lookups == ["swebench/sweb.eval:latest"]
+    script = (tmp_path / "last-staging" / "s0" / "build.sh").read_text()
+    assert script.endswith(
+        "_ursa_private_tmp\n"
+        "_ursa_workdir /testbed\n"
+        "_ursa_user=root\n"
+        "_ursa_step 2 'RUN git add -A'\n"
+        "_ursa_run /bin/sh -c 'git add -A'\n"
+    )
+
+
+async def test_auto_reuses_cached_oci_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    calls = _fake_apptainer(environment, tmp_path)
+    built, build = _oci_builders(monkeypatch, "buildah")
+    monkeypatch.setattr(environment, "_build_with", build)
+    cached = await environment._dockerfile_cache_path()
+    cached.parent.mkdir(parents=True)
+    cached.write_text("sif")
+
+    assert await environment._build_dockerfile_sif(False) == cached
+    assert not built
+    assert not _builds(calls)
+
+
+async def test_cached_sif_is_reused_without_its_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A SIF prebuilt on a login node serves a node with no builder at all.
+    environment = _environment(tmp_path)
+    _fake_apptainer(
+        environment,
+        tmp_path,
+        name="singularity",
+        version="singularity-ce version 3.6.2",
+    )
+    _oci_builders(monkeypatch)
+    cached = await environment._dockerfile_cache_path()
+    cached.parent.mkdir(parents=True)
+    cached.write_text("sif")
+
+    assert await environment._build_dockerfile_sif(False) == cached
+
+    # Apptainer with no OCI builder reuses an OCI build too ...
+    calls = _fake_apptainer(environment, tmp_path)
+    assert await environment._build_dockerfile_sif(False) == cached
+    assert not _builds(calls)
+
+    # ... and an explicit Apptainer builder its own build, even after the
+    # runtime failed for a host reason.
+    environment._builder_setting = "apptainer"
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment,
+        "_unusable_builders",
+        {environment._runtime_path: "FATAL:   no fakeroot"},
+    )
+    definition = await environment._dockerfile_cache_path(builder="apptainer")
+    definition.write_text("sif")
+    assert await environment._build_dockerfile_sif(False) == definition
+    assert not _builds(calls)
+
+
+async def test_build_without_base_config_is_cached_apart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    (environment.environment_dir / "Dockerfile").write_text(
+        "FROM swebench/sweb.eval:latest\nRUN git add -A\n"
+    )
+    calls = _fake_apptainer(environment, tmp_path)
+    _oci_builders(monkeypatch)
+    configs: list[dict[str, str] | None] = [None]
+    monkeypatch.setattr(
+        harbor_singularity, "image_config", lambda image, machine: configs[0]
+    )
+
+    degraded = await environment._build_dockerfile_sif(False)
+
+    assert degraded != await environment._dockerfile_cache_path(
+        builder="apptainer"
+    )
+    # The same failure reuses that build ...
+    assert await environment._build_dockerfile_sif(False) == degraded
+    assert len(_builds(calls)) == 1
+
+    # ... but once the config can be read, the build is redone with it.
+    configs[0] = {"WorkingDir": "/testbed"}
+    output = await environment._build_dockerfile_sif(False)
+
+    assert output == await environment._dockerfile_cache_path(
+        builder="apptainer"
+    )
+    assert len(_builds(calls)) == 2
+    script = (tmp_path / "last-staging" / "s0" / "build.sh").read_text()
+    assert "_ursa_workdir /testbed\n" in script
+
+
+async def test_definition_cache_key_uses_docker_ignore_matching(
+    tmp_path: Path,
+):
+    environment = _environment(tmp_path)
+    (environment.environment_dir / ".dockerignore").write_text("*.json\n")
+    nested = environment.environment_dir / "src" / "config.json"
+    nested.parent.mkdir()
+    nested.write_text("1")
+    oci = await environment._dockerfile_cache_path()
+    definition = await environment._dockerfile_cache_path(builder="apptainer")
+
+    nested.write_text("2")
+
+    # Docker copies src/config.json, so the definition build depends on it.
+    assert await environment._dockerfile_cache_path() == oci
+    assert (
+        await environment._dockerfile_cache_path(builder="apptainer")
+        != definition
+    )
+
+
+async def test_auto_builds_unsupported_dockerfile_with_oci_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    (environment.environment_dir / "Dockerfile").write_text(
+        "FROM ubuntu:24.04\nRUN --mount=type=secret,id=token true\n"
+    )
+    calls = _fake_apptainer(environment, tmp_path)
+    built, build = _oci_builders(monkeypatch, "podman")
+    monkeypatch.setattr(environment, "_build_with", build)
+
+    output = await environment._build_dockerfile_sif(False)
+
+    assert built == [("/usr/bin/podman", output)]
+    assert output == await environment._dockerfile_cache_path()
+    assert not _builds(calls)
+
+
+async def test_explicit_apptainer_builder_names_unsupported_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    environment._builder_setting = "apptainer"
+    (environment.environment_dir / "Dockerfile").write_text(
+        "FROM ubuntu:24.04\nRUN --mount=type=secret,id=token true\n"
+    )
+    calls = _fake_apptainer(environment, tmp_path)
+    _oci_builders(monkeypatch, "docker")
+
+    with pytest.raises(RuntimeError, match="line 2: RUN --mount=type=secret"):
+        await environment._build_dockerfile_sif(False)
+    assert not _builds(calls)
+
+
+async def test_apptainer_host_failure_is_skipped_for_later_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_unusable_builders", {}
+    )
+    environment = _environment(tmp_path)
+    calls = _fake_apptainer(
+        environment,
+        tmp_path,
+        build="echo 'FATAL:   could not use fakeroot: no user namespace'; "
+        "exit 255",
+    )
+    built, build = _oci_builders(monkeypatch, "docker")
+    monkeypatch.setattr(environment, "_build_with", build)
+
+    output = await environment._build_dockerfile_sif(False)
+
+    assert built == [("/usr/bin/docker", output)]
+    assert environment._unusable_builders == {
+        environment._runtime_path: (
+            "FATAL:   could not use fakeroot: no user namespace"
+        )
+    }
+    # The Apptainer log stays for diagnosis; the OCI build left none.
+    [log] = output.parent.glob("*.build.log")
+    assert "could not use fakeroot" in log.read_text()
+    assert log.stem != output.stem
+    assert environment._dockerfile_builders() == ["/usr/bin/docker"]
+    await environment._build_dockerfile_sif(True)
+    assert len(_builds(calls)) == 1
+
+
+async def test_apptainer_step_failure_is_not_a_host_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_unusable_builders", {}
+    )
+    environment = _environment(tmp_path)
+    _fake_apptainer(
+        environment,
+        tmp_path,
+        build="echo 'E: Unable to locate package nope'; echo 'FATAL:   "
+        "While performing build: while running %post section: exit status "
+        "100'; exit 255",
+    )
+    _oci_builders(monkeypatch)
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment._build_dockerfile_sif(False)
+
+    message = str(raised.value)
+    assert message.startswith("No container builder succeeded: ")
+    log = next((tmp_path / "cache").glob("*.build.log"))
+    assert message.endswith(f"Build log: {log.absolute()}")
+    assert "Unable to locate package" in log.read_text()
+    assert not environment._unusable_builders
+
+
+async def test_fakeroot_command_failure_retries_without_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    calls = _fake_apptainer(
+        environment,
+        tmp_path,
+        build='case "$*" in *--ignore-fakeroot-command*) '
+        'echo sif > "$output" ;; *) echo "fakeroot: error while starting the '
+        "\\`faked' daemon.\"; exit 1 ;; esac",
+    )
+    _oci_builders(monkeypatch)
+
+    output = await environment._build_dockerfile_sif(False)
+
+    assert output.read_text() == "sif\n"
+    builds = [command.split()[:3] for _, _, command in _builds(calls)]
+    assert builds == [
+        ["build", "--fakeroot", str(output.with_suffix(".tmp.sif"))],
+        ["build", "--fakeroot", "--ignore-fakeroot-command"],
+    ]
+
+
+async def test_oci_run_failure_is_skipped_for_later_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_unusable_builders", {}
+    )
+    environment = _environment(tmp_path)
+    _fake_apptainer(
+        environment,
+        tmp_path,
+        name="singularity",
+        version="singularity-ce version 3.6.2",
+    )
+    built: list[str] = []
+    monkeypatch.setattr(
+        harbor_singularity.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name != "docker" else None,
+    )
+
+    async def build(builder: str, output: Path, *args: object) -> None:
+        built.append(builder)
+        build_log_path = args[-1]
+        if builder.endswith("buildah"):
+            environment._record_command_failure(
+                build_log_path,
+                (builder, "build"),
+                return_code=1,
+                output=io.BytesIO(
+                    b"STEP 2/2: RUN true\nerror running container: error "
+                    b"setting supplemental groups list: operation not "
+                    b"permitted\n"
+                ),
+            )
+            raise RuntimeError("buildah build failed")
+        output.write_text("sif")
+
+    monkeypatch.setattr(environment, "_build_with", build)
+
+    # SingularityCE cannot build definitions without fakeroot here, so it
+    # keeps the OCI builders.
+    assert environment._dockerfile_builders() == [
+        "/usr/bin/buildah",
+        "/usr/bin/podman",
+    ]
+    await environment._build_dockerfile_sif(False)
+    await environment._build_dockerfile_sif(True)
+
+    assert built == ["/usr/bin/buildah", "/usr/bin/podman", "/usr/bin/podman"]
+    assert (
+        "supplemental groups"
+        in environment._unusable_builders["/usr/bin/buildah"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [
+        ("auto", ["apptainer", "/usr/bin/buildah", "/usr/bin/docker"]),
+        ("apptainer", ["apptainer"]),
+        ("buildah", ["/usr/bin/buildah"]),
+        ("docker", ["/usr/bin/docker"]),
+    ],
+)
+def test_builder_setting_selects_builders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+    expected: list[str],
+):
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_unusable_builders", {}
+    )
+    environment = _environment(tmp_path)
+    environment._builder_setting = setting
+    _fake_apptainer(environment, tmp_path)
+    _oci_builders(monkeypatch, "buildah", "docker")
+
+    assert environment._dockerfile_builders() == expected
+
+
+def test_explicit_builder_must_be_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    _fake_apptainer(
+        environment,
+        tmp_path,
+        name="singularity",
+        version="singularity-ce version 3.6.2",
+    )
+    _oci_builders(monkeypatch)
+
+    environment._builder_setting = "apptainer"
+    with pytest.raises(RuntimeError, match="is not Apptainer"):
+        environment._dockerfile_builders()
+    environment._builder_setting = "podman"
+    with pytest.raises(RuntimeError, match="requires podman"):
+        environment._dockerfile_builders()
+    environment._builder_setting = "auto"
+    with pytest.raises(RuntimeError, match="requires Apptainer, buildah"):
+        environment._dockerfile_builders()
+
+
+@pytest.mark.parametrize(
+    ("value", "environ", "expected"),
+    [
+        (None, None, "auto"),
+        (None, "buildah", "buildah"),
+        (" Apptainer ", "buildah", "apptainer"),
+        ("docker", None, "docker"),
+    ],
+)
+def test_builder_setting_accepts_kwarg_or_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    environ: str | None,
+    expected: str,
+):
+    if environ is None:
+        monkeypatch.delenv("URSA_HARBOR_SIF_BUILDER", raising=False)
+    else:
+        monkeypatch.setenv("URSA_HARBOR_SIF_BUILDER", environ)
+
+    assert DockerfileSingularityEnvironment._parse_builder(value) == expected
+
+
+def test_builder_setting_rejects_unknown_builders():
+    with pytest.raises(ValueError, match="singularity_builder must be one of"):
+        DockerfileSingularityEnvironment._parse_builder("kaniko")
+
+
+async def test_oci_cache_key_is_unchanged_by_definition_builds(
+    tmp_path: Path,
+):
+    # SIFs that OCI builders cached before the definition builder existed
+    # must keep their names, so the OCI key is recomputed here by hand.
+    environment = _environment(tmp_path)
+    context = environment.environment_dir
+    (context / ".dockerignore").write_text("ignored.txt\n")
+    (context / "ignored.txt").write_text("skip")
+    (context / "kept.txt").write_text("keep")
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "architecture": platform.machine(),
+                "build_args": [],
+                "microarchitecture": archspec.cpu.host().name,
+                "target": None,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    for path in sorted(context.resolve().rglob("*")):
+        relative = path.relative_to(context.resolve()).as_posix()
+        if relative == "ignored.txt":
+            continue
+        digest.update(relative.encode())
+        digest.update(str(path.lstat().st_mode).encode())
+        digest.update(path.read_bytes())
+
+    assert await environment._dockerfile_cache_path() == (
+        environment._image_cache_dir
+        / f"dockerfile-{digest.hexdigest()[:24]}.sif"
+    )
+
+
+async def test_definition_cache_key_includes_translator_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    oci = await environment._dockerfile_cache_path()
+    definition = await environment._dockerfile_cache_path(builder="apptainer")
+
+    monkeypatch.setattr(
+        harbor_singularity, "DOCKERFILE_TRANSLATOR_VERSION", 999
+    )
+
+    assert definition != oci
+    assert await environment._dockerfile_cache_path() == oci
+    assert (
+        await environment._dockerfile_cache_path(builder="apptainer")
+        != definition
+    )
+
+
+def test_workdir_uses_compose_build_target_and_args(tmp_path: Path):
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text(
+        "FROM ubuntu AS base\n"
+        "ARG APP=/default\n"
+        "WORKDIR $APP\n"
+        "FROM base\n"
+        "WORKDIR /final\n"
+    )
+    (environment_dir / "docker-compose.yaml").write_text(
+        "services:\n"
+        "  main:\n"
+        "    build:\n"
+        "      context: .\n"
+        "      target: base\n"
+        "      args:\n"
+        "        APP: /from-compose\n"
+    )
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+
+    environment = DockerfileSingularityEnvironment(
+        environment_dir=environment_dir,
+        environment_name="unit-test",
+        session_id=f"{tmp_path.name}__env",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(),
+        network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+        persistent_env={},
+    )
+
+    assert environment._workdir == "/from-compose"
+
+
+def test_relative_workdir_starts_in_base_image_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("FROM base\nWORKDIR sub\n")
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    configs: list[dict[str, str] | None] = [{"WorkingDir": "/app"}]
+    monkeypatch.setattr(
+        harbor_singularity, "image_config", lambda image, machine: configs[0]
+    )
+
+    def workdir() -> str:
+        return DockerfileSingularityEnvironment(
+            environment_dir=environment_dir,
+            environment_name="unit-test",
+            session_id=f"{tmp_path.name}__env",
+            trial_paths=trial_paths,
+            task_env_config=EnvironmentConfig(),
+            network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+            persistent_env={},
+        )._workdir
+
+    assert workdir() == "/app/sub"
+    configs[0] = None
+    assert workdir() == "/sub"
+    assert "cannot read the config of base" in caplog.text
 
 
 async def test_marking_a_live_sif_twice_keeps_its_usage_marker(
@@ -1570,7 +2365,16 @@ async def test_force_build_without_dockerfile_refreshes_the_pull(
     await environment._build_main_sif(force_build=True)
 
     assert len(_pulls(log)) == 2
-    assert environment._workdir == "/"
+    # The pulled image's own WorkingDir, as under Docker.
+    monkeypatch.setattr(
+        harbor_singularity,
+        "image_config",
+        lambda image, machine: {"WorkingDir": "/task"}
+        if image == "example/task:20251031"
+        else None,
+    )
+    await environment._prepare_workdir(force_build=True)
+    assert environment._workdir == "/task"
 
 
 async def test_force_pull_refreshes_prebuilt_image_without_building(
@@ -1685,10 +2489,15 @@ async def test_compose_main_image_follows_harbor_build_mode(
     await environment._build_main_sif(force_build=force_build)
 
     assert observed == (["ubuntu:24.04"] if pulled else ["build"])
-    # The workdir follows the image the trial uses: the Dockerfile that
-    # --force-build builds, or the pulled image.
+    # The workdir follows the image the trial uses: the pulled image's
+    # config, or the Dockerfile that --force-build builds.
+    monkeypatch.setattr(
+        harbor_singularity,
+        "image_config",
+        lambda image, machine: {"WorkingDir": f"/from/{image}"},
+    )
     await environment._prepare_workdir(force_build)
-    assert environment._workdir == ("/" if pulled else "/app")
+    assert environment._workdir == ("/from/ubuntu:24.04" if pulled else "/app")
 
 
 async def test_compose_sidecars_follow_prebuilt_main_image(

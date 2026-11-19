@@ -19,6 +19,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 from collections.abc import (
     Awaitable,
@@ -63,6 +64,15 @@ from harbor.utils.env import resolve_env_vars
 from pathspec import GitIgnoreSpec
 
 from ursa.integrations.harbor import network_proxy
+from ursa.integrations.harbor.dockerfile import (
+    DOCKERFILE_TRANSLATOR_VERSION,
+    Definition,
+    DockerfileUnsupported,
+    DockerIgnore,
+    dockerfile_workdir,
+    image_config,
+    translate_dockerfile,
+)
 from ursa.util.http import OpenSSLContext
 
 _COMPOSE_SERVICE_FIELDS = frozenset({
@@ -145,6 +155,20 @@ _FAKEROOT_FAILURE_MARKERS = (
 _FAKEROOT_COMMAND_FAILURE_MARKERS = (
     "error while starting the `faked' daemon",
     "required by /.singularity.d/libs/libfakeroot",
+)
+# ``apptainer`` builds a translated definition file with the runtime itself;
+# the others build an OCI image that the runtime then converts.
+_SIF_BUILDERS = ("auto", "apptainer", "buildah", "podman", "docker")
+_OCI_BUILDERS = ("buildah", "podman", "docker")
+# Rootless OCI builder errors that mean no ``RUN`` step can work on this
+# host, as on hosts without /etc/subuid entries, rather than a task error.
+_OCI_RUN_FAILURE_MARKERS = (
+    "supplemental groups",
+    "/dev/net/tun",
+    "newuidmap",
+    "newgidmap",
+    "subuid",
+    "subgid",
 )
 # Without /etc/subuid, Apptainer's fakeroot wraps every instance exec in the
 # fakeroot(1) command, whose faked daemon exits with that exec. Processes the
@@ -1392,6 +1416,10 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     _fakeroot_unavailable_reasons: ClassVar[dict[str, str]] = {}
     # An explicit opt-out is explained once per process.
     _fakeroot_disabled_warned: ClassVar[bool] = False
+    # Builders that failed for a host reason, such as missing fakeroot or
+    # subuid support, keyed by executable; later builds in the process skip
+    # them instead of failing the same way for every task.
+    _unusable_builders: ClassVar[dict[str, str]] = {}
 
     def __init__(
         self,
@@ -1405,6 +1433,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         singularity_overlay: bool | int | str = True,
         singularity_no_mount: str | None = None,
         singularity_startup_timeout_sec: float = 300,
+        singularity_builder: str | None = None,
         **kwargs,
     ) -> None:
         if (
@@ -1468,6 +1497,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             else self._parse_bool("singularity_fakeroot", singularity_fakeroot)
         )
         self._fakeroot = self._fakeroot_setting
+        self._builder_setting = self._parse_builder(singularity_builder)
         self._overlay_enabled = singularity_overlay
         self._runtime_path: str | None = None
         # Resolved by ``_prepare_workdir`` at start, or on first use.
@@ -1526,6 +1556,18 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             if normalized in {"false", "0", "no"}:
                 return False
         raise ValueError(f"{name} must be true or false")
+
+    @staticmethod
+    def _parse_builder(value: str | None) -> str:
+        """Parse ``singularity_builder``; ``None`` reads the environment."""
+        if value is None:
+            value = os.environ.get("URSA_HARBOR_SIF_BUILDER") or "auto"
+        normalized = str(value).strip().lower()
+        if normalized not in _SIF_BUILDERS:
+            raise ValueError(
+                "singularity_builder must be one of " + ", ".join(_SIF_BUILDERS)
+            )
+        return normalized
 
     @staticmethod
     @override
@@ -1747,18 +1789,19 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         """Resolve task overrides and Dockerfile WORKDIR instructions.
 
         A pulled image, a Compose ``main.image`` or a prebuilt
-        ``docker_image`` without a Dockerfile, starts in ``/`` with a
-        warning; a task whose image uses another WORKDIR sets
-        ``[environment].workdir``. A prebuilt image that comes with its
-        Dockerfile takes the Dockerfile's WORKDIR. ``force_build`` is the
-        trial's, which decides whether the Dockerfile is built.
+        ``docker_image`` without a Dockerfile, starts in its config's
+        ``WorkingDir``, as under Docker. A prebuilt image that comes with
+        its Dockerfile takes the Dockerfile's WORKDIR. ``force_build`` is
+        the trial's, which decides whether the Dockerfile is built.
         """
         if self.task_env_config.workdir is not None:
             return self.task_env_config.workdir
         dockerfile_path = self._dockerfile_path
+        build_args: tuple[str, ...] = ()
+        target = None
         build = self._main_compose_build_inputs()
         if build is not None:
-            dockerfile_path = build[0]
+            dockerfile_path, _, build_args, target = build
         else:
             image = self._main_image(force_build)
             if image is not None and (
@@ -1768,27 +1811,33 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 return self._image_workdir(image)
             if not dockerfile_path.is_file():
                 return "/"
-        workdir = PurePosixPath("/")
-        for line in dockerfile_path.read_text().splitlines():
-            instruction = line.strip()
-            if instruction.upper().startswith("FROM "):
-                workdir = PurePosixPath("/")
-            elif instruction.upper().startswith("WORKDIR "):
-                value = line.split(None, 1)[1].strip()
-                if "$" in value:
-                    raise ValueError(
-                        "Singularity cannot resolve variables in Dockerfile "
-                        f"WORKDIR: {value}"
-                    )
-                path = PurePosixPath(value)
-                workdir = path if path.is_absolute() else workdir / path
-        return str(workdir)
+        # Every builder starts in the base image's WORKDIR, which matters
+        # for a relative WORKDIR and is looked up only then.
+        warnings: list[str] = []
+        workdir = dockerfile_workdir(
+            dockerfile_path.read_text(),
+            build_args=build_args,
+            target=target,
+            image_config=image_config,
+            warnings=warnings,
+        )
+        for warning in warnings:
+            self.logger.warning("%s: %s", dockerfile_path, warning)
+        return workdir
 
     def _image_workdir(self, image: str) -> str:
-        """Return the directory a pulled image's commands start in."""
+        """Return a pulled image's ``WorkingDir`` from its registry config."""
+        reference = image.removeprefix("docker://")
+        config = (
+            None
+            if "://" in reference
+            else image_config(reference, platform.machine())
+        )
+        if config is not None:
+            return config.get("WorkingDir") or "/"
         self.logger.warning(
-            "Cannot read the WORKDIR of %s; commands start in /. Set "
-            "[environment].workdir if it has another.",
+            "Cannot read the config of %s; commands start in / instead of "
+            "its WORKDIR. Set [environment].workdir if it has another.",
             image,
         )
         return "/"
@@ -1799,28 +1848,41 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         context_dir: Path,
         build_args: tuple[str, ...],
         target: str | None,
+        builder: str | None = None,
+        unread_configs: tuple[str, ...] = (),
     ) -> Path:
         dockerfile_path = dockerfile_path.resolve()
         context_dir = context_dir.resolve()
         digest = hashlib.sha256()
+        key: dict[str, Any] = {
+            "architecture": platform.machine(),
+            "build_args": build_args,
+            "microarchitecture": archspec.cpu.host().name,
+            "target": target,
+        }
+        # Definition builds are keyed apart from OCI builds, whose existing
+        # keys stay valid, and by the translator so its fixes rebuild.
+        # A build without a base image's config is keyed apart, so it never
+        # stands in for one with it.
+        if builder == "apptainer":
+            key["builder"] = builder
+            key["translator"] = DOCKERFILE_TRANSLATOR_VERSION
+            if unread_configs:
+                key["unread_configs"] = unread_configs
         digest.update(
-            json.dumps(
-                {
-                    "architecture": platform.machine(),
-                    "build_args": build_args,
-                    "microarchitecture": archspec.cpu.host().name,
-                    "target": target,
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode()
+            json.dumps(key, separators=(",", ":"), sort_keys=True).encode()
         )
         ignore_path = context_dir / ".dockerignore"
-        ignore = (
-            GitIgnoreSpec.from_lines(ignore_path.read_text().splitlines())
-            if ignore_path.is_file()
-            else None
-        )
+        # The translation copies exactly what Docker's matching keeps; OCI
+        # keys keep the gitignore matching they were made with.
+        ignored: Callable[[str], bool] | None = None
+        if ignore_path.is_file():
+            lines = ignore_path.read_text().splitlines()
+            ignored = (
+                DockerIgnore(lines).ignored
+                if builder == "apptainer"
+                else GitIgnoreSpec.from_lines(lines).match_file
+            )
         dockerfile_in_context = None
         with suppress(ValueError):
             dockerfile_in_context = dockerfile_path.relative_to(
@@ -1829,9 +1891,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         for path in sorted(context_dir.rglob("*")):
             relative = path.relative_to(context_dir).as_posix()
             if (
-                ignore is not None
+                ignored is not None
                 and relative not in {dockerfile_in_context, ".dockerignore"}
-                and ignore.match_file(relative)
+                and ignored(relative)
             ):
                 continue
             digest.update(relative.encode())
@@ -1853,6 +1915,8 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         context_dir: Path | None = None,
         build_args: tuple[str, ...] = (),
         target: str | None = None,
+        builder: str | None = None,
+        unread_configs: tuple[str, ...] = (),
     ) -> Path:
         return await asyncio.to_thread(
             self._dockerfile_cache_path_sync,
@@ -1860,6 +1924,8 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             context_dir or self.environment_dir,
             build_args,
             target,
+            builder,
+            unread_configs,
         )
 
     async def _is_valid_sif(self, path: Path) -> bool:
@@ -2197,6 +2263,178 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             finally:
                 temporary.unlink(missing_ok=True)
 
+    @staticmethod
+    def _last_build_output(path: Path) -> str:
+        """Return the output of the last failed command in a build log."""
+        try:
+            with path.open("rb") as log:
+                size = log.seek(0, os.SEEK_END)
+                log.seek(max(0, size - 256 * 1024))
+                text = log.read().decode(errors="replace")
+        except OSError:
+            return ""
+        block = text.rpartition("=== failed build command ===")[2]
+        return block.partition("--- output ---\n")[2]
+
+    def _dockerfile_builders(self) -> list[str]:
+        """Return the builders to try, in order.
+
+        ``apptainer`` stands for a definition-file build by the runtime
+        itself. With ``singularity_builder=auto`` it comes first when the
+        runtime is Apptainer: it needs no subuid range, without which
+        rootless Buildah and Podman cannot run any ``RUN`` step, and it costs
+        no failed build to find that out. SingularityCE keeps the OCI
+        builders. A builder that already failed for a host reason in this
+        process is skipped unless it was requested explicitly.
+        """
+        setting = self._builder_setting
+        builders = []
+        skipped = []
+        if setting in {"auto", "apptainer"}:
+            try:
+                runtime = self._instance_runtime()
+            except RuntimeError as exc:
+                reason: str | None = str(exc)
+            else:
+                reason = (
+                    self._unusable_builders.get(runtime)
+                    if _runtime_is_apptainer(runtime)
+                    else f"{runtime} is not Apptainer"
+                )
+            if reason is None:
+                builders.append("apptainer")
+            elif setting == "apptainer":
+                raise RuntimeError(
+                    f"singularity_builder=apptainer cannot build: {reason}"
+                )
+            elif "is not Apptainer" not in reason:
+                skipped.append(f"apptainer: {reason}")
+        for name in _OCI_BUILDERS:
+            if setting not in {"auto", name}:
+                continue
+            builder = shutil.which(name)
+            if builder is None:
+                continue
+            reason = self._unusable_builders.get(builder)
+            if reason is not None and setting == "auto":
+                skipped.append(f"{name}: {reason}")
+                continue
+            builders.append(builder)
+        if not builders:
+            needed = (
+                "Apptainer, buildah, podman, or docker"
+                if setting == "auto"
+                else setting
+            )
+            detail = f" ({'; '.join(skipped)})" if skipped else ""
+            raise RuntimeError(
+                f"Building a Dockerfile for Singularity requires {needed}"
+                f"{detail}"
+            )
+        return builders
+
+    def _note_unusable_builder(
+        self, builder: str, build_log_path: Path
+    ) -> None:
+        """Skip a builder for the rest of the process after a host failure."""
+        output = self._last_build_output(build_log_path)
+        if builder == "apptainer":
+            key = self._instance_runtime()
+            markers = _FAKEROOT_FAILURE_MARKERS
+            lines = [line for line in output.splitlines() if "FATAL" in line]
+        else:
+            key = builder
+            markers = _OCI_RUN_FAILURE_MARKERS
+            lines = [
+                line for line in output.splitlines() if "error" in line.lower()
+            ]
+        reason = next(
+            (
+                line.strip()
+                for line in lines
+                if any(marker in line.lower() for marker in markers)
+            ),
+            None,
+        )
+        if reason is not None and key not in self._unusable_builders:
+            self._unusable_builders[key] = reason
+            self.logger.warning(
+                "Not using %s for later builds in this process: %s",
+                Path(builder).name,
+                reason,
+            )
+
+    async def _build_with_apptainer(
+        self,
+        definition: Definition,
+        output: Path,
+        temporary: Path,
+        context_dir: Path,
+        build_log_path: Path,
+    ) -> None:
+        """Build a translated Dockerfile with ``apptainer build --fakeroot``."""
+        runtime = self._instance_runtime()
+        for note in definition.notes:
+            self.logger.debug("Dockerfile translation: %s", note)
+        for warning in definition.warnings:
+            self.logger.warning("Dockerfile translation: %s", warning)
+        # Binds from the caller's environment would also apply to %post.
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if re.fullmatch(
+                r"(APPTAINER|SINGULARITY)_(BIND|BINDPATH|MOUNT)", key
+            )
+            is None
+        }
+        options = ["--fakeroot"] if os.geteuid() != 0 else []
+        temporary.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ursa-harbor-def-") as staging:
+            try:
+                definition_path = await asyncio.to_thread(
+                    definition.write, Path(staging)
+                )
+            except (OSError, tarfile.TarError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Could not stage the Apptainer build: {exc}"
+                ) from exc
+
+            async def build(*extra: str) -> None:
+                await self._run(
+                    runtime,
+                    "build",
+                    *options,
+                    *extra,
+                    str(temporary),
+                    str(definition_path),
+                    cwd=context_dir,
+                    env=environment,
+                    failure_log_path=build_log_path,
+                )
+
+            try:
+                try:
+                    await build()
+                except RuntimeError:
+                    failure = self._last_build_output(build_log_path)
+                    if not options or not any(
+                        marker in failure
+                        for marker in _FAKEROOT_COMMAND_FAILURE_MARKERS
+                    ):
+                        raise
+                    # A root-mapped user namespace alone still runs package
+                    # managers that do not drop privileges, such as apk.
+                    self.logger.warning(
+                        "The host's fakeroot command cannot run in %s; "
+                        "retrying with --ignore-fakeroot-command",
+                        definition.stages[-1].image,
+                    )
+                    temporary.unlink(missing_ok=True)
+                    await build("--ignore-fakeroot-command")
+                temporary.replace(output)
+            finally:
+                temporary.unlink(missing_ok=True)
+
     async def _build_dockerfile_sif(
         self,
         force_build: bool,
@@ -2208,61 +2446,122 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     ) -> Path:
         dockerfile_path = dockerfile_path or self._dockerfile_path
         context_dir = context_dir or self.environment_dir
-        output = await self._dockerfile_cache_path(
-            dockerfile_path, context_dir, build_args, target
-        )
+        inputs = (dockerfile_path, context_dir, build_args, target)
+        setting = self._builder_setting
+        # Definition and OCI builds are cached apart. Either one is reused
+        # before any builder is looked up, so a SIF built elsewhere, say on
+        # a login node, also serves a node without that builder.
+        apptainer_path = oci_path = None
+        if setting in {"auto", "apptainer"}:
+            apptainer_path = await self._dockerfile_cache_path(
+                *inputs, builder="apptainer"
+            )
+        if setting != "apptainer":
+            oci_path = await self._dockerfile_cache_path(*inputs)
         self._image_cache_dir.mkdir(parents=True, exist_ok=True)
-        if not force_build and await self._is_valid_sif(output):
-            return output
-        async with AsyncFileLock(output.with_suffix(".lock")):
-            if not force_build and await self._is_valid_sif(output):
-                return output
-            builders = [
-                builder
-                for name in ("buildah", "podman", "docker")
-                if (builder := shutil.which(name)) is not None
-            ]
-            if not builders:
-                raise RuntimeError(
-                    "Building a Dockerfile for Singularity requires buildah, "
-                    "podman, or docker"
+        if not force_build:
+            for output in (apptainer_path, oci_path):
+                if output is not None and await self._is_valid_sif(output):
+                    return output
+        builders = self._dockerfile_builders()
+        oci_builders = [b for b in builders if b != "apptainer"]
+        definition = None
+        if "apptainer" in builders:
+            # Translate first, so an unsupported Dockerfile fails or falls
+            # back before any command runs.
+            try:
+                definition = await asyncio.to_thread(
+                    translate_dockerfile,
+                    dockerfile_path,
+                    context_dir,
+                    build_args=build_args,
+                    target=target,
+                    image_config=image_config,
                 )
-            temporary = output.with_suffix(".tmp.sif")
-            build_log_path = output.with_suffix(".build.log")
-            build_log_path.unlink(missing_ok=True)
-            failures = []
-            for builder in builders:
-                try:
-                    await self._build_with(
-                        builder,
-                        output,
-                        temporary,
-                        force_build,
-                        dockerfile_path,
-                        context_dir,
-                        build_args,
-                        target,
-                        build_log_path,
+            except DockerfileUnsupported as exc:
+                if not oci_builders:
+                    raise RuntimeError(
+                        f"Apptainer cannot build this Dockerfile: {exc}"
+                    ) from exc
+                self.logger.info(
+                    "Building with an OCI builder instead of Apptainer: %s",
+                    exc,
+                )
+            else:
+                if definition.unread_configs:
+                    apptainer_path = await self._dockerfile_cache_path(
+                        *inputs,
+                        builder="apptainer",
+                        unread_configs=tuple(definition.unread_configs),
                     )
+        groups: list[tuple[Path, list[str]]] = []
+        if definition is not None and apptainer_path is not None:
+            groups.append((apptainer_path, ["apptainer"]))
+        if oci_builders and oci_path is not None:
+            groups.append((oci_path, oci_builders))
+        failures = []
+        failed_logs: list[Path] = []
+        for output, group in groups:
+            async with AsyncFileLock(output.with_suffix(".lock")):
+                if not force_build and await self._is_valid_sif(output):
+                    return output
+                temporary = output.with_suffix(".tmp.sif")
+                build_log_path = output.with_suffix(".build.log")
+                build_log_path.unlink(missing_ok=True)
+                # Every attempt appends to the same log; name it once at the
+                # end.
+                attempt_log_note = f"\nBuild log: {build_log_path.absolute()}"
+                for builder in group:
+                    try:
+                        if builder == "apptainer":
+                            assert definition is not None
+                            await self._build_with_apptainer(
+                                definition,
+                                output,
+                                temporary,
+                                context_dir,
+                                build_log_path,
+                            )
+                        else:
+                            await self._build_with(
+                                builder,
+                                output,
+                                temporary,
+                                force_build,
+                                dockerfile_path,
+                                context_dir,
+                                build_args,
+                                target,
+                                build_log_path,
+                            )
+                    except RuntimeError as exc:
+                        failures.append(str(exc).replace(attempt_log_note, ""))
+                        self._note_unusable_builder(builder, build_log_path)
+                        continue
                     build_log_path.unlink(missing_ok=True)
                     return output
-                except RuntimeError as exc:
-                    failures.append(str(exc))
-            log_note = (
-                f" Build log: {build_log_path.absolute()}"
-                if build_log_path.is_file()
-                else ""
-            )
-            if build_log_path.is_file():
-                self._surface_build_log(build_log_path)
-                with suppress(OSError):
-                    with build_log_path.open(errors="replace") as log:
-                        self._warn_root_failure(log)
-            raise RuntimeError(
-                "No container builder succeeded: "
-                + "; ".join(failures)
-                + log_note
-            )
+                if build_log_path.is_file():
+                    failed_logs.append(build_log_path)
+                if group == ["apptainer"] and len(groups) > 1:
+                    # Keep this log even if an OCI builder succeeds, since
+                    # it may show a translation problem.
+                    self.logger.warning(
+                        "Apptainer could not build %s; trying OCI builders. "
+                        "Build log: %s",
+                        dockerfile_path,
+                        build_log_path.absolute(),
+                    )
+        for path in failed_logs:
+            self._surface_build_log(path)
+            with suppress(OSError):
+                with path.open(errors="replace") as log:
+                    self._warn_root_failure(log)
+        log_note = "".join(
+            f" Build log: {path.absolute()}" for path in failed_logs
+        )
+        raise RuntimeError(
+            "No container builder succeeded: " + "; ".join(failures) + log_note
+        )
 
     def _compose_key(self, service: str) -> str:
         identity = getattr(

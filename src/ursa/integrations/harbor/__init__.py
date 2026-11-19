@@ -1296,6 +1296,16 @@ def prebuild_sifs(
             help="Match the fakeroot setting used by later runs (default: runtime-dependent)",
         ),
     ] = None,
+    builder: Annotated[
+        str | None,
+        typer.Option(
+            "--builder",
+            help=(
+                "Dockerfile builder: auto, apptainer, buildah, podman, or "
+                "docker (default: URSA_HARBOR_SIF_BUILDER or auto)"
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Cache task/verifier images and optionally complete agent install layers."""
     from harbor.cli.utils import parse_kwargs
@@ -1326,6 +1336,7 @@ def prebuild_sifs(
                     agent_cache_dir=agent_cache_dir,
                     agent_install_timeout_sec=agent_install_timeout_sec,
                     fakeroot=fakeroot,
+                    builder=builder,
                 )
             except Exception as exc:
                 failures += 1

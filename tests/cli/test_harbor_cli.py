@@ -130,6 +130,37 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
     assert paths == [cache / "environment.sif", cache / "tests.sif"]
 
 
+@pytest.mark.parametrize(
+    ("builder", "environ", "expected"),
+    [
+        (None, None, "auto"),
+        (None, "buildah", "buildah"),
+        ("docker", None, "docker"),
+    ],
+)
+async def test_prebuild_uses_the_requested_dockerfile_builder(
+    tmp_path, monkeypatch, builder, environ, expected
+):
+    # Prebuilt Dockerfile SIFs are keyed by builder group, so every task and
+    # verifier environment must use the builder later runs use.
+    task = _task(tmp_path)
+    if environ is None:
+        monkeypatch.delenv("URSA_HARBOR_SIF_BUILDER", raising=False)
+    else:
+        monkeypatch.setenv("URSA_HARBOR_SIF_BUILDER", environ)
+    settings: list[str] = []
+
+    async def build(self, force_build=False, *, refresh=False):
+        settings.append(self._builder_setting)
+        return []
+
+    monkeypatch.setattr(DockerfileSingularityEnvironment, "build_sifs", build)
+
+    await prebuild_harbor_task(task, builder=builder)
+
+    assert settings == [expected, expected]
+
+
 async def test_prebuild_accepts_force_build_as_a_deprecated_refresh(
     tmp_path, monkeypatch
 ):
@@ -146,6 +177,11 @@ async def test_prebuild_accepts_force_build_as_a_deprecated_refresh(
         await prebuild_harbor_task(_task(tmp_path), force_build=True)
 
     assert refreshes == [True, True]
+
+
+async def test_prebuild_rejects_an_unknown_dockerfile_builder(tmp_path):
+    with pytest.raises(ValueError, match="singularity_builder must be one of"):
+        await prebuild_harbor_task(_task(tmp_path), builder="kaniko")
 
 
 async def test_prebuild_pulls_prebuilt_image_for_agent_and_verifier(
@@ -315,6 +351,8 @@ def test_harbor_prebuild_command_reports_built_sifs(
             "--agent-install-timeout-sec",
             "900",
             "--no-fakeroot",
+            "--builder",
+            "buildah",
             *(argument for agent in agents for argument in ("--agent", agent)),
             str(task),
         ],
@@ -332,6 +370,7 @@ def test_harbor_prebuild_command_reports_built_sifs(
                 "agent_cache_dir": tmp_path / "agents",
                 "agent_install_timeout_sec": 900,
                 "fakeroot": False,
+                "builder": "buildah",
             },
         )
     ]
