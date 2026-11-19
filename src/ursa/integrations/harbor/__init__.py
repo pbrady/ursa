@@ -1250,7 +1250,7 @@ def prebuild_sifs(
         bool,
         typer.Option(
             "--force",
-            help="Rebuild cached SIFs and selected agent install layers",
+            help="Rebuild or re-pull cached SIFs and rebuild selected agent install layers",
         ),
     ] = False,
     image_cache_dir: Annotated[
@@ -1319,7 +1319,7 @@ def prebuild_sifs(
                     )
                 built = await prebuild_harbor_task(
                     task,
-                    force_build=force,
+                    refresh=force,
                     image_cache_dir=image_cache_dir,
                     agents=agents or (),
                     agent_kwargs=install_kwargs,

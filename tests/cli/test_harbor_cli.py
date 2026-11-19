@@ -105,18 +105,22 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
     async def build(
         self: DockerfileSingularityEnvironment,
         force_build: bool = False,
+        *,
+        refresh: bool = False,
     ) -> list[Path]:
+        # A refresh never becomes Harbor's force_build.
+        assert not force_build
         observed.append((
             self.environment_dir,
             self._image_cache_dir,
-            force_build,
+            refresh,
         ))
         return [cache / f"{self.environment_dir.name}.sif"]
 
     monkeypatch.setattr(DockerfileSingularityEnvironment, "build_sifs", build)
 
     paths = await prebuild_harbor_task(
-        task, force_build=True, image_cache_dir=cache
+        task, refresh=True, image_cache_dir=cache
     )
 
     assert observed == [
@@ -124,6 +128,63 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
         (task / "tests", cache, True),
     ]
     assert paths == [cache / "environment.sif", cache / "tests.sif"]
+
+
+async def test_prebuild_accepts_force_build_as_a_deprecated_refresh(
+    tmp_path, monkeypatch
+):
+    refreshes: list[bool] = []
+
+    async def build(self, force_build=False, *, refresh=False):
+        assert force_build is False
+        refreshes.append(refresh)
+        return []
+
+    monkeypatch.setattr(DockerfileSingularityEnvironment, "build_sifs", build)
+
+    with pytest.warns(DeprecationWarning, match="use refresh"):
+        await prebuild_harbor_task(_task(tmp_path), force_build=True)
+
+    assert refreshes == [True, True]
+
+
+async def test_prebuild_pulls_prebuilt_image_for_agent_and_verifier(
+    tmp_path, monkeypatch
+):
+    # Without tests/Dockerfile the separate verifier reuses the task
+    # environment and its docker_image, so nothing needs a Dockerfile.
+    task = _task(
+        tmp_path,
+        _TASK_TOML.replace(
+            "[environment]", '[environment]\ndocker_image = "example/task:1"'
+        ),
+    )
+    (task / "environment" / "Dockerfile").unlink()
+    (task / "tests" / "Dockerfile").unlink()
+    (task / "tests" / "test.sh").write_text("#!/bin/sh\n")
+    cache = tmp_path / "cache"
+    pulls = []
+
+    async def pull(self, image, force_build):
+        pulls.append((image, force_build))
+        return cache / "task.sif"
+
+    async def build(self, force_build, **kwargs):
+        pytest.fail("a prebuilt image must not be built")
+
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_pull_image_sif", pull
+    )
+    monkeypatch.setattr(
+        DockerfileSingularityEnvironment, "_build_dockerfile_sif", build
+    )
+
+    paths = await prebuild_harbor_task(
+        task, refresh=True, image_cache_dir=cache
+    )
+
+    assert pulls == [("example/task:1", True), ("example/task:1", True)]
+    assert paths == [cache / "task.sif"]
 
 
 def test_separate_verifier_without_tests_image_uses_task_environment(
@@ -179,6 +240,9 @@ async def test_prebuild_includes_image_only_agent_and_verifier_services(
         (task / name / "docker-compose.yaml").write_text(
             yaml.safe_dump({"services": services})
         )
+    # With a Dockerfile to build, Harbor would build the verifier's main
+    # service; without one its image is pulled.
+    (task / "tests" / "Dockerfile").unlink()
     pulls, builds = [], []
 
     async def pull(self, image, force_build):
@@ -197,7 +261,7 @@ async def test_prebuild_includes_image_only_agent_and_verifier_services(
         DockerfileSingularityEnvironment, "_build_dockerfile_sif", build
     )
     paths = await prebuild_harbor_task(
-        task, force_build=force, image_cache_dir=cache
+        task, refresh=force, image_cache_dir=cache
     )
 
     assert set(pulls) == {
@@ -228,11 +292,11 @@ def test_harbor_prebuild_command_reports_built_sifs(
     async def build(
         task_dir: Path,
         *,
-        force_build: bool,
+        refresh: bool,
         image_cache_dir: Path | None,
         **kwargs,
     ) -> list[Path]:
-        observed.append((task_dir, force_build, image_cache_dir, kwargs))
+        observed.append((task_dir, refresh, image_cache_dir, kwargs))
         return [cache / "agent.sif", cache / "verifier.sif"]
 
     monkeypatch.setattr(
@@ -281,8 +345,9 @@ async def test_prebuild_builds_agent_layers_after_all_task_images(
     task = _task(tmp_path)
     events = []
 
-    async def build(self, force_build=False):
-        events.append(("image", self.environment_dir.name, force_build))
+    async def build(self, force_build=False, *, refresh=False):
+        assert not force_build
+        events.append(("image", self.environment_dir.name, refresh))
         return [tmp_path / f"{self.environment_dir.name}.sif"]
 
     async def layer(template, spec, **kwargs):
@@ -299,7 +364,7 @@ async def test_prebuild_builds_agent_layers_after_all_task_images(
     )
     await prebuild_harbor_task(
         task,
-        force_build=True,
+        refresh=True,
         agents=["goose@v1.2.3", "codex", "goose@v1.2.3"],
         agent_cache_dir=tmp_path / "agents",
         fakeroot=False,

@@ -45,6 +45,7 @@ from harbor.environments.compose_service_ops import (
     ComposeServiceOpsMixin,
     ComposeServiceTransport,
 )
+from harbor.environments.definition import should_use_prebuilt_docker_image
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import (
     NetworkMode,
@@ -863,6 +864,8 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._fakeroot = singularity_fakeroot
         self._overlay_enabled = singularity_overlay
         self._runtime_path: str | None = None
+        # Resolved by ``_prepare_workdir`` at start, or on first use.
+        self._resolved_workdir: str | None = None
         super().__init__(*args, **kwargs)
         self._startup_timeout_sec = singularity_startup_timeout_sec
         self._lifecycle_lock = asyncio.Lock()
@@ -874,7 +877,6 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._runtime_workdir_root: Path | None = None
         self._sif_path: Path | None = None
         self._overlay_path: Path | None = None
-        self._workdir = self._resolve_workdir()
         identity = hashlib.sha256(self.session_id.encode()).hexdigest()[:16]
         self._instance_name = f"ursa{identity}{secrets.token_hex(4)}"
         self._compose_identity = f"{identity[:8]}{secrets.token_hex(4)}"
@@ -1048,6 +1050,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         main = config["services"]["main"] if config is not None else {}
         if (
             not ({"build", "image"} & set(main))
+            and not self.task_env_config.docker_image
             and not self._dockerfile_path.is_file()
         ):
             raise FileNotFoundError(
@@ -1065,24 +1068,48 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     def _load_compose_config(self) -> dict[str, Any]:
         return _load_docker_compose(self._compose_paths())
 
-    def _resolve_workdir(self) -> str:
-        """Resolve task overrides and Dockerfile WORKDIR instructions."""
+    @property
+    def _workdir(self) -> str:
+        """The directory commands start in; see ``_resolve_workdir``."""
+        if self._resolved_workdir is None:
+            self._resolved_workdir = self._resolve_workdir(force_build=False)
+        return self._resolved_workdir
+
+    @_workdir.setter
+    def _workdir(self, value: str | None) -> None:
+        self._resolved_workdir = value
+
+    async def _prepare_workdir(self, force_build: bool) -> None:
+        """Resolve the workdir for this start without blocking the loop."""
+        self._resolved_workdir = await asyncio.to_thread(
+            self._resolve_workdir, force_build
+        )
+
+    def _resolve_workdir(self, force_build: bool) -> str:
+        """Resolve task overrides and Dockerfile WORKDIR instructions.
+
+        A pulled image, a Compose ``main.image`` or a prebuilt
+        ``docker_image`` without a Dockerfile, starts in ``/`` with a
+        warning; a task whose image uses another WORKDIR sets
+        ``[environment].workdir``. A prebuilt image that comes with its
+        Dockerfile takes the Dockerfile's WORKDIR. ``force_build`` is the
+        trial's, which decides whether the Dockerfile is built.
+        """
         if self.task_env_config.workdir is not None:
             return self.task_env_config.workdir
         dockerfile_path = self._dockerfile_path
         build = self._main_compose_build_inputs()
         if build is not None:
             dockerfile_path = build[0]
-        elif (
-            self._uses_compose
-            and "image" in self._load_compose_config()["services"]["main"]
-        ):
-            raise ValueError(
-                "Singularity cannot determine the WORKDIR for a Compose "
-                "main image; set [environment].workdir"
-            )
-        elif not dockerfile_path.is_file():
-            return "/"
+        else:
+            image = self._main_image(force_build)
+            if image is not None and (
+                image == self._compose_main_image()
+                or not dockerfile_path.is_file()
+            ):
+                return self._image_workdir(image)
+            if not dockerfile_path.is_file():
+                return "/"
         workdir = PurePosixPath("/")
         for line in dockerfile_path.read_text().splitlines():
             instruction = line.strip()
@@ -1098,6 +1125,15 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 path = PurePosixPath(value)
                 workdir = path if path.is_absolute() else workdir / path
         return str(workdir)
+
+    def _image_workdir(self, image: str) -> str:
+        """Return the directory a pulled image's commands start in."""
+        self.logger.warning(
+            "Cannot read the WORKDIR of %s; commands start in /. Set "
+            "[environment].workdir if it has another.",
+            image,
+        )
+        return "/"
 
     def _dockerfile_cache_path_sync(
         self,
@@ -1205,6 +1241,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
     async def _mark_sif_in_use(self, path: Path) -> None:
         """Refresh a cached SIF and record this environment as a user."""
+        if not path.is_relative_to(self._image_cache_dir):
+            # A task's own local SIF file is not part of the cache.
+            return
         present = True if path not in self._sifs_in_use else None
         await self._set_sif_in_use(path, present=present, touch=True)
         if present:
@@ -1575,6 +1614,16 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         return image if "://" in image else f"docker://{image}"
 
     async def _pull_image_sif(self, image: str, force_build: bool) -> Path:
+        """Pull an image into the SIF cache, or use a local ``*.sif`` file."""
+        if (
+            isinstance(image, str)
+            and "://" not in image
+            and image.endswith(".sif")
+        ):
+            path = Path(image).expanduser()
+            if not await self._is_valid_sif(path):
+                raise FileNotFoundError(f"Singularity image not found: {path}")
+            return path
         image = self._image_uri(image)
         digest = hashlib.sha256(
             json.dumps([platform.machine(), image]).encode()
@@ -1644,42 +1693,81 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             target=target,
         )
 
-    async def _build_main_sif(self, force_build: bool) -> Path:
-        build = self._main_compose_build_inputs()
-        if build is None and self._uses_compose:
-            main = self._load_compose_config()["services"]["main"]
-            if "image" in main:
-                return await self._pull_image_sif(main["image"], force_build)
-        if build is None:
-            return await self._build_dockerfile_sif(force_build)
-        return await self._build_sif(build, force_build)
+    def _compose_main_image(self) -> str | None:
+        """Return the Compose ``main.image`` when main has no build section."""
+        if not self._uses_compose:
+            return None
+        main = self._load_compose_config()["services"]["main"]
+        return None if "build" in main else main.get("image")
 
-    async def build_sifs(self, force_build: bool = False) -> list[Path]:
-        """Build or pull all environment and Compose SIFs without starting them."""
-        force_build = force_build or self._force_pull
-        main_path = await self._build_main_sif(force_build)
+    def _prebuilt_image(self, force_build: bool) -> str | None:
+        """Return the task's ``docker_image`` when Harbor would pull it."""
+        image = self.task_env_config.docker_image
+        if not should_use_prebuilt_docker_image(
+            self.environment_dir, docker_image=image, force_build=force_build
+        ):
+            return None
+        return image
+
+    def _main_image(self, force_build: bool) -> str | None:
+        """Return the image the main SIF is pulled from, or None to build it.
+
+        As with Harbor's Docker backend, the task's prebuilt ``docker_image``
+        wins over the Dockerfile unless the trial forces a build, and a
+        Compose ``main.image`` replaces that prebuilt image. When Harbor
+        would build, ``main.image`` only names the built image, so it is
+        pulled only if there is no Dockerfile to build.
+        """
+        prebuilt = self._prebuilt_image(force_build)
+        image = self._compose_main_image()
+        if image is not None and (
+            prebuilt is not None or not self._dockerfile_path.is_file()
+        ):
+            return image
+        return prebuilt
+
+    async def _build_main_sif(
+        self, force_build: bool, *, refresh: bool = False
+    ) -> Path:
+        # ``refresh`` and ``singularity_force_pull`` rebuild or re-pull the
+        # cached SIF but never turn a prebuilt-image task into a build.
+        refresh = force_build or refresh or self._force_pull
+        image = self._main_image(force_build)
+        if image is not None:
+            return await self._pull_image_sif(image, refresh)
+        build = self._main_compose_build_inputs()
+        if build is None:
+            return await self._build_dockerfile_sif(refresh)
+        return await self._build_sif(build, refresh)
+
+    async def build_sifs(
+        self, force_build: bool = False, *, refresh: bool = False
+    ) -> list[Path]:
+        """Build or pull all environment and Compose SIFs without starting them.
+
+        ``force_build`` has Harbor's meaning and can switch a prebuilt-image
+        task to a Dockerfile build. ``refresh`` only rebuilds or re-pulls the
+        SIFs that a trial without ``--force-build`` would use.
+        """
+        main_path = await self._build_main_sif(force_build, refresh=refresh)
         paths = [main_path]
         if not self._uses_compose:
             return paths
 
+        refresh = force_build or refresh or self._force_pull
         compose_config = self._load_compose_config()
-        main_build = self._main_compose_build_inputs()
-        if (
-            main_build is None
-            and "image" not in compose_config["services"]["main"]
-        ):
-            main_build = (
+        main_image = self._main_image(force_build)
+        main_build = None
+        if main_image is None:
+            main_build = self._main_compose_build_inputs() or (
                 self._dockerfile_path,
                 self.environment_dir,
                 (),
                 None,
             )
         seen_builds = {main_build} if main_build is not None else set()
-        main_image = compose_config["services"]["main"].get("image")
         seen_images = (
-            {self._image_uri(main_image)}
-            if main_build is None and main_image is not None
-            else set()
+            {self._image_uri(main_image)} if main_image is not None else set()
         )
         for name, service in compose_config["services"].items():
             if name == "main":
@@ -1689,13 +1777,13 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 if build in seen_builds:
                     continue
                 seen_builds.add(build)
-                path = await self._build_sif(build, force_build)
+                path = await self._build_sif(build, refresh)
             else:
                 image = self._image_uri(service["image"])
                 if image in seen_images:
                     continue
                 seen_images.add(image)
-                path = await self._pull_image_sif(image, force_build)
+                path = await self._pull_image_sif(service["image"], refresh)
             if path not in paths:
                 paths.append(path)
         return paths
@@ -2527,8 +2615,8 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     async def _start(self, force_build: bool) -> None:
         if sys.platform == "win32":
             raise RuntimeError("Singularity is unavailable on Windows")
-        force_build = force_build or self._force_pull
         try:
+            await self._prepare_workdir(force_build)
             self._sif_path = await self._build_main_sif(force_build)
             if self._sif_path is not None:
                 await self._mark_sif_in_use(self._sif_path)
@@ -2555,7 +2643,10 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 self._prepare_harbor_bind_sources()
                 await self._seed_harbor_bind_sources()
                 if self._uses_compose:
-                    await self._prepare_compose_project(force_build)
+                    # A forced pull also refreshes the sidecar SIFs.
+                    await self._prepare_compose_project(
+                        force_build or self._force_pull
+                    )
                 await self._start_prepared_runtime(self._network_policy)
             await self.ensure_dirs(self._mount_targets(writable_only=True))
             await self._upload_environment_dir_after_start()

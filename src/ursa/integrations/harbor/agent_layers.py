@@ -173,7 +173,9 @@ class _InstallEnvironment(DockerfileSingularityEnvironment):
         if not self._base_image.is_file():
             raise FileNotFoundError(self._base_image)
 
-    async def _build_main_sif(self, force_build: bool) -> Path:
+    async def _build_main_sif(
+        self, force_build: bool, *, refresh: bool = False
+    ) -> Path:
         return self._base_image
 
     def _harbor_writable_binds(self):

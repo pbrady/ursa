@@ -121,6 +121,16 @@ or `~/.cache/ursa/harbor/sif`; concurrent builds share a lock. Set
 `singularity_image_cache_dir`, or use `prebuild --image-cache-dir` to choose a
 shared cache.
 
+As with Harbor's Docker backend, a task's prebuilt `[environment].docker_image`
+is pulled instead of building the Dockerfile; Harbor's `--force-build` builds
+the Dockerfile when one exists. A Compose `main.image` replaces that prebuilt
+image, and without a prebuilt image it is pulled only when there is no
+Dockerfile to build. A `docker_image` ending in `.sif` (with no `://` scheme)
+is used directly as a local SIF file. Pulled images are cached by reference, so
+a moving tag such as `latest` is fetched again only when refreshed:
+`--environment-kwarg singularity_force_pull=true` re-pulls (and rebuilds) the
+cached SIFs without turning a prebuilt-image task into a build.
+
 `singularity_fakeroot` defaults to `None`: fakeroot is enabled with Apptainer
 and disabled with Singularity. Passing
 `--environment-kwarg singularity_fakeroot=true` or
@@ -146,7 +156,9 @@ uv run -m ursa.integrations.harbor prebuild benchmark/tasks
 Prebuild includes separate verifier environments and every Compose service:
 Dockerfile builds are built, and `image:` references are fetched as local SIFs.
 Runs reuse these files from the same cache without contacting the registry.
-Use `prebuild --force` to rebuild Dockerfiles and refresh fetched images.
+Use `prebuild --force` to rebuild Dockerfiles and refresh fetched images; it
+refreshes the SIFs a trial without `--force-build` uses, so a prebuilt
+`docker_image` is re-pulled rather than built.
 
 ### Agent install layers
 
@@ -324,8 +336,12 @@ stdlib bridge; a cached URSA installation's interpreter is also supported.
 The proxy socket lives in a private directory and is removed on cleanup.
 
 Set `[environment].workdir` when a Dockerfile has a variable or inherited
-non-root `WORKDIR`, or when Compose uses an image for its `main` service; the
-adapter rejects unresolved workdirs before launch.
+non-root `WORKDIR`; the adapter rejects unresolved workdirs before launch. A
+pulled Compose `main.image`, or a prebuilt `docker_image` without a Dockerfile,
+starts in `/` with a warning unless `[environment].workdir` says otherwise. A
+prebuilt image that ships with its Dockerfile uses that Dockerfile's `WORKDIR`.
+Workdirs are resolved when the trial starts, for the image it uses: with
+`--force-build`, the Dockerfile's.
 
 To verify the integrated lifecycle with an existing Python-enabled SIF, run:
 

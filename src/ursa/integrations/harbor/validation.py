@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -170,19 +171,32 @@ def validate_harbor_task(task_dir: Path | str) -> None:
 async def prebuild_harbor_task(
     task_dir: Path | str,
     *,
-    force_build: bool = False,
+    refresh: bool = False,
     image_cache_dir: Path | str | None = None,
     agents: Sequence[str] = (),
     agent_kwargs: dict | None = None,
     agent_cache_dir: Path | str | None = None,
     agent_install_timeout_sec: float = 1800,
     fakeroot: bool | None = None,
+    force_build: bool | None = None,
 ) -> list[Path]:
     """Cache task/verifier SIFs and optionally build complete agent install layers.
+
+    The SIFs are the ones a trial without ``--force-build`` uses, so
+    ``refresh`` rebuilds or re-pulls them (and the agent layers) without
+    switching a prebuilt-image task to a Dockerfile build.
+    ``force_build`` is a deprecated alias for ``refresh``.
 
     Each NAME[@VERSION] installer runs in a fresh disposable task environment.
     Only the completed install overlay survives; no inference or verification runs.
     """
+    if force_build is not None:
+        warnings.warn(
+            "prebuild_harbor_task(force_build=...) is deprecated; use refresh",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        refresh = refresh or force_build
     if (
         not math.isfinite(agent_install_timeout_sec)
         or agent_install_timeout_sec <= 0
@@ -201,7 +215,7 @@ async def prebuild_harbor_task(
     )
     for environment in environments:
         paths.update(
-            dict.fromkeys(await environment.build_sifs(force_build=force_build))
+            dict.fromkeys(await environment.build_sifs(refresh=refresh))
         )
     template = environments[0]
     template._agent_kwargs = agent_kwargs or {}
@@ -213,7 +227,7 @@ async def prebuild_harbor_task(
         await build_agent_layer(
             template,
             spec,
-            force=force_build,
+            force=refresh,
             timeout_sec=agent_install_timeout_sec,
         )
     return list(paths)
