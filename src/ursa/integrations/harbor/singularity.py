@@ -32,7 +32,7 @@ from contextlib import AsyncExitStack, contextmanager, suppress
 from copy import deepcopy
 from functools import cache, partial
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, cast, override
+from typing import Any, BinaryIO, ClassVar, NoReturn, cast, override
 from urllib.parse import urlsplit
 
 import archspec.cpu
@@ -99,8 +99,46 @@ _COMPOSE_BRIDGE_REQUIREMENT = (
     "invoking user, or root (or Docker): an unprivileged Apptainer gives "
     "non-root users only --network none."
 )
+# Runtime diagnostics that mean ``--fakeroot`` itself is unusable, as opposed
+# to an unrelated probe failure such as a pull error or a broken image.
+_FAKEROOT_FAILURE_MARKERS = (
+    "fakeroot",
+    "subuid",
+    "subgid",
+    "user namespace",
+    "uid map",
+    "gid map",
+    "newuidmap",
+    "newgidmap",
+)
+# Apptainer's root-mapped fakeroot bind-mounts the host's fakeroot(1) into
+# builds and containers; it cannot load in images with an older glibc than
+# the host's, or with musl. Such a failure is about the image, not the host,
+# and ``--ignore-fakeroot-command`` avoids it.
+_FAKEROOT_COMMAND_FAILURE_MARKERS = (
+    "error while starting the `faked' daemon",
+    "required by /.singularity.d/libs/libfakeroot",
+)
 _warned_unset_compose_variables: set[str] = set()
 _logger = logging.getLogger(__name__)
+
+
+@cache
+def _runtime_is_apptainer(runtime: str) -> bool:
+    """Detect Apptainer, including through a ``singularity`` alias."""
+    if Path(runtime).name == "apptainer":
+        return True
+    try:
+        result = subprocess.run(
+            [runtime, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.stdout.strip().lower().startswith("apptainer")
 
 
 def _host_ca_certificates_pem() -> str:
@@ -877,6 +915,7 @@ async def docker_compose_to_singularity_compose(
     main_mounts: Sequence[Mapping[str, Any]] = (),
     network_mode: NetworkMode = NetworkMode.PUBLIC,
     fakeroot: bool | None = None,
+    ignore_fakeroot_command: bool = False,
     main_agent_layer: Path | None = None,
     main_overlay: Path | None = None,
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
@@ -885,12 +924,12 @@ async def docker_compose_to_singularity_compose(
     """Convert one or more Docker Compose files into a singularity-compose file.
 
     ``interpolation_environment`` supplies the Compose variables and defaults
-    to the host environment.
+    to the host environment. ``ignore_fakeroot_command`` adds
+    ``--ignore-fakeroot-command`` to fakeroot starts.
     """
     if fakeroot is None:
-        fakeroot = (
-            Path(DockerfileSingularityEnvironment._runtime()).name
-            == "apptainer"
+        fakeroot = _runtime_is_apptainer(
+            DockerfileSingularityEnvironment._runtime()
         )
     paths = (
         [docker_compose_paths]
@@ -951,6 +990,8 @@ async def docker_compose_to_singularity_compose(
         start_options = ["containall", "no-home"]
         if fakeroot:
             start_options.insert(0, "fakeroot")
+            if ignore_fakeroot_command:
+                start_options.insert(1, "ignore-fakeroot-command")
         if name == "main" and main_agent_layer is not None:
             start_options.append(f"overlay={main_agent_layer}:ro")
         if name == "main" and main_overlay is not None:
@@ -1078,6 +1119,11 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     """Run Dockerfile and supported Compose tasks with Singularity or Apptainer."""
 
     _compose_filename = "docker-compose.yaml"
+    # Why ``--fakeroot`` failed, per runtime: later trials in the same process
+    # fail before building instead of probing again.
+    _fakeroot_unavailable_reasons: ClassVar[dict[str, str]] = {}
+    # An explicit opt-out is explained once per process.
+    _fakeroot_disabled_warned: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -1086,9 +1132,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         singularity_agent: str | None = None,
         singularity_agent_kwargs: dict | str | None = None,
         singularity_agent_cache_dir: Path | str | None = None,
-        singularity_force_pull: bool = False,
-        singularity_fakeroot: bool | None = None,
-        singularity_overlay: bool = True,
+        singularity_force_pull: bool | int | str = False,
+        singularity_fakeroot: bool | int | str | None = None,
+        singularity_overlay: bool | int | str = True,
         singularity_no_mount: str | None = None,
         singularity_startup_timeout_sec: float = 300,
         **kwargs,
@@ -1111,7 +1157,12 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             if singularity_image_cache_dir
             else self._default_image_cache_dir()
         )
-        self._force_pull = singularity_force_pull
+        self._force_pull = self._parse_bool(
+            "singularity_force_pull", singularity_force_pull
+        )
+        singularity_overlay = self._parse_bool(
+            "singularity_overlay", singularity_overlay
+        )
         # Harbor 0.25 forwards environment kwargs to separate verifiers too.
         # Their explicit auto-mount list contains only the verifier log mount;
         # they must use their own image without an agent installation layer.
@@ -1142,7 +1193,13 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             raise ValueError(
                 "An agent install layer requires a writable trial overlay"
             )
-        self._fakeroot = singularity_fakeroot
+        # ``None`` follows the runtime.
+        self._fakeroot_setting = (
+            None
+            if singularity_fakeroot is None
+            else self._parse_bool("singularity_fakeroot", singularity_fakeroot)
+        )
+        self._fakeroot = self._fakeroot_setting
         self._overlay_enabled = singularity_overlay
         self._runtime_path: str | None = None
         # Resolved by ``_prepare_workdir`` at start, or on first use.
@@ -1163,7 +1220,11 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._compose_identity = f"{identity[:8]}{secrets.token_hex(4)}"
         self._instance_started = False
         self._instance_start_attempted = False
+        # Set by the fakeroot probe when the host's fakeroot command cannot
+        # run in this image; see ``_FAKEROOT_COMMAND_FAILURE_MARKERS``.
+        self._ignore_fakeroot_command = False
         self._warned_user_switch_without_fakeroot = False
+        self._fakeroot_disabled_explained = False
         self._compose_project_dir: Path | None = None
         self._compose_file: Path | None = None
         self._compose_instances: dict[str, list[str]] = {}
@@ -1176,6 +1237,24 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._proxy_process: asyncio.subprocess.Process | None = None
         self._proxy_env: dict[str, str] = {}
         self._model_forwards: dict[tuple[str, int], int] = {}
+
+    @staticmethod
+    def _parse_bool(name: str, value: bool | int | str) -> bool:
+        """Parse a boolean environment kwarg such as ``singularity_overlay``."""
+        if isinstance(value, bool):
+            return value
+        # Harbor's CLI JSON-decodes ``--ek`` values, so ``=1`` arrives as int,
+        # while other configuration paths can pass the raw string, whose
+        # truthiness would turn ``"false"`` on.
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes"}:
+                return True
+            if normalized in {"false", "0", "no"}:
+                return False
+        raise ValueError(f"{name} must be true or false")
 
     @staticmethod
     @override
@@ -1268,7 +1347,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             runtime = self._runtime()
             self._runtime_path = runtime
         if self._fakeroot is None:
-            self._fakeroot = Path(runtime).name == "apptainer"
+            self._fakeroot = _runtime_is_apptainer(runtime)
         return runtime
 
     @override
@@ -1654,7 +1733,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             or shutil.which("apptainer")
             or shutil.which("singularity")
         )
-        if runtime is None or Path(runtime).name != "singularity":
+        if runtime is None or _runtime_is_apptainer(runtime):
             return
         if any(
             re.search(
@@ -2174,6 +2253,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             main_mounts=main_mounts,
             network_mode=self._network_policy.network_mode,
             fakeroot=self._fakeroot,
+            ignore_fakeroot_command=self._ignore_fakeroot_command,
             main_agent_layer=self._agent_layer_path,
             main_overlay=self._overlay_path,
             service_workdirs=service_workdirs,
@@ -2372,6 +2452,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             self._instance_runtime(),
             "exec",
             "--cleanenv",
+            *self._fakeroot_command_options(),
             "--pwd",
             cwd or default_cwd or self._workdir,
             f"instance://{instance_name or self._instance_name}",
@@ -2425,6 +2506,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             args.extend(["--pwd", pwd])
         if self._fakeroot:
             args.append("--fakeroot")
+            args.extend(self._fakeroot_command_options())
         if self._agent_layer_path is not None:
             args.extend(["--overlay", f"{self._agent_layer_path}:ro"])
         if include_overlay and self._overlay_path is not None:
@@ -2533,7 +2615,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         layout = self._scratch_dir / "overlay-layout"
         overlay = self._scratch_dir / "overlay.img"
         try:
-            if self._fakeroot and Path(runtime).name == "apptainer":
+            if self._fakeroot and _runtime_is_apptainer(runtime):
                 # Let Apptainer map overlay ownership, including on hosts
                 # without subordinate UID/GID ranges.
                 command = [
@@ -2587,6 +2669,128 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         if not isinstance(image, str) or not image:
             raise RuntimeError("Main Singularity image is not prepared")
         return image if "://" in image else f"docker://{image}"
+
+    def _fakeroot_command_options(self) -> list[str]:
+        """Return the options that keep the fakeroot command out of execs."""
+        if self._fakeroot and self._ignore_fakeroot_command:
+            return ["--ignore-fakeroot-command"]
+        return []
+
+    async def _fakeroot_probe_error(self) -> str | None:
+        """Return why ``--fakeroot`` cannot run on this host, or ``None``.
+
+        When only the host's fakeroot command fails to load in this image,
+        the host itself can run fakeroot: the probe is repeated with
+        ``--ignore-fakeroot-command``, which this trial's starts and execs
+        then also pass, as the Apptainer build does. A failure of that
+        retry is this image's, so it fails the start without a reason that
+        later trials would reuse.
+        """
+
+        async def probe(*extra: str) -> None:
+            await self._run(
+                self._instance_runtime(),
+                "exec",
+                "--cleanenv",
+                "--containall",
+                "--no-home",
+                "--workdir",
+                str(self._runtime_workdir("fakeroot-probe")),
+                "--fakeroot",
+                *extra,
+                self._main_seed_image(),
+                "true",
+            )
+
+        self._ignore_fakeroot_command = False
+        try:
+            await probe()
+        except RuntimeError as exc:
+            if any(
+                marker in str(exc)
+                for marker in _FAKEROOT_COMMAND_FAILURE_MARKERS
+            ):
+                await probe("--ignore-fakeroot-command")
+                self.logger.warning(
+                    "The host's fakeroot command cannot run in %s; using "
+                    "--ignore-fakeroot-command",
+                    self._main_seed_image(),
+                )
+                self._ignore_fakeroot_command = True
+                return None
+            lines = [line.strip() for line in str(exc).splitlines()]
+            lines = [line for line in lines if line]
+            # Report the runtime's own diagnosis, e.g. SingularityCE's
+            # "FATAL: could not use fakeroot: no mapping entry found in
+            # /etc/subuid", rather than the whole command line.
+            reason = next(
+                (line for line in reversed(lines) if "FATAL" in line),
+                lines[-1] if lines else type(exc).__name__,
+            )
+            lowered = reason.lower()
+            if not any(
+                marker in lowered for marker in _FAKEROOT_FAILURE_MARKERS
+            ):
+                # A pull, image, or I/O failure says nothing about fakeroot;
+                # fail the start rather than silently dropping container root.
+                raise
+            return reason
+        return None
+
+    async def _resolve_fakeroot(self) -> None:
+        """Verify that this start can use ``--fakeroot``.
+
+        Runs before the first command that passes ``--fakeroot``, including
+        Apptainer's ``overlay create``, so a host without a usable fakeroot
+        fails with the runtime's reason instead of a later raw error.
+        """
+        runtime = self._instance_runtime()
+        if not self._fakeroot:
+            if self._fakeroot_setting is False:
+                self._warn_fakeroot_disabled()
+            return
+        reason = (
+            self._fakeroot_unavailable_reasons.get(runtime)
+            or await self._fakeroot_probe_error()
+        )
+        if reason is not None:
+            self._fakeroot = False
+            self._fakeroot_unavailable_reasons.setdefault(runtime, reason)
+            self._fakeroot_unavailable(reason)
+
+    def _raise_if_fakeroot_known_unavailable(self) -> None:
+        """Fail before building or pulling when an earlier probe failed."""
+        if not self._fakeroot_unavailable_reasons:
+            return
+        runtime = self._instance_runtime()
+        reason = self._fakeroot_unavailable_reasons.get(runtime)
+        if self._fakeroot and reason is not None:
+            self._fakeroot_unavailable(reason)
+
+    @staticmethod
+    def _fakeroot_unavailable(reason: str) -> NoReturn:
+        raise RuntimeError(
+            "Singularity fakeroot is enabled (the default with Apptainer, or "
+            "singularity_fakeroot=true) but unavailable on this host: "
+            f"{reason}. Fakeroot needs unprivileged user namespaces, and "
+            "outside Apptainer's root-mapped mode a user-namespace mapping "
+            "for the invoking user, such as /etc/subuid and /etc/subgid "
+            "entries. Set singularity_fakeroot=false to run as the invoking "
+            "host user instead; most tasks that install packages then fail."
+        )
+
+    def _warn_fakeroot_disabled(self) -> None:
+        cls = DockerfileSingularityEnvironment
+        # The warning also covers the user switch that fakeroot would allow.
+        self._fakeroot_disabled_explained = True
+        self.logger.log(
+            logging.DEBUG if cls._fakeroot_disabled_warned else logging.WARNING,
+            "Singularity fakeroot is disabled (singularity_fakeroot=false), so "
+            "commands run as the invoking host user instead of container "
+            "root. Root-owned image files stay read-only, and tasks that "
+            "install system packages will fail.",
+        )
+        cls._fakeroot_disabled_warned = True
 
     async def _seed_harbor_bind_sources(self) -> None:
         """Copy existing image content into writable bind sources."""
@@ -3031,6 +3235,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         if sys.platform == "win32":
             raise RuntimeError("Singularity is unavailable on Windows")
         try:
+            self._raise_if_fakeroot_known_unavailable()
             self._raise_if_compose_bridge_unavailable()
             await self._prepare_workdir(force_build)
             self._sif_path = await self._build_main_sif(force_build)
@@ -3054,6 +3259,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             self._prepare_host_ca_certificates()
             self._instance_start_attempted = False
             async with asyncio.timeout(self._startup_timeout_sec):
+                await self._resolve_fakeroot()
                 if self._overlay_enabled:
                     self._prepare_disk_overlay()
                 self._prepare_harbor_bind_sources()
@@ -3159,6 +3365,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             self._instance_runtime(),
             "shell",
             "--cleanenv",
+            *self._fakeroot_command_options(),
             "--pwd",
             self._workdir,
             f"instance://{self._instance_name}",
@@ -3204,7 +3411,10 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             if requested_user is not None and not getattr(
                 self, "_warned_user_switch_without_fakeroot", False
             ):
-                self.logger.warning(
+                self.logger.log(
+                    logging.DEBUG
+                    if getattr(self, "_fakeroot_disabled_explained", False)
+                    else logging.WARNING,
                     "Singularity fakeroot is disabled; cannot switch to "
                     "requested container user %r, so commands will run as "
                     "the invoking host user",
@@ -3236,9 +3446,11 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         merge_persistent: bool = True,
     ) -> dict[str, str]:
         runtime_env = self._clean_host_environment()
+        # Apptainer accepts SINGULARITYENV_ only with a deprecation warning
+        # on every command's stderr.
         prefix = (
             "APPTAINERENV_"
-            if Path(self._instance_runtime()).name == "apptainer"
+            if _runtime_is_apptainer(self._instance_runtime())
             else "SINGULARITYENV_"
         )
         configured = (self._merge_env(env) if merge_persistent else env) or {}

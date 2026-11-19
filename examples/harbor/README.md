@@ -131,10 +131,17 @@ a moving tag such as `latest` is fetched again only when refreshed:
 `--environment-kwarg singularity_force_pull=true` re-pulls (and rebuilds) the
 cached SIFs without turning a prebuilt-image task into a build.
 
-`singularity_fakeroot` defaults to `None`: fakeroot is enabled with Apptainer
-and disabled with Singularity. Passing
+`singularity_fakeroot` defaults to `None`: fakeroot is enabled with Apptainer,
+including Apptainer installed under the `singularity` name (detected from
+`--version`), and disabled with SingularityCE. Passing
 `--environment-kwarg singularity_fakeroot=true` or
-`--environment-kwarg singularity_fakeroot=false` overrides this choice.
+`--environment-kwarg singularity_fakeroot=false` overrides this choice (`1`,
+`0`, `yes`, and `no` are accepted too). With fakeroot enabled, each start first
+checks that `--fakeroot` works and otherwise fails, before any overlay is
+created, with the runtime's reason; later trials in the same process then fail
+before building. Disabling fakeroot explicitly logs one warning: commands run
+as the invoking host user, root-owned image files stay read-only, and tasks that
+install system packages fail.
 Apptainer is preferred when both runtimes are installed. A failed build or task
 command that reports requiring root under Singularity warns that switching to
 Apptainer may help.
