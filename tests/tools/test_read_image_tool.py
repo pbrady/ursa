@@ -1,4 +1,5 @@
 import base64
+import io
 import os
 import random
 import subprocess
@@ -14,6 +15,7 @@ from pydantic import BaseModel
 from tests.tools.utils import make_runtime
 from ursa.cli.config import ChatModelConfig
 from ursa.tools.read_image_tool import (
+    MAX_IMAGE_SIDE_PX,
     ImageReadError,
     image_block_from_file,
     read_image_tool,
@@ -140,7 +142,9 @@ def test_read_image_tool_rejects_unsupported_extension(
     target.write_bytes(b"not an image")
 
     with pytest.raises(
-        ImageReadError, match="Unsupported image type"
+        ImageReadError,
+        match="Unsupported or unreadable image type: image.unknown; "
+        "convert it to PNG first",
     ) as raised:
         read_image_tool.func(
             image_path=target.name,
@@ -316,3 +320,259 @@ def test_svg_conversion_labels_original_filename(
     assert result[1]["mime_type"] == "image/png"
     assert "file_id" not in result[1]
     assert base64.b64decode(result[1]["base64"]).startswith(b"\x89PNG")
+
+
+def test_image_block_from_file_passes_png_through_unchanged(tmp_path: Path):
+    target = tmp_path / "pixel.png"
+    Image.new("RGB", (3, 2), color=(0, 255, 0)).save(target)
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    assert base64.b64decode(result["base64"]) == target.read_bytes()
+
+
+@pytest.mark.parametrize("name", ["frame_0001", "screenshot.dat", "out.img"])
+def test_image_block_from_file_reads_images_whatever_their_name(
+    tmp_path: Path, name: str
+):
+    # No extension, or one mimetypes does not map to an image type.
+    target = tmp_path / name
+    Image.new("RGB", (3, 2), color=(0, 255, 0)).save(target, format="PNG")
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    assert base64.b64decode(result["base64"]) == target.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("suffix", "mime_type"),
+    [(".jpg", "image/jpeg"), (".gif", "image/gif"), (".webp", "image/webp")],
+)
+def test_image_block_from_file_passes_accepted_formats_through(
+    tmp_path: Path, suffix: str, mime_type: str
+):
+    target = tmp_path / f"pixel{suffix}"
+    Image.new("RGB", (3, 2), color=(0, 0, 255)).save(target)
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == mime_type
+    assert base64.b64decode(result["base64"]) == target.read_bytes()
+
+
+@pytest.mark.parametrize("suffix", [".ppm", ".pgm", ".pbm", ".bmp", ".tiff"])
+def test_image_block_from_file_converts_other_rasters_to_png(
+    tmp_path: Path, suffix: str
+):
+    # e.g. the .ppm screenshots QEMU's VNC writes, which OpenAI answers with
+    # a 400 "does not represent a valid image" when sent as image/x-portable-*
+    target = tmp_path / f"screen{suffix}"
+    mode = {".pgm": "L", ".pbm": "1"}.get(suffix, "RGB")
+    Image.new(mode, (5, 4), color=1).save(target)
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    decoded = Image.open(io.BytesIO(base64.b64decode(result["base64"])))
+    assert decoded.format == "PNG"
+    assert decoded.size == (5, 4)
+
+
+def test_image_block_from_file_converts_ppm_named_png(tmp_path: Path):
+    # The format comes from the bytes, not the suffix
+    target = tmp_path / "screen.png"
+    Image.new("RGB", (5, 4), color=(9, 9, 9)).save(target, format="PPM")
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    assert base64.b64decode(result["base64"]).startswith(b"\x89PNG")
+
+
+def test_image_block_from_file_downscales_large_images(tmp_path: Path):
+    target = tmp_path / "wide.png"
+    Image.new("RGB", (MAX_IMAGE_SIDE_PX * 2, 100)).save(target)
+
+    result = image_block_from_file(target)
+
+    decoded = Image.open(io.BytesIO(base64.b64decode(result["base64"])))
+    assert result["mime_type"] == "image/png"
+    assert decoded.size == (MAX_IMAGE_SIDE_PX, 50)
+
+
+def test_image_block_from_file_converts_animated_gif(tmp_path: Path):
+    target = tmp_path / "anim.gif"
+    frames = [Image.new("RGB", (4, 4), color=c) for c in ("red", "blue")]
+    frames[0].save(target, save_all=True, append_images=frames[1:])
+
+    result = image_block_from_file(target)
+
+    assert result["mime_type"] == "image/png"
+    assert _decoded(result).convert("RGB").getpixel((0, 0)) == (255, 0, 0)
+
+
+@pytest.mark.parametrize("name", ["data.xyz", "notes.txt"])
+def test_image_block_from_file_refuses_non_images_with_known_mime(
+    tmp_path: Path, name: str
+):
+    # .xyz maps to chemical/x-xyz and .txt to text/plain; neither may be
+    # sent to the model as image data
+    target = tmp_path / name
+    target.write_bytes(b"not an image at all")
+
+    with pytest.raises(
+        ImageReadError,
+        match=rf"Unsupported or unreadable image type .*: {name}; "
+        "convert it to PNG first",
+    ) as raised:
+        image_block_from_file(target)
+
+    assert isinstance(raised.value, ToolException)
+
+
+@pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+@pytest.mark.parametrize("side", [11_000, 20_000])
+def test_image_block_from_file_refuses_decompression_bombs(
+    tmp_path: Path, side: int
+):
+    # A tiny file whose header declares a huge canvas: 11000 px is over
+    # MAX_DECODE_PIXELS, 20000 px also over Pillow's own bomb limit
+    target = tmp_path / "bomb.pgm"
+    target.write_bytes(f"P5\n{side} {side}\n255\n".encode())
+
+    with pytest.raises(ImageReadError, match="Image too large to decode"):
+        image_block_from_file(target)
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "expected"),
+    [
+        (
+            "data.xyz",
+            b"not an image",
+            "Unsupported or unreadable image type chemical/x-xyz: data.xyz",
+        ),
+        (
+            "broken.png",
+            b"\x89PNG garbage",
+            "Unsupported or unreadable image type image/png: broken.png; "
+            "convert it to PNG first",
+        ),
+        ("missing.png", None, "Could not read image 'missing.png'"),
+    ],
+)
+def test_read_image_tool_raises_tool_error_for_unreadable_files(
+    tmp_path: Path,
+    chat_model: BaseChatModel,
+    name: str,
+    content: bytes | None,
+    expected: str,
+):
+    if content is not None:
+        (tmp_path / name).write_bytes(content)
+
+    with pytest.raises(ImageReadError) as raised:
+        read_image_tool.func(
+            image_path=name,
+            runtime=make_runtime(
+                tmp_path,
+                llm=chat_model,
+                tool_call_id="read-bad-image-call",
+            ),
+        )
+
+    assert isinstance(raised.value, ToolException)
+    assert expected in str(raised.value)
+
+
+def test_read_image_tool_sends_ppm_as_png(
+    tmp_path: Path, chat_model: BaseChatModel
+):
+    target = tmp_path / "vnc.ppm"
+    Image.new("RGB", (6, 3), color=(1, 2, 3)).save(target)
+
+    result = read_image_tool.func(
+        image_path=target.name,
+        runtime=make_runtime(
+            tmp_path,
+            llm=chat_model,
+            tool_call_id="read-ppm-call",
+        ),
+    )
+
+    assert result[0] == {"type": "text", "text": "Image file: vnc.ppm"}
+    assert result[1]["mime_type"] == "image/png"
+    assert base64.b64decode(result[1]["base64"]).startswith(b"\x89PNG")
+
+
+def _decoded(block) -> Image.Image:
+    image = Image.open(io.BytesIO(base64.b64decode(block["base64"])))
+    image.load()
+    return image
+
+
+@pytest.mark.parametrize(
+    ("samples", "extrema"),
+    [
+        # 16-bit PGM using only 0..1000 of 0..65535: stretched, not near-black
+        ([0, 250, 500, 1000], (0, 255)),
+        # a flat white 16-bit frame stays white
+        ([65535] * 4, (255, 255)),
+        ([0] * 4, (0, 0)),
+    ],
+)
+def test_image_block_from_file_stretches_16_bit_grayscale(
+    tmp_path: Path, samples: list[int], extrema: tuple[int, int]
+):
+    target = tmp_path / "depth.pgm"
+    target.write_bytes(
+        b"P5\n2 2\n65535\n" + b"".join(v.to_bytes(2, "big") for v in samples)
+    )
+
+    image = _decoded(image_block_from_file(target))
+
+    assert (image.format, image.mode) == ("PNG", "L")
+    assert image.getextrema() == extrema
+
+
+def test_image_block_from_file_does_not_take_lab_a_band_for_alpha(
+    tmp_path: Path,
+):
+    target = tmp_path / "lab.tiff"
+    Image.new("LAB", (3, 2), color=(50, 0, 0)).save(target)
+
+    assert _decoded(image_block_from_file(target)).mode == "RGB"
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
+def test_image_block_from_file_refuses_truncated_pass_through_image(
+    tmp_path: Path, fmt: str
+):
+    # e.g. a screenshot read while it is still being written: the header
+    # parses, so it must be decoded to be caught before the API sees it
+    target = tmp_path / f"screen.{fmt.lower()}"
+    Image.effect_noise((256, 256), 50).convert("RGB").save(target, format=fmt)
+    target.write_bytes(target.read_bytes()[:3000])
+
+    with pytest.raises(ImageReadError, match="truncated or corrupt"):
+        image_block_from_file(target)
+
+
+def test_read_image_tool_raises_tool_error_for_a_directory(
+    tmp_path: Path, chat_model: BaseChatModel
+):
+    (tmp_path / "shots.png").mkdir()
+
+    with pytest.raises(
+        ImageReadError, match="Could not read image 'shots.png'"
+    ) as raised:
+        read_image_tool.func(
+            image_path="shots.png",
+            runtime=make_runtime(
+                tmp_path, llm=chat_model, tool_call_id="read-dir-call"
+            ),
+        )
+
+    assert isinstance(raised.value, ToolException)

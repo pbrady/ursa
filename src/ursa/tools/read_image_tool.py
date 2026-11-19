@@ -1,4 +1,5 @@
 import base64
+import io
 import logging
 import mimetypes
 from pathlib import Path
@@ -11,11 +12,40 @@ from langchain_core.messages.content import (
     create_image_block,
 )
 from langchain_core.tools import tool
+from PIL import Image, UnidentifiedImageError
 
 from ursa.agents.base import AgentContext
 from ursa.tools.read_file_tool import _validate_read_path
 
 logger = logging.getLogger(__name__)
+
+# Pillow format names that the supported vision endpoints accept as-is
+# (OpenAI lists png, jpeg, gif and webp; Anthropic and Gemini accept the same
+# four). Anything else Pillow can decode (ppm/pgm/pbm, bmp, tiff, ico, ...)
+# is re-encoded as PNG: OpenAI answers other bytes with a 400 "The image data
+# you provided does not represent a valid image", and the image then stays in
+# the history, so every later request fails the same way.
+PASS_THROUGH_FORMATS = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
+
+# Longest side sent to the model. OpenAI scales high-detail images to fit in
+# 2048x2048 and Anthropic refuses images over 8000 px, so a larger image only
+# costs upload bytes; it is downscaled (keeping its aspect ratio) instead.
+MAX_IMAGE_SIDE_PX = 2048
+
+# Largest canvas decoded at all, checked from the header before any pixel is
+# read, so a small file that declares an enormous canvas is refused rather
+# than expanded in memory.
+MAX_DECODE_PIXELS = 100_000_000
+
+# Modes PNG stores as they are. Others (CMYK, YCbCr, LAB, HSV, float and
+# 32-bit integer) are converted first.
+_PNG_MODES = {"1", "L", "LA", "P", "RGB", "RGBA"}
+_HIGH_DEPTH_GRAY_MODES = {"I", "I;16", "I;16B", "I;16L", "I;16N", "F"}
 
 
 class ImageReadError(ToolException):
@@ -73,26 +103,40 @@ def image_block_from_file(
     filename: Path,
     max_size_mb: float = 20,
 ) -> ImageContentBlock:
+    """Build a base64 image block the model API will accept.
+
+    The format is taken from the file's bytes, not its name. PNG, JPEG,
+    still GIF and WebP no larger than ``MAX_IMAGE_SIDE_PX`` are sent
+    unchanged after a full decode. SVG is rendered to PNG. Any other raster
+    format Pillow can decode, an animated GIF (first frame) and an image
+    larger than ``MAX_IMAGE_SIDE_PX`` are re-encoded as PNG. Raises
+    ``ImageReadError`` for content that is not a readable image.
+    """
+    max_bytes = max_size_mb * 1024 * 1024
     file_size = filename.stat().st_size
-    if file_size > (max_size_mb * 1024 * 1024):
+    if file_size > max_bytes:
         raise ImageSizeError(
             f"File too large: {file_size / 1024 / 1024:.2f}MB "
             f"(max: {max_size_mb:0.1f}MB)"
         )
 
+    # Only SVG is chosen by name; everything else by its bytes, so a PNG
+    # without an extension, or with one mimetypes does not know, is sent.
     mime_type, _ = mimetypes.guess_type(filename)
-    if mime_type is None:
-        raise ImageReadError(f"Unsupported image type: {filename.name}")
-
     if mime_type == "image/svg+xml":
         with pymupdf.open(filename) as document:
             page = document[0]
             pixmap = page.get_pixmap()
             image_bytes = pixmap.tobytes("png")
-
-        mime_type = "image/png"
     else:
         image_bytes = filename.read_bytes()
+
+    image_bytes, mime_type = _normalize_image(image_bytes, filename, mime_type)
+    if len(image_bytes) > max_bytes:
+        raise ImageSizeError(
+            f"Encoded image too large: {len(image_bytes) / 1024 / 1024:.2f}MB "
+            f"(max: {max_size_mb:0.1f}MB)"
+        )
 
     data = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -100,3 +144,88 @@ def image_block_from_file(
         base64=data,
         mime_type=mime_type,
     )
+
+
+def _normalize_image(
+    image_bytes: bytes, filename: Path, guessed_mime: str | None
+) -> tuple[bytes, str]:
+    """Return ``(bytes, mime_type)`` in a format and size the API accepts.
+
+    The format comes from the bytes, not the file name, so a ``.png`` that
+    is really a PPM is converted rather than passed through, and a text file
+    is refused rather than sent as image data.
+    """
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+            if width * height > MAX_DECODE_PIXELS:
+                raise ImageReadError(
+                    f"Image too large to decode: {filename.name} is "
+                    f"{width}x{height} px; downscale it to at most "
+                    f"{MAX_IMAGE_SIDE_PX} px per side first"
+                )
+            image_format = image.format or ""
+            if (
+                image_format in PASS_THROUGH_FORMATS
+                and not getattr(image, "is_animated", False)
+                and max(width, height) <= MAX_IMAGE_SIDE_PX
+            ):
+                # Decode it once (at most 2048x2048), so a truncated file,
+                # e.g. a screenshot read while still being written, is
+                # refused here rather than by the API.
+                image.load()
+                return image_bytes, PASS_THROUGH_FORMATS[image_format]
+            return _to_png(image), "image/png"
+    except ImageReadError:
+        raise
+    except Image.DecompressionBombError:
+        raise ImageReadError(
+            f"Image too large to decode: {filename.name}; downscale it to at "
+            f"most {MAX_IMAGE_SIDE_PX} px per side first"
+        ) from None
+    except UnidentifiedImageError:
+        kind = f" {guessed_mime}" if guessed_mime else ""
+        raise ImageReadError(
+            f"Unsupported or unreadable image type{kind}: "
+            f"{filename.name}; convert it to PNG first"
+        ) from None
+    except (OSError, SyntaxError, ValueError):
+        # Pillow raises these for a truncated or corrupt file of a format it
+        # knows.
+        raise ImageReadError(
+            f"Image data in {filename.name} is truncated or corrupt; if the "
+            "file is still being written, read it again once it is complete"
+        ) from None
+
+
+def _to_png(image: Image.Image) -> bytes:
+    """Encode the first frame of ``image`` as PNG within the side limit."""
+    image.seek(0)
+    if image.mode in _HIGH_DEPTH_GRAY_MODES:
+        # Downscale in float first, so the stretch below works on at most
+        # 2048x2048 px rather than on another full-size float copy.
+        image = image.convert("F")
+        image.thumbnail((MAX_IMAGE_SIDE_PX, MAX_IMAGE_SIDE_PX))
+        # Stretch to 8 bits; a plain convert("L") clips at 255, which turns
+        # most 16-bit and float images white. A flat image has no range to
+        # stretch: it is black if it is all zero (or below), else white.
+        low, high = image.getextrema()
+        if high > low:
+            scale = 255.0 / (high - low)
+            image = image.point(lambda v: (v - low) * scale)
+        else:
+            image = Image.new("F", image.size, 255.0 if low > 0 else 0.0)
+        image = image.convert("L")
+    else:
+        if image.mode not in _PNG_MODES:
+            # has_transparency_data, not an "A" band: LAB's A is a colour
+            # channel, not alpha.
+            image = image.convert(
+                "RGBA" if image.has_transparency_data else "RGB"
+            )
+        # In place: the file's own image is not used again, and a copy of a
+        # 100 Mpx canvas would cost another 400 MB.
+        image.thumbnail((MAX_IMAGE_SIDE_PX, MAX_IMAGE_SIDE_PX))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
