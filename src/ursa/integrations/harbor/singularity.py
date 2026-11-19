@@ -101,6 +101,11 @@ _IMAGE_TMP = "tmp"
 # caps what a task can write; 1 GiB was too small for agents that install a
 # toolchain, such as Codex's Node and npm.
 _DEFAULT_OVERLAY_MB = 10240
+# How long a timed-out or cancelled exec waits for its output pipes to close
+# after its process tree is killed. Background jobs it started, such as
+# ``server &`` or a ``nohup`` job reparented away from that tree, keep them
+# open.
+_EXEC_OUTPUT_DRAIN_SEC = 10
 _PROXY_CONTAINER_DIR = "/run/ursa-proxy"
 _HARBOR_WRITABLE_BIND_TARGETS = (
     ("installed-agent", PurePosixPath("/installed-agent")),
@@ -1358,6 +1363,8 @@ class _SingularityComposeServiceTransport:
     async def service_download_file(
         self, source_path: str, target_path: Path | str, *, service: str
     ) -> None:
+        if self.environment._skip_download_without_staging(source_path):
+            return
         await self.environment._download(
             source_path, target_path, self._execute(service), directory=False
         )
@@ -1365,6 +1372,8 @@ class _SingularityComposeServiceTransport:
     async def service_download_dir(
         self, source_dir: str, target_dir: Path | str, *, service: str
     ) -> None:
+        if self.environment._skip_download_without_staging(source_dir):
+            return
         await self.environment._download(
             source_dir, target_dir, self._execute(service), directory=True
         )
@@ -4047,7 +4056,14 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     instance_name=instance_name,
                     default_cwd=default_cwd,
                 )
-                stdout, stderr = await communication
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        communication, timeout=_EXEC_OUTPUT_DRAIN_SEC
+                    )
+                except TimeoutError:
+                    # A background job the command started still holds the
+                    # output pipes after the tree was killed.
+                    stdout, stderr = b"", b""
             except asyncio.CancelledError:
                 cleanup = asyncio.create_task(
                     self._cleanup_exec_process(
@@ -4060,7 +4076,11 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 with suppress(asyncio.CancelledError):
                     await asyncio.shield(cleanup)
                 with suppress(Exception, asyncio.CancelledError):
-                    await asyncio.shield(communication)
+                    await asyncio.wait_for(
+                        asyncio.shield(communication),
+                        timeout=_EXEC_OUTPUT_DRAIN_SEC,
+                    )
+                communication.cancel()
                 raise
 
             stdout_text = stdout.decode(errors="replace")
@@ -4178,6 +4198,21 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 )
             self._check_transfer(await self.exec(command), f"upload {kind}")
 
+    def _skip_download_without_staging(self, source: str) -> bool:
+        """Skip downloads when start() failed or the environment stopped.
+
+        Harbor still collects logs after a failed start; raising here would
+        log a second traceback that hides the startup error.
+        """
+        if self._staging_dir is not None:
+            return False
+        self.logger.debug(
+            "Skipping download of %s; the Singularity environment is not "
+            "running",
+            source,
+        )
+        return True
+
     @override
     async def download_file(
         self, source_path: str, target_path: Path | str
@@ -4194,6 +4229,8 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         *,
         directory: bool,
     ) -> None:
+        if self._skip_download_without_staging(source_path):
+            return
         target = Path(target_path)
         kind = "directory" if directory else "file"
         (target.mkdir if directory else target.parent.mkdir)(
@@ -4230,6 +4267,26 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self, source_dir: str, target_dir: Path | str
     ) -> None:
         await self._download(source_dir, target_dir, self.exec, directory=True)
+
+    @override
+    async def download_dir_filtered(
+        self,
+        *,
+        source_dir: str,
+        target_dir: Path | str,
+        include: Sequence[str] | None = None,
+        exclude: Sequence[str] | None = None,
+        protect: Sequence[str] | None = None,
+    ) -> None:
+        if self._skip_download_without_staging(source_dir):
+            return
+        await super().download_dir_filtered(
+            source_dir=source_dir,
+            target_dir=target_dir,
+            include=include,
+            exclude=exclude,
+            protect=protect,
+        )
 
     def _compose_instance(self, service: str) -> str:
         instances = self._compose_instances.get(service)

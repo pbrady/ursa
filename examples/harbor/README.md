@@ -188,6 +188,12 @@ As in Harbor 0.25, trial log directories are bind-mounted to the host only
 with `--environment-kwarg auto_mounting=true`; otherwise they are writable
 directories in the trial's staging area that Harbor downloads.
 
+A command that times out or is cancelled has its process tree killed, then
+waits at most 10 seconds for the rest of its output, so a background job it
+left holding stdout or stderr cannot hang the trial. After a failed start, or
+once the environment has stopped, Harbor's log downloads are skipped instead of
+raising a second error that would hide the startup failure.
+
 Validate tasks against URSA's Singularity constraints, or warm the SIF cache,
 without running an agent:
 

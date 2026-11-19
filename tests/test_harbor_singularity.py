@@ -3825,3 +3825,93 @@ def test_nested_mount_gets_a_mount_point(tmp_path: Path):
     assert (writable / "agent" / "data").is_dir()
     assert (writable / "verifier" / "data.h5").is_file()
     assert (writable / "artifacts" / "seeded").is_dir()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_exec_returns_while_a_background_job_holds_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    monkeypatch.setattr(harbor_singularity, "_EXEC_OUTPUT_DRAIN_SEC", 0.05)
+    cleaned: list[str] = []
+    started = asyncio.Event()
+
+    class Process:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            # Output never ends, as when ``server &`` keeps the pipes open.
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def spawn(*_command: str, **_kwargs: object) -> Process:
+        return Process()
+
+    async def cleanup(_process: Process, pid_file: str, **_kwargs: object):
+        cleaned.append(pid_file)
+
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+    monkeypatch.setattr(environment, "_cleanup_exec_process", cleanup)
+
+    if cancel:
+        task = asyncio.create_task(environment.exec("server &"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    else:
+        result = await asyncio.wait_for(
+            environment.exec("server &", timeout_sec=0.05), timeout=5
+        )
+        assert result.return_code == 124
+        assert "timed out" in result.stderr
+    assert len(cleaned) == 1
+    environment._cleanup_staging()
+
+
+async def test_downloads_after_failed_start_are_skipped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    environment = _environment(tmp_path)
+
+    async def fail_build(_force_build: bool) -> Path:
+        raise RuntimeError("build failed")
+
+    async def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("download should not run commands after a failed start")
+
+    monkeypatch.setattr(environment, "_build_main_sif", fail_build)
+    with pytest.raises(RuntimeError, match="build failed"):
+        await environment.start(force_build=False)
+    monkeypatch.setattr(environment, "exec", unexpected)
+    monkeypatch.setattr(environment, "_exec_instance", unexpected)
+
+    with caplog.at_level("DEBUG"):
+        await environment.download_dir("/logs/agent", tmp_path / "agent")
+        await environment.download_file(
+            "/logs/agent/ursa.log", tmp_path / "file" / "ursa.log"
+        )
+        await environment.download_dir_filtered(
+            source_dir="/logs/agent",
+            target_dir=tmp_path / "filtered",
+            include=["*.log"],
+        )
+        await environment.service_download_dir(
+            "/logs", tmp_path / "helper", service="helper"
+        )
+        await environment.service_download_file(
+            "/logs/x", tmp_path / "helper-file" / "x", service="helper"
+        )
+
+    for name in ("agent", "file", "filtered", "helper", "helper-file"):
+        assert not (tmp_path / name).exists()
+    assert "Skipping download of /logs/agent" in caplog.text
+    assert not [
+        record for record in caplog.records if record.levelname == "ERROR"
+    ]
