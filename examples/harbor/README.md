@@ -261,12 +261,46 @@ prebuilds are running.
 The `main` service may use an image or a Dockerfile build; verifier overlays
 are resolved relative to their overlay file. The adapter supports images,
 Dockerfile builds, list `depends_on`, commands, bind mounts, TCP ports,
-replicas, environment, `env_file`, and per-service artifacts. Unsupported
-Compose features fail before launch; consult Harbor's
+replicas, environment, `env_file`, and per-service artifacts.
+`deploy.resources` is accepted but not enforced, like the task's `cpus` and
+`memory_mb`. Unsupported Compose features fail before launch; consult Harbor's
 [multi-container guide](https://docs.harborframework.com/core-concepts/tasks/multi-container)
 and the [`singularity-compose` specification](https://github.com/singularityhub/singularity-compose/blob/master/docs/spec/spec-2.0.md).
-Apptainer and SingularityCE work without a system-wide `singularity` alias;
-the host runtime needs fakeroot CNI networking.
+Apptainer and SingularityCE work without a system-wide `singularity` alias.
+
+Bind mounts use `SOURCE:TARGET`, `SOURCE:TARGET:ro`, `SOURCE:TARGET:rw`, or the
+long form with `type: bind` and optional `read_only: true`; the source must
+exist on the host, and paths cannot contain `:` or `,`. `singularity-compose`
+0.1.19 accepts only `SOURCE:TARGET` volumes, so read-only mounts, including
+read-only Harbor mounts, are passed to the runtime as `--bind=SOURCE:TARGET:ro`
+start options, followed by any mounts nested inside them so that the read-only
+parent does not hide them.
+
+Compose files are interpolated as Docker Compose does: `$VAR`, `${VAR}`,
+`${VAR:-default}`, `${VAR-default}`, `${VAR:?message}`, `${VAR?message}`,
+`${VAR:+alternative}`, `${VAR+alternative}`, nested defaults, and `$$` for a
+literal `$`. As with Harbor's Docker backend, variables come from the host
+environment, overlaid with the task's `[environment].env`, Harbor's persistent
+environment, and then Harbor's own Compose variables: `CONTEXT_DIR`,
+`MAIN_IMAGE_NAME`, `PREBUILT_IMAGE_NAME`, `CPUS`, `MEMORY`, and the legacy
+`ENV_*_PATH`/`HOST_*_PATH` log mount variables. A missing required variable
+fails with its message; an unset plain `$VAR` becomes an empty string with a
+warning. Unquoted and double-quoted `env_file` values are interpolated too,
+and single-quoted values are kept literally.
+
+A project whose only service is `main`, without published ports or replicas,
+uses host networking for public phases, as a task without Compose does, and
+keeps the host's `/etc/hosts` and `/etc/resolv.conf`. Sidecars and published
+ports need bridge networking, which requires root or a setuid installation
+whose fakeroot CNI networking works for the invoking user (with `/etc/subuid`
+and `/etc/subgid` entries). On HPC hosts with an unprivileged (non-setuid)
+Apptainer and no `/etc/subuid`, such a project fails before any image is
+built: the trial looks for the runtime's setuid `starter-suid` under the
+`LIBEXECDIR` reported by `buildcfg` (and beside a relocated binary). Root,
+`singularity_fakeroot=false`, and unrecognized layouts are never rejected by
+this check. Because `singularity-compose` 0.1.19 exits 0 when an instance
+fails to start, the adapter then lists the running instances and fails with
+the runtime's `FATAL` output when one is missing.
 
 The adapter supports Harbor `public`, `no-network`, and HTTP/HTTPS `allowlist`
 policies. The `[environment]` policy is the setup baseline; omitted agent and

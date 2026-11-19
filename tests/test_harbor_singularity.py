@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import shlex
 import subprocess
@@ -12,6 +13,7 @@ import yaml
 pytest.importorskip("harbor")
 
 from harbor.environments.base import ExecResult
+from harbor.mappers.terminal_bench import HARBOR_MAIN_SERVICE
 from harbor.models.task.config import (
     EnvironmentConfig,
     NetworkMode,
@@ -319,7 +321,21 @@ def test_compose_environment_and_build_arguments(tmp_path, monkeypatch, values):
     monkeypatch.setenv("INHERITED", "host=value")
     env_file = tmp_path / "service.env"
     env_file.write_text("VALUE=file\nFILE_ONLY=preserved\n")
-    service = {"environment": values, "env_file": [str(env_file)]}
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        yaml.safe_dump({
+            "services": {
+                "main": {
+                    "build": {"context": ".", "args": values},
+                    "environment": values,
+                    "env_file": [str(env_file)],
+                }
+            }
+        })
+    )
+    service = harbor_singularity._load_docker_compose([compose])["services"][
+        "main"
+    ]
     expected = {
         "BOOL": "true",
         "EMPTY": "",
@@ -327,7 +343,7 @@ def test_compose_environment_and_build_arguments(tmp_path, monkeypatch, values):
         "VALUE": "host=value",
     }
     environment = _environment(tmp_path)
-    assert environment._compose_build_inputs({"args": values})[2] == tuple(
+    assert environment._compose_build_inputs(service["build"])[2] == tuple(
         f"{key}={value}" for key, value in expected.items()
     )
     assert harbor_singularity._compose_environment("helper", service, {}) == {
@@ -491,7 +507,8 @@ def test_compose_network_policy_is_rewritten(tmp_path: Path):
             NetworkMode.NO_NETWORK,
             {"allocate_ip": False, "enable": True, "type": "none"},
         ),
-        (NetworkMode.PUBLIC, {"allocate_ip": True, "enable": True}),
+        # A lone main instance uses host networking, as without Compose.
+        (NetworkMode.PUBLIC, {"allocate_ip": True, "enable": False}),
     ):
         environment._set_compose_network_policy(
             NetworkPolicy(network_mode=mode)
@@ -502,6 +519,20 @@ def test_compose_network_policy_is_rewritten(tmp_path: Path):
             ]
             == expected
         )
+    assert environment._compose_host_network
+
+    compose = yaml.safe_load(compose_file.read_text())
+    compose["instances"]["helper"] = {"network": {}}
+    compose_file.write_text(yaml.safe_dump(compose))
+    environment._set_compose_network_policy(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+    instances = yaml.safe_load(compose_file.read_text())["instances"]
+    assert all(
+        instance["network"] == {"allocate_ip": True, "enable": True}
+        for instance in instances.values()
+    )
+    assert not environment._compose_host_network
 
 
 @pytest.mark.parametrize("fail_isolated_start", [False, True])
@@ -1281,7 +1312,12 @@ async def test_compose_proxy_mount_is_removed_when_policy_changes(tmp_path):
         await environment._prepare_network_proxy(policy)
         environment._set_compose_network_policy(policy)
         instance = yaml.safe_load(compose.read_text())["instances"]["main"]
-        assert instance["network"]["type"] == "none"
+        # Restricted phases keep the isolated namespace, even for a lone main.
+        assert instance["network"] == {
+            "allocate_ip": False,
+            "enable": True,
+            "type": "none",
+        }
         assert "userns" in instance["start"]["options"]
         assert any(
             ":/run/ursa-proxy:ro" in option
@@ -1290,7 +1326,8 @@ async def test_compose_proxy_mount_is_removed_when_policy_changes(tmp_path):
         environment._set_compose_network_policy(NetworkPolicy())
         instance = yaml.safe_load(compose.read_text())["instances"]["main"]
         assert instance["start"]["options"] == ["containall"]
-        assert instance["network"] == {"allocate_ip": True, "enable": True}
+        # A public lone main instance uses host networking.
+        assert instance["network"] == {"allocate_ip": True, "enable": False}
     finally:
         await environment._cleanup_runtime_resources()
 
@@ -1652,3 +1689,947 @@ async def test_compose_sidecars_follow_prebuilt_main_image(
         ("redis:7", True),
     ]
     assert len(paths) == 3
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("plain", "plain"),
+        ("$$HOME and $${SET}", "$HOME and ${SET}"),
+        ("$SET/x", "value/x"),
+        ("${SET}", "value"),
+        ("a${SET}b", "avalueb"),
+        ("${UNSET:-fallback}", "fallback"),
+        ("${EMPTY:-fallback}", "fallback"),
+        ("${UNSET-fallback}", "fallback"),
+        ("${EMPTY-fallback}", ""),
+        ("${SET:-fallback}", "value"),
+        ("${SET:?unused}", "value"),
+        ("${EMPTY?unused}", ""),
+        ("${SET:+alt}", "alt"),
+        ("${EMPTY:+alt}", ""),
+        ("${EMPTY+alt}", "alt"),
+        ("${UNSET+alt}", ""),
+        ("${UNSET:-${SET}}", "value"),
+        ("${UNSET:-${ALSO_UNSET:-deep}}/x", "deep/x"),
+        ("${UNSET:-a:b c}", "a:b c"),
+        ("${UNSET:-$$literal}", "$literal"),
+        ("${SET:-${MISSING:?not evaluated}}", "value"),
+        # Docker Compose substitutes an empty string for a plain reference.
+        ("${MISSING}/x", "/x"),
+        ("$MISSING", ""),
+    ],
+)
+def test_compose_interpolation(template: str, expected: str):
+    environ = {"SET": "value", "EMPTY": ""}
+
+    assert harbor_singularity._interpolate_compose(template, environ) == (
+        expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("template", "match"),
+    [
+        ("${MISSING:?set MISSING first}", "'MISSING' is required: set"),
+        ("${EMPTY:?must not be empty}", "'EMPTY' is required: must not"),
+        ("${MISSING?}", "'MISSING' is required$"),
+        ("${UNTERMINATED", "Unterminated"),
+        ("${1BAD}", "Invalid"),
+        ("${BAD:x}", "Invalid"),
+        ("cost $5", "Invalid"),
+    ],
+)
+def test_compose_interpolation_errors(template: str, match: str):
+    with pytest.raises(ValueError, match=match):
+        harbor_singularity._interpolate_compose(template, {"EMPTY": ""})
+
+
+def test_unset_compose_variable_warns_once(monkeypatch, caplog):
+    monkeypatch.setattr(
+        harbor_singularity, "_warned_unset_compose_variables", set()
+    )
+
+    with caplog.at_level(logging.WARNING, harbor_singularity.__name__):
+        harbor_singularity._interpolate_compose("${MISSING}", {})
+        harbor_singularity._interpolate_compose("$MISSING", {})
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "Compose variable 'MISSING' in '${MISSING}' is not set; defaulting "
+        "to an empty string"
+    ]
+
+
+def test_compose_interpolation_includes_harbor_infra_variables(
+    tmp_path: Path, monkeypatch
+):
+    # Harbor's Terminal-Bench mapper writes this main service.
+    monkeypatch.delenv("TEST_DIR", raising=False)
+    monkeypatch.setenv("CONTEXT_DIR", "/host/value/is/overridden")
+    monkeypatch.setenv("URSA_TEST_HOST_ONLY", "host")
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (environment_dir / "docker-compose.yaml").write_text(
+        yaml.safe_dump({"services": {"main": HARBOR_MAIN_SERVICE}})
+    )
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    environment = DockerfileSingularityEnvironment(
+        environment_dir=environment_dir,
+        environment_name="unit-test",
+        session_id=f"{tmp_path.name}__env",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(
+            docker_image="example/task:20251031",
+            cpus=2,
+            memory_mb=4096,
+            env={"URSA_TEST_TASK": "task", "URSA_TEST_HOST_ONLY": "task"},
+        ),
+        persistent_env={"URSA_TEST_TASK": "persistent"},
+        singularity_image_cache_dir=tmp_path / "cache",
+        singularity_fakeroot=False,
+    )
+
+    variables = environment._compose_interpolation_environment()
+    main = environment._load_compose_config()["services"]["main"]
+
+    assert variables["CONTEXT_DIR"] == str(environment_dir.resolve())
+    assert variables["MAIN_IMAGE_NAME"] == f"hb__{environment.environment_id}"
+    assert variables["PREBUILT_IMAGE_NAME"] == "example/task:20251031"
+    assert variables["CPUS"] == "2"
+    assert variables["MEMORY"] == "4096M"
+    # Task env overrides the host; persistent env overrides the task.
+    assert variables["URSA_TEST_HOST_ONLY"] == "task"
+    assert variables["URSA_TEST_TASK"] == "persistent"
+    assert main["build"] == {"context": str(environment_dir.resolve())}
+    assert main["image"] == f"hb__{environment.environment_id}"
+    assert main["environment"] == ["TEST_DIR="]
+    # Resource limits are accepted but not enforced.
+    assert main["deploy"] == {}
+
+
+def test_compose_legacy_log_mount_variables(tmp_path: Path):
+    environment = _environment(tmp_path)
+    # As for Harbor's Docker backend, only host-visible mounts count.
+    assert "ENV_VERIFIER_LOGS_PATH" not in (
+        environment._compose_interpolation_environment()
+    )
+    environment._host_mounts.append({
+        "type": "bind",
+        "source": str(environment.trial_paths.verifier_dir),
+        "target": "/logs/verifier",
+    })
+
+    variables = environment._compose_interpolation_environment()
+
+    assert variables["ENV_VERIFIER_LOGS_PATH"] == "/logs/verifier"
+    assert variables["HOST_VERIFIER_LOGS_PATH"] == str(
+        environment.trial_paths.verifier_dir
+    )
+
+
+@pytest.mark.parametrize(
+    ("deploy", "error"),
+    [
+        ({"resources": {"limits": {"cpus": "2", "memory": "4G"}}}, None),
+        ({"replicas": 2, "resources": {"reservations": {}}}, None),
+        ({"restart_policy": {"condition": "any"}}, "deploy.replicas and"),
+        ({"replicas": 0, "resources": {}}, "positive integer"),
+    ],
+)
+def test_compose_deploy_resources_are_accepted_but_not_enforced(
+    tmp_path: Path, deploy: dict[str, object], error: str | None
+):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        yaml.safe_dump({"services": {"main": {"image": "x", "deploy": deploy}}})
+    )
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            harbor_singularity._load_docker_compose([compose])
+        return
+    main = harbor_singularity._load_docker_compose([compose])["services"][
+        "main"
+    ]
+    assert main["deploy"] == {
+        key: value for key, value in deploy.items() if key != "resources"
+    }
+
+
+async def test_compose_interpolates_environment_env_file_and_build_args(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("URSA_TEST_TOKEN", "secret")
+    monkeypatch.delenv("URSA_TEST_UNSET", raising=False)
+    (tmp_path / "service.env").write_text(
+        "FROM_FILE=${URSA_TEST_TOKEN}-file\n"
+        "LITERAL='${URSA_TEST_TOKEN}'\n"
+        'QUOTED="${URSA_TEST_UNSET:-quoted}"\n'
+        "CHAINED=${FROM_FILE}+\n"
+    )
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  main:\n"
+        "    build:\n"
+        "      context: .\n"
+        "      args:\n"
+        '        TOKEN: "${URSA_TEST_TOKEN}"\n'
+        '        PRICE: "$$5"\n'
+        "    env_file: service.env\n"
+        "    environment:\n"
+        '      COMBINED: "pre-${URSA_TEST_TOKEN}-${URSA_TEST_UNSET:-none}"\n'
+        '      ESCAPED: "$${URSA_TEST_TOKEN}"\n'
+        "    volumes:\n"
+        '      - "${URSA_TEST_UNSET:-.}/data:/data"\n'
+    )
+    config = harbor_singularity._load_docker_compose([compose])
+    main = config["services"]["main"]
+
+    assert harbor_singularity._compose_environment("main", main, {}) == {
+        "FROM_FILE": "secret-file",
+        "LITERAL": "${URSA_TEST_TOKEN}",
+        "QUOTED": "quoted",
+        "CHAINED": "secret-file+",
+        "COMBINED": "pre-secret-none",
+        "ESCAPED": "${URSA_TEST_TOKEN}",
+    }
+    assert main["build"]["args"] == {"TOKEN": "secret", "PRICE": "$5"}
+    assert main["volumes"] == [f"{tmp_path.resolve()}/data:/data"]
+
+
+def test_compose_env_file_uses_the_interpolation_environment(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("URSA_TASK_ONLY", raising=False)
+    env_file = tmp_path / "service.env"
+    env_file.write_text(
+        "FROM_TASK=${URSA_TASK_ONLY:?set by the task}\nURSA_TASK_ONLY\n"
+    )
+
+    environment = harbor_singularity._compose_environment(
+        "main",
+        {"env_file": [str(env_file)], "environment": ["URSA_TASK_ONLY"]},
+        {},
+        {"URSA_TASK_ONLY": "task-value"},
+    )
+
+    assert environment == {
+        "FROM_TASK": "task-value",
+        "URSA_TASK_ONLY": "task-value",
+    }
+
+
+SCICODE_COMPOSE = (
+    "services:\n"
+    "  main:\n"
+    "    volumes:\n"
+    '      - "${HARBOR_SCICODE_TEST_DATA_PATH:?'
+    "set HARBOR_SCICODE_TEST_DATA_PATH to an absolute path to a local "
+    'test_data.h5 before running harbor}:/app/test_data.h5:ro"\n'
+)
+
+
+def test_scicode_compose_requires_test_data_variable(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("HARBOR_SCICODE_TEST_DATA_PATH", raising=False)
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(SCICODE_COMPOSE)
+
+    with pytest.raises(ValueError) as raised:
+        harbor_singularity._load_docker_compose([compose])
+
+    message = str(raised.value)
+    assert str(compose) in message
+    assert "'HARBOR_SCICODE_TEST_DATA_PATH' is required" in message
+    assert message.endswith(
+        "set HARBOR_SCICODE_TEST_DATA_PATH to an absolute path to a local "
+        "test_data.h5 before running harbor"
+    )
+
+
+def _scicode_environment(
+    tmp_path: Path, monkeypatch
+) -> tuple[DockerfileSingularityEnvironment, Path]:
+    test_data = tmp_path / "data" / "test_data.h5"
+    test_data.parent.mkdir()
+    test_data.write_bytes(b"hdf5")
+    monkeypatch.setenv("HARBOR_SCICODE_TEST_DATA_PATH", str(test_data))
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    # The Dockerfile and Compose file of Harbor's SciCode adapter.
+    (environment_dir / "Dockerfile").write_text(
+        "FROM python:3.11-slim\n"
+        "RUN apt-get update && apt-get install -y build-essential\n"
+        "WORKDIR /app\n"
+    )
+    (environment_dir / "docker-compose.yaml").write_text(SCICODE_COMPOSE)
+    trial_paths = TrialPaths(tmp_path / "trial")
+    trial_paths.mkdir()
+    environment = DockerfileSingularityEnvironment(
+        environment_dir=environment_dir,
+        environment_name="scicode",
+        session_id=f"{tmp_path.name}__env",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(),
+        network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+        persistent_env={},
+        singularity_fakeroot=False,
+        singularity_overlay=False,
+    )
+    runtime = tmp_path / "fake-singularity"
+    runtime.write_text("#!/bin/sh\nexit 0\n")
+    runtime.chmod(0o755)
+    environment._runtime_path = str(runtime)
+    environment._prepare_runtime_workdir()
+    environment._staging_dir = tmp_path / "staging"
+    environment._staging_dir.mkdir()
+    environment._sif_path = tmp_path / "image.sif"
+    environment._sif_path.write_text("sif")
+    return environment, test_data
+
+
+async def test_scicode_compose_binds_test_data_read_only(
+    tmp_path: Path, monkeypatch
+):
+    environment, test_data = _scicode_environment(tmp_path, monkeypatch)
+    assert environment._workdir == "/app"
+
+    environment._prepare_harbor_bind_sources()
+    await environment._prepare_compose_project(force_build=False)
+
+    assert environment._compose_file is not None
+    instances = yaml.safe_load(environment._compose_file.read_text())[
+        "instances"
+    ]
+    (main,) = instances.values()
+    workdir_source = tmp_path / "staging" / "harbor-writable" / "workdir"
+    assert not any(volume.endswith(":ro") for volume in main["volumes"])
+    assert f"{workdir_source}:/app" in main["volumes"]
+    assert f"bind={test_data}:/app/test_data.h5:ro" in main["start"]["options"]
+    assert main["network"]["enable"] is False
+    environment._cleanup_compose_project()
+    await environment._release_sifs_in_use()
+    environment._cleanup_staging()
+
+
+async def test_compose_rejects_missing_bind_source(tmp_path: Path, monkeypatch):
+    environment, test_data = _scicode_environment(tmp_path, monkeypatch)
+    test_data.unlink()
+
+    with pytest.raises(FileNotFoundError, match="test_data.h5"):
+        await environment._prepare_compose_project(force_build=False)
+    environment._cleanup_compose_project()
+    await environment._release_sifs_in_use()
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize(
+    ("volume", "expected"),
+    [
+        ("./data:/data", "{base}/data:/data"),
+        ("./data:/data:rw", "{base}/data:/data"),
+        ("./data:/data:ro", "{base}/data:/data:ro"),
+        (
+            {"type": "bind", "source": "./data", "target": "/data"},
+            "{base}/data:/data",
+        ),
+        (
+            {
+                "type": "bind",
+                "source": "./data",
+                "target": "/data",
+                "read_only": True,
+            },
+            "{base}/data:/data:ro",
+        ),
+    ],
+)
+def test_compose_volume_modes_are_normalized(
+    tmp_path: Path, volume: object, expected: str
+):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        yaml.safe_dump({"services": {"main": {"volumes": [volume]}}})
+    )
+
+    config = harbor_singularity._load_docker_compose([compose])
+
+    assert config["services"]["main"]["volumes"] == [
+        expected.format(base=tmp_path.resolve())
+    ]
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        "./data:/data:z",
+        "./data:/data:ro:z",
+        "named:/data",
+        "./a,b:/data",
+        {"type": "bind", "source": "./data", "target": "/d", "read_only": 1},
+        {"type": "volume", "source": "named", "target": "/data"},
+    ],
+)
+def test_compose_rejects_unsupported_volumes(tmp_path: Path, volume: object):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        yaml.safe_dump({"services": {"main": {"volumes": [volume]}}})
+    )
+
+    with pytest.raises(ValueError, match="service 'main'"):
+        harbor_singularity._load_docker_compose([compose])
+
+
+def test_compose_overlay_replaces_volume_by_target(tmp_path: Path):
+    base = tmp_path / "docker-compose.yaml"
+    base.write_text("services:\n  main:\n    volumes: [/a:/data, /b:/keep]\n")
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text("services:\n  main:\n    volumes: [/c:/data:ro]\n")
+
+    config = harbor_singularity._load_docker_compose([base, overlay])
+
+    assert config["services"]["main"]["volumes"] == ["/c:/data:ro", "/b:/keep"]
+
+
+async def _convert_main_volumes(
+    tmp_path: Path,
+    compose_text: str,
+    main_mounts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(compose_text)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "singularity-compose.yml"
+
+    async def resolve(_name: str, _service: dict[str, object]) -> str:
+        return "image.sif"
+
+    await docker_compose_to_singularity_compose(
+        compose,
+        output,
+        identity="unit",
+        image_resolver=resolve,
+        staging_dir=staging,
+        fakeroot=False,
+        main_mounts=main_mounts or [],
+    )
+    (main,) = yaml.safe_load(output.read_text())["instances"].values()
+    return main
+
+
+async def test_compose_keeps_read_only_harbor_mounts(tmp_path: Path):
+    main = await _convert_main_volumes(
+        tmp_path,
+        "services:\n  main: {}\n",
+        [
+            {
+                "type": "bind",
+                "source": "/host/data",
+                "target": "/data",
+                "read_only": True,
+            },
+            {"type": "bind", "source": "/host/app", "target": "/app"},
+        ],
+    )
+
+    assert "bind=/host/data:/data:ro" in main["start"]["options"]
+    assert "/host/app:/app" in main["volumes"]
+    assert not any(volume.endswith(":ro") for volume in main["volumes"])
+
+
+def test_compose_accepts_read_only_harbor_mounts(tmp_path: Path):
+    environment = _environment(tmp_path, compose=True)
+    environment._mounts[0]["read_only"] = True
+
+    environment._validate_definition()
+
+
+async def test_compose_read_only_parent_does_not_hide_writable_child(
+    tmp_path: Path,
+):
+    for name in ("data", "out", "other"):
+        (tmp_path / name).mkdir()
+    main = await _convert_main_volumes(
+        tmp_path,
+        "services:\n"
+        "  main:\n"
+        "    volumes:\n"
+        f"      - {tmp_path}/out:/data/out\n"
+        f"      - {tmp_path}/data:/data:ro\n"
+        f"      - {tmp_path}/other:/other\n",
+    )
+
+    # singularity-compose emits volumes first, then start options in order.
+    assert main["volumes"] == [
+        f"{tmp_path}/other:/other",
+        f"{tmp_path / 'staging'}:/staging",
+    ]
+    binds = [
+        option
+        for option in main["start"]["options"]
+        if option.startswith("bind=")
+    ]
+    assert binds == [
+        f"bind={tmp_path}/data:/data:ro",
+        f"bind={tmp_path}/out:/data/out",
+    ]
+
+
+async def test_compose_writable_volumes_mount_parents_first(tmp_path: Path):
+    (tmp_path / "nested").mkdir()
+    main = await _convert_main_volumes(
+        tmp_path,
+        "services:\n  main:\n    volumes: [./nested:/app/nested]\n",
+        [{"type": "bind", "source": "/host/app", "target": "/app"}],
+    )
+
+    targets = [volume.split(":")[1] for volume in main["volumes"]]
+    assert targets.index("/app") < targets.index("/app/nested")
+
+
+@pytest.mark.parametrize(
+    ("services", "network_mode", "network"),
+    [
+        (
+            {"main": {}},
+            NetworkMode.PUBLIC,
+            {"allocate_ip": True, "enable": False},
+        ),
+        (
+            {"main": {}},
+            NetworkMode.NO_NETWORK,
+            {"allocate_ip": False, "enable": True, "type": "none"},
+        ),
+        (
+            {"main": {"ports": ["8080:80"]}},
+            NetworkMode.PUBLIC,
+            {"allocate_ip": True, "enable": True},
+        ),
+        (
+            {"main": {}, "helper": {"image": "redis:7"}},
+            NetworkMode.PUBLIC,
+            {"allocate_ip": True, "enable": True},
+        ),
+    ],
+)
+async def test_compose_conversion_uses_host_networking_for_a_lone_main(
+    tmp_path: Path,
+    services: dict[str, object],
+    network_mode: NetworkMode,
+    network: dict[str, object],
+):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(yaml.safe_dump({"services": services}))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "singularity-compose.yml"
+
+    async def resolve(_name: str, _service: dict[str, object]) -> str:
+        return "image.sif"
+
+    await docker_compose_to_singularity_compose(
+        compose,
+        output,
+        identity="unit",
+        image_resolver=resolve,
+        staging_dir=staging,
+        network_mode=network_mode,
+        fakeroot=False,
+    )
+
+    instances = yaml.safe_load(output.read_text())["instances"]
+    assert all(
+        instance["network"] == network for instance in instances.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("instances", "up", "aliases"),
+    [
+        ({"main": {}}, ["up", "--read_only", "--no-resolv"], False),
+        ({"main": {}, "helper": {}}, ["up", "--read_only"], True),
+    ],
+)
+async def test_lone_main_compose_keeps_host_resolver_files(
+    tmp_path: Path,
+    monkeypatch,
+    instances: dict[str, dict[str, object]],
+    up: list[str],
+    aliases: bool,
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    environment._compose_file = tmp_path / "singularity-compose.yml"
+    environment._compose_file.write_text(
+        yaml.safe_dump({"instances": instances})
+    )
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    calls: list[tuple[str, ...]] = []
+    alias_calls: list[bool] = []
+
+    async def run_compose(*arguments: str) -> str:
+        calls.append(arguments)
+        return ""
+
+    monkeypatch.setattr(environment, "_run_compose", run_compose)
+    monkeypatch.setattr(environment, "_run", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        environment,
+        "_add_compose_service_aliases",
+        lambda: alias_calls.append(True),
+    )
+    monkeypatch.setattr(
+        type(environment), "_uses_compose", property(lambda _self: True)
+    )
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    assert calls == [tuple(up)]
+    assert bool(alias_calls) is aliases
+    environment._cleanup_staging()
+
+
+NETWORK_FATAL = (
+    "FATAL:   container creation failed: network requires root or a suid "
+    "installation with /etc/subuid --fakeroot; non-root users can only use "
+    "--network=none unless permitted by the administrator"
+)
+
+
+def _compose_up_environment(
+    tmp_path: Path, monkeypatch, *, running: list[str]
+) -> DockerfileSingularityEnvironment:
+    """Prepare a sidecar project whose singularity-compose hides a FATAL."""
+    environment = _environment(tmp_path, compose=True)
+    _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
+    environment._instance_start_attempted = False
+    project = tmp_path / "project"
+    (project / "bin").mkdir(parents=True)
+    environment._compose_project_dir = project
+    environment._compose_file = project / "singularity-compose.yml"
+    environment._compose_file.write_text(
+        yaml.safe_dump({
+            "instances": {
+                "unitmain": {"network": {}},
+                "unithelper": {"network": {}},
+            }
+        })
+    )
+    environment._compose_instances = {
+        "main": ["unitmain1"],
+        "helper": ["unithelper1"],
+    }
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    # singularity-compose 0.1.19 logs the failed instance start and exits 0.
+    compose = tools / "singularity-compose"
+    compose.write_text(
+        "#!/bin/sh\n"
+        f"echo '{NETWORK_FATAL}' >&2\n"
+        'echo \'ERROR ["singularity", "instance", "start"] '
+        "return code 255'\n"
+        "exit 0\n"
+    )
+    compose.chmod(0o755)
+    listed = ", ".join(f'{{"instance": "{name}"}}' for name in running)
+    runtime = tmp_path / "fake-singularity"
+    runtime.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "instance list" ]; then\n'
+        f"  echo '{{\"instances\": [{listed}]}}'\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    runtime.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{Path(sys.executable).parent}")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        environment, "_add_compose_service_aliases", lambda: None
+    )
+    return environment
+
+
+async def test_compose_up_that_exits_zero_without_instances_fails(
+    tmp_path: Path, monkeypatch
+):
+    environment = _compose_up_environment(
+        tmp_path, monkeypatch, running=["unitmain1"]
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment._start_prepared_runtime(
+            NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+        )
+
+    message = str(raised.value)
+    assert "did not start instance(s): unithelper1" in message
+    assert "unitmain1" not in message.split("\n")[0]
+    assert NETWORK_FATAL in message
+    assert "return code 255" in message
+    assert "setuid Apptainer" in message
+    assert "/etc/subuid" in message
+    assert not environment._instance_started
+    assert environment._instance_start_attempted
+    environment._cleanup_staging()
+
+
+async def test_compose_up_keeps_its_output_when_instances_cannot_be_listed(
+    tmp_path: Path, monkeypatch
+):
+    environment = _compose_up_environment(tmp_path, monkeypatch, running=[])
+
+    async def failing_list() -> set[str]:
+        raise RuntimeError("Could not list Singularity instances: denied")
+
+    monkeypatch.setattr(environment, "_list_instances", failing_list)
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment._start_prepared_runtime(
+            NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+        )
+
+    message = str(raised.value)
+    assert "Could not list Singularity instances: denied" in message
+    assert NETWORK_FATAL in message
+    assert not environment._instance_started
+    environment._cleanup_staging()
+
+
+async def test_compose_up_checks_every_instance_is_running(
+    tmp_path: Path, monkeypatch
+):
+    environment = _compose_up_environment(
+        tmp_path, monkeypatch, running=["unitmain1", "unithelper1", "other"]
+    )
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    assert environment._instance_started
+    environment._cleanup_staging()
+
+
+async def test_compose_up_through_sudo_skips_the_user_instance_list(
+    tmp_path: Path, monkeypatch
+):
+    environment = _compose_up_environment(tmp_path, monkeypatch, running=[])
+    environment._compose_uses_sudo = True
+
+    async def unexpected_list() -> set[str]:
+        pytest.fail("root's instances are not listed for the invoking user")
+
+    monkeypatch.setattr(environment, "_list_instances", unexpected_list)
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    assert environment._instance_started
+    environment._cleanup_staging()
+
+
+async def test_run_returns_successful_output(tmp_path: Path):
+    environment = _environment(tmp_path)
+
+    output = await environment._run(
+        sys.executable,
+        "-c",
+        "import sys; print('out'); print('err', file=sys.stderr)",
+    )
+
+    assert output == "out\nerr\n"
+
+
+def _fake_install(
+    tmp_path: Path, *, buildcfg: bool = True, starter: bool = True
+) -> str:
+    libexec = tmp_path / "install" / "libexec"
+    if starter:
+        (libexec / "apptainer" / "bin").mkdir(parents=True)
+        (libexec / "apptainer" / "bin" / "starter").write_text("")
+    runtime = tmp_path / "install" / "bin" / "apptainer"
+    runtime.parent.mkdir(parents=True)
+    script = "exit 1"
+    if buildcfg:
+        script = (
+            'if [ "$1" = buildcfg ]; then\n'
+            "  echo PREFIX=/usr\n"
+            f"  echo LIBEXECDIR={libexec}\n"
+            "fi"
+        )
+    runtime.write_text(f"#!/bin/sh\n{script}\n")
+    runtime.chmod(0o755)
+    harbor_singularity._runtime_lacks_setuid_starter.cache_clear()
+    return str(runtime)
+
+
+def test_unprivileged_runtime_is_detected_from_buildcfg(tmp_path: Path):
+    runtime = _fake_install(tmp_path)
+
+    assert harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+def test_relocated_unprivileged_runtime_is_detected_beside_its_binary(
+    tmp_path: Path,
+):
+    runtime = _fake_install(tmp_path, buildcfg=False)
+
+    assert harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+def test_runtime_without_a_known_layout_is_not_called_unprivileged(
+    tmp_path: Path,
+):
+    runtime = _fake_install(tmp_path, buildcfg=False, starter=False)
+
+    assert not harbor_singularity._runtime_lacks_setuid_starter(runtime)
+    assert not harbor_singularity._runtime_lacks_setuid_starter(
+        str(tmp_path / "missing" / "apptainer")
+    )
+
+
+@pytest.mark.parametrize("name", ["apptainer", "singularity"])
+def test_setuid_starter_marks_the_runtime_privileged(
+    tmp_path: Path, monkeypatch, name: str
+):
+    runtime = _fake_install(tmp_path)
+    bin_dir = tmp_path / "install" / "libexec" / name / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "starter").write_text("")
+    starter_suid = bin_dir / "starter-suid"
+    starter_suid.write_text("")
+    real_stat = Path.stat
+
+    class RootSetuid:
+        st_uid = 0
+        st_mode = 0o104755
+
+    def fake_stat(path: Path, **kwargs: object):
+        if path == starter_suid:
+            return RootSetuid()
+        return real_stat(path, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+    assert not harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+def test_user_owned_starter_suid_is_not_setuid(tmp_path: Path):
+    runtime = _fake_install(tmp_path)
+    starter_suid = (
+        tmp_path / "install" / "libexec" / "apptainer" / "bin" / "starter-suid"
+    )
+    starter_suid.write_text("")
+    starter_suid.chmod(0o4755)
+
+    assert harbor_singularity._runtime_lacks_setuid_starter(runtime)
+
+
+async def test_start_fails_before_building_without_bridge_networking(
+    tmp_path: Path, monkeypatch
+):
+    environment = _environment(tmp_path, compose=True, fakeroot=True)
+    checked: list[str] = []
+
+    def unprivileged(runtime: str) -> bool:
+        checked.append(runtime)
+        return True
+
+    async def unexpected(*_args: object, **_kwargs: object) -> Path:
+        pytest.fail("the image must not be built without bridge networking")
+
+    monkeypatch.setattr(harbor_singularity.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        harbor_singularity, "_runtime_lacks_setuid_starter", unprivileged
+    )
+    monkeypatch.setattr(environment, "_build_main_sif", unexpected)
+
+    with pytest.raises(RuntimeError) as raised:
+        await environment.start(force_build=False)
+
+    message = str(raised.value)
+    assert "bridge networking" in message
+    assert "setuid Apptainer" in message
+    assert "/etc/subuid" in message
+    assert "root" in message
+    assert "Docker" in message
+    assert checked == [environment._instance_runtime()]
+    assert environment._runtime_workdir_root is None
+
+
+@pytest.mark.parametrize(
+    ("compose", "euid", "unprivileged", "network_mode", "fakeroot"),
+    [
+        # Root and setuid installations are never rejected.
+        ("sidecar", 0, True, NetworkMode.PUBLIC, True),
+        ("sidecar", 1000, False, NetworkMode.PUBLIC, True),
+        # A lone main uses host networking; restricted phases use
+        # --network none.
+        ("main", 1000, True, NetworkMode.PUBLIC, True),
+        ("ports-main", 1000, True, NetworkMode.NO_NETWORK, True),
+        ("ports-main", 1000, True, NetworkMode.ALLOWLIST, True),
+        # Without fakeroot, singularity-compose uses sudo for published ports
+        # and otherwise --network none, so it never asks for a bridge.
+        ("ports-main", 1000, True, NetworkMode.PUBLIC, False),
+        ("sidecar", 1000, True, NetworkMode.PUBLIC, False),
+    ],
+)
+def test_bridge_check_allows_projects_that_can_start(
+    tmp_path: Path,
+    monkeypatch,
+    compose: str,
+    euid: int,
+    unprivileged: bool,
+    network_mode: NetworkMode,
+    fakeroot: bool,
+):
+    environment = _environment(
+        tmp_path, network_mode=network_mode, fakeroot=fakeroot
+    )
+    services = {
+        "sidecar": "  main: {}\n  helper:\n    image: redis:7\n",
+        "main": "  main: {}\n",
+        "ports-main": "  main:\n    ports:\n      - '8080:80'\n",
+    }[compose]
+    (environment.environment_dir / "docker-compose.yaml").write_text(
+        f"services:\n{services}"
+    )
+    monkeypatch.setattr(harbor_singularity.os, "geteuid", lambda: euid)
+    monkeypatch.setattr(
+        harbor_singularity,
+        "_runtime_lacks_setuid_starter",
+        lambda _runtime: unprivileged,
+    )
+
+    environment._raise_if_compose_bridge_unavailable()
+
+
+def test_bridge_check_covers_public_phases_and_published_ports(
+    tmp_path: Path, monkeypatch
+):
+    environment = _environment(
+        tmp_path,
+        network_mode=NetworkMode.NO_NETWORK,
+        phase_network_modes=(NetworkMode.PUBLIC,),
+        overlay=True,
+        fakeroot=True,
+    )
+    (environment.environment_dir / "docker-compose.yaml").write_text(
+        "services:\n  main:\n    ports:\n      - '8080:80'\n"
+    )
+    monkeypatch.setattr(harbor_singularity.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        harbor_singularity, "_runtime_lacks_setuid_starter", lambda _r: True
+    )
+
+    with pytest.raises(RuntimeError, match="setuid Apptainer"):
+        environment._raise_if_compose_bridge_unavailable()

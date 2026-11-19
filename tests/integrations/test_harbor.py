@@ -23,6 +23,7 @@ from harbor.models.trial.paths import TrialPaths
 from ursa.integrations.harbor import UrsaHarborAgent
 from ursa.integrations.harbor.singularity import (
     DockerfileSingularityEnvironment,
+    _runtime_lacks_setuid_starter,
 )
 
 SINGULARITY = shutil.which("apptainer") or shutil.which("singularity")
@@ -230,6 +231,17 @@ def _require_fakeroot(image):
         )
 
 
+def _require_compose_bridge():
+    # The environment refuses a fakeroot Compose project with a public
+    # network phase on the same evidence before building; root never is.
+    if os.geteuid() and _runtime_lacks_setuid_starter(SINGULARITY):
+        pytest.skip(
+            "Compose under fakeroot needs bridge networking, which this "
+            "unprivileged Apptainer installation (no setuid starter) does "
+            "not offer"
+        )
+
+
 class _Loopback(BaseHTTPRequestHandler):
     def do_GET(self):
         body = b"local-only"
@@ -383,6 +395,7 @@ async def test_compose_overlay_survives_network_transition(
     tmp_path, ubuntu_sif
 ):
     _require_fakeroot(ubuntu_sif)
+    _require_compose_bridge()
     async with _environment(
         tmp_path,
         ubuntu_sif,
@@ -406,6 +419,7 @@ async def test_prebuilt_compose_images_start_without_pulling(
     )
 
     _require_fakeroot(ubuntu_sif)
+    _require_compose_bridge()
     task_dir = tmp_path / "task"
     for directory in ("environment", "tests"):
         (task_dir / directory).mkdir(parents=True)
@@ -489,6 +503,7 @@ async def test_compose_sidecar_isolation_transfer_and_cleanup(
     tmp_path, ubuntu_sif
 ):
     _require_fakeroot(ubuntu_sif)
+    _require_compose_bridge()
     env = await _start(tmp_path, ubuntu_sif, fakeroot=True, compose=True)
     names = set()
     try:

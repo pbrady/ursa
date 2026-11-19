@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 import platform
@@ -15,6 +16,7 @@ import shlex
 import shutil
 import signal
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,7 +30,7 @@ from collections.abc import (
 )
 from contextlib import AsyncExitStack, contextmanager, suppress
 from copy import deepcopy
-from functools import partial
+from functools import cache, partial
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, cast, override
 from urllib.parse import urlsplit
@@ -46,6 +48,10 @@ from harbor.environments.compose_service_ops import (
     ComposeServiceTransport,
 )
 from harbor.environments.definition import should_use_prebuilt_docker_image
+from harbor.environments.docker.compose_env import (
+    ComposeInfraEnvVars,
+    legacy_log_mount_env_vars,
+)
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import (
     NetworkMode,
@@ -86,6 +92,15 @@ _HARBOR_WRITABLE_IMAGE_TARGETS = (
     EnvironmentPaths.verifier_dir,
     EnvironmentPaths.artifacts_dir,
 )
+_COMPOSE_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_COMPOSE_BRIDGE_REQUIREMENT = (
+    "Compose projects with sidecars or published ports need a setuid "
+    "Apptainer installation with /etc/subuid and /etc/subgid entries for the "
+    "invoking user, or root (or Docker): an unprivileged Apptainer gives "
+    "non-root users only --network none."
+)
+_warned_unset_compose_variables: set[str] = set()
+_logger = logging.getLogger(__name__)
 
 
 def _host_ca_certificates_pem() -> str:
@@ -114,6 +129,11 @@ def _host_ca_certificates_pem() -> str:
     )
 
 
+def _volume_target(volume: str) -> str:
+    """Return the container path of a normalized ``src:dst[:ro]`` volume."""
+    return volume.split(":")[1]
+
+
 def _merge_compose(base: dict[str, Any], overlay: dict[str, Any]) -> None:
     for key, value in overlay.items():
         current = base.get(key)
@@ -124,11 +144,11 @@ def _merge_compose(base: dict[str, Any], overlay: dict[str, Any]) -> None:
         ):
             merged = list(current)
             positions = {
-                volume.split(":", 1)[1]: index
+                _volume_target(volume): index
                 for index, volume in enumerate(merged)
             }
             for volume in value:
-                target = volume.split(":", 1)[1]
+                target = _volume_target(volume)
                 if target in positions:
                     merged[positions[target]] = volume
                 else:
@@ -141,12 +161,125 @@ def _merge_compose(base: dict[str, Any], overlay: dict[str, Any]) -> None:
             base[key] = value
 
 
-def _compose_path(value: str, base_dir: Path) -> str:
-    if "$" in value:
-        raise ValueError(
-            "singularity-compose cannot interpolate variables in paths: "
-            f"{value!r}"
+def _compose_variable(
+    name: str, environ: Mapping[str, str], template: str
+) -> str:
+    if name in environ:
+        return environ[name]
+    # Docker Compose substitutes an empty string and warns once.
+    if name not in _warned_unset_compose_variables:
+        _warned_unset_compose_variables.add(name)
+        _logger.warning(
+            "Compose variable %r in %r is not set; defaulting to an empty "
+            "string",
+            name,
+            template,
         )
+    return ""
+
+
+def _compose_closing_brace(template: str, start: int) -> int:
+    depth = 1
+    index = start
+    while index < len(template):
+        if template.startswith("$$", index):
+            index += 2
+        elif template.startswith("${", index):
+            depth += 1
+            index += 2
+        elif template[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+            index += 1
+        else:
+            index += 1
+    raise ValueError(f"Unterminated Compose interpolation in {template!r}")
+
+
+def _interpolate_compose_braced(
+    expression: str, environ: Mapping[str, str], template: str
+) -> str:
+    match = _COMPOSE_VARIABLE.match(expression)
+    if match is None:
+        raise ValueError(f"Invalid Compose interpolation in {template!r}")
+    name = match.group()
+    modifier = expression[match.end() :]
+    if not modifier:
+        return _compose_variable(name, environ, template)
+    operator = next(
+        (
+            candidate
+            for candidate in (":-", ":?", ":+", "-", "?", "+")
+            if modifier.startswith(candidate)
+        ),
+        None,
+    )
+    if operator is None:
+        raise ValueError(f"Invalid Compose interpolation in {template!r}")
+    # As in Docker Compose, the colon forms also treat an empty value as
+    # unset, and the argument is expanded only when it is used.
+    value = environ.get(name)
+    present = value is not None and (value != "" or ":" not in operator)
+    argument = modifier[len(operator) :]
+    if operator.endswith("-"):
+        return value if present else _interpolate_compose(argument, environ)
+    if operator.endswith("+"):
+        return _interpolate_compose(argument, environ) if present else ""
+    if present:
+        return value
+    message = _interpolate_compose(argument, environ)
+    raise ValueError(
+        f"Compose variable {name!r} is required"
+        + (f": {message}" if message else "")
+    )
+
+
+def _interpolate_compose(template: str, environ: Mapping[str, str]) -> str:
+    """Expand Docker Compose ``$VAR`` and ``${VAR...}`` interpolation.
+
+    Supports ``$$`` escapes and the ``-``, ``?``, and ``+`` modifiers, each
+    with and without a colon. As in Docker Compose, a plain reference to an
+    unset variable becomes an empty string with a warning.
+    """
+    parts = []
+    index = 0
+    while (start := template.find("$", index)) != -1:
+        parts.append(template[index:start])
+        if template.startswith("$$", start):
+            parts.append("$")
+            index = start + 2
+        elif template.startswith("${", start):
+            end = _compose_closing_brace(template, start + 2)
+            parts.append(
+                _interpolate_compose_braced(
+                    template[start + 2 : end], environ, template
+                )
+            )
+            index = end + 1
+        elif match := _COMPOSE_VARIABLE.match(template, start + 1):
+            parts.append(_compose_variable(match.group(), environ, template))
+            index = match.end()
+        else:
+            raise ValueError(f"Invalid Compose interpolation in {template!r}")
+    parts.append(template[index:])
+    return "".join(parts)
+
+
+def _interpolate_compose_tree(value: Any, environ: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        return _interpolate_compose(value, environ)
+    if isinstance(value, list):
+        return [_interpolate_compose_tree(item, environ) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _interpolate_compose_tree(item, environ)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _compose_path(value: str, base_dir: Path) -> str:
     path = Path(value).expanduser()
     return str((path if path.is_absolute() else base_dir / path).resolve())
 
@@ -263,27 +396,41 @@ def _normalize_volumes(
     normalized = []
     for volume in volumes:
         error = (
-            "singularity-compose supports only writable bind mounts "
-            f"on service {name!r}: {volume!r}"
+            "singularity-compose supports only SOURCE:TARGET[:ro|rw] bind "
+            f"mounts on service {name!r}: {volume!r}"
         )
         if isinstance(volume, dict):
             if (
                 set(volume) - {"read_only", "source", "target", "type"}
                 or volume.get("type") != "bind"
-                or volume.get("read_only", False) is not False
+                or not isinstance(volume.get("read_only", False), bool)
                 or not all(
                     isinstance(volume.get(field), str)
                     for field in ("source", "target")
                 )
             ):
                 raise ValueError(error)
-            volume = f"{volume['source']}:{volume['target']}"
-        if not isinstance(volume, str) or volume.count(":") != 1:
+            volume = f"{volume['source']}:{volume['target']}" + (
+                ":ro" if volume.get("read_only") else ""
+            )
+        parts = volume.split(":") if isinstance(volume, str) else []
+        if (
+            len(parts) not in (2, 3)
+            or not parts[0].startswith(("/", ".", "~"))
+            or not parts[1].startswith("/")
+            or parts[2:] not in ([], ["ro"], ["rw"])
+        ):
             raise ValueError(error)
-        source, target = volume.split(":", 1)
-        if not source.startswith(("/", ".", "~")) or not target.startswith("/"):
-            raise ValueError(error)
-        normalized.append(f"{_compose_path(source, base_dir)}:{target}")
+        # Singularity splits its bind list on commas.
+        if "," in volume:
+            raise ValueError(
+                "Singularity bind mounts cannot contain commas on "
+                f"service {name!r}: {volume!r}"
+            )
+        normalized.append(
+            f"{_compose_path(parts[0], base_dir)}:{parts[1]}"
+            + (":ro" if parts[2:] == ["ro"] else "")
+        )
     return normalized
 
 
@@ -364,11 +511,17 @@ def _normalize_compose_service(
         replicas = (
             deploy.get("replicas", 1) if isinstance(deploy, dict) else None
         )
-        if not isinstance(deploy, dict) or set(deploy) - {"replicas"}:
+        if not isinstance(deploy, dict) or set(deploy) - {
+            "replicas",
+            "resources",
+        }:
             raise ValueError(
-                "singularity-compose supports only deploy.replicas on service "
-                f"{name!r}"
+                "singularity-compose supports only deploy.replicas and "
+                f"deploy.resources on service {name!r}"
             )
+        # Like the task's cpus and memory_mb, Compose resource limits are
+        # not enforced; Harbor's Terminal-Bench adapter always emits them.
+        deploy.pop("resources", None)
         if type(replicas) is not int or replicas < 1:
             raise ValueError(
                 f"Docker Compose replicas on service {name!r} must be a positive integer"
@@ -378,7 +531,15 @@ def _normalize_compose_service(
     )
 
 
-def _load_docker_compose(paths: list[Path]) -> dict[str, Any]:
+def _load_docker_compose(
+    paths: list[Path], environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Load, interpolate, validate, and merge Docker Compose files.
+
+    Interpolation uses ``environ``, which defaults to the host environment,
+    and happens once here so later stages see literal values.
+    """
+    environ = os.environ if environ is None else environ
     config: dict[str, Any] = {"services": {}}
     for path in paths:
         try:
@@ -389,6 +550,10 @@ def _load_docker_compose(paths: list[Path]) -> dict[str, Any]:
             ) from exc
         if not isinstance(overlay, dict):
             raise ValueError(f"Docker Compose file must be a mapping: {path}")
+        try:
+            overlay = _interpolate_compose_tree(overlay, environ)
+        except ValueError as exc:
+            raise ValueError(f"Docker Compose file {path}: {exc}") from exc
         unsupported = set(overlay) - {"name", "services", "version"}
         if unsupported:
             raise ValueError(
@@ -443,45 +608,43 @@ def _compose_key(identity: str, service: str) -> str:
     return f"u{identity}-{safe_service}-{service_hash}"
 
 
-def _resolve_compose_value(key: str, value: Any) -> str:
+def _resolve_compose_value(
+    key: str, value: Any, environ: Mapping[str, str] | None = None
+) -> str:
     if value is None:
         try:
-            return os.environ[key]
+            return (os.environ if environ is None else environ)[key]
         except KeyError as exc:
             raise ValueError(
                 f"Environment variable {key!r} is not set on the host"
             ) from exc
-    scalar = str(value).lower() if isinstance(value, bool) else str(value)
-    literal_marker = "\0URSA_COMPOSE_DOLLAR\0"
-    template = scalar.replace("$$", literal_marker)
-    resolved = resolve_env_vars({key: template})[key]
-    if "$" in template and resolved == template:
-        raise ValueError(
-            "Compose interpolation is supported only when the whole value "
-            f"is a ${{VARIABLE}} template: {scalar!r}"
-        )
-    return resolved.replace(literal_marker, "$")
+    # ``_load_docker_compose`` has already interpolated Compose values.
+    return str(value).lower() if isinstance(value, bool) else str(value)
 
 
 def _resolve_compose_mapping(
     values: dict[str, Any] | list[str],
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Resolve Compose environment/build arguments in mapping or list form."""
     if isinstance(values, dict):
         return {
-            key: _resolve_compose_value(key, value)
+            key: _resolve_compose_value(key, value, environ)
             for key, value in values.items()
         }
     resolved = {}
     for entry in values:
         key, separator, value = entry.partition("=")
         resolved[key] = _resolve_compose_value(
-            key, value if separator else None
+            key, value if separator else None, environ
         )
     return resolved
 
 
-def _read_compose_env_file(path: Path) -> dict[str, str]:
+def _read_compose_env_file(
+    path: Path, environ: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    environ = os.environ if environ is None else environ
     environment = {}
     for number, raw_line in enumerate(path.read_text().splitlines(), 1):
         line = raw_line.strip()
@@ -495,7 +658,7 @@ def _read_compose_env_file(path: Path) -> dict[str, str]:
                 f"Invalid environment entry at {path}:{number}: {raw_line!r}"
             )
         if not separator:
-            environment[key] = _resolve_compose_value(key, None)
+            environment[key] = _resolve_compose_value(key, None, environ)
         elif len(value) >= 2 and value[0] == value[-1] == "'":
             environment[key] = value[1:-1]
         else:
@@ -503,7 +666,10 @@ def _read_compose_env_file(path: Path) -> dict[str, str]:
                 value = value[1:-1]
             elif " #" in value:
                 value = value.split(" #", 1)[0].rstrip()
-            environment[key] = _resolve_compose_value(key, value)
+            # Docker Compose resolves earlier entries of the file first.
+            environment[key] = _interpolate_compose(
+                value, {**environ, **environment}
+            )
     return environment
 
 
@@ -511,11 +677,18 @@ def _compose_environment(
     service_name: str,
     service: dict[str, Any],
     main_environment: Mapping[str, str],
+    interpolation_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     environment = {}
     for path in service.get("env_file", []):
-        environment.update(_read_compose_env_file(Path(path)))
-    environment.update(_resolve_compose_mapping(service.get("environment", {})))
+        environment.update(
+            _read_compose_env_file(Path(path), interpolation_environment)
+        )
+    environment.update(
+        _resolve_compose_mapping(
+            service.get("environment", {}), interpolation_environment
+        )
+    )
     if service_name == "main":
         environment.update(main_environment)
     return environment
@@ -561,9 +734,23 @@ def _compose_volumes(
     staging_dir: Path,
     environment_file: Path | None,
     main_mounts: Sequence[Mapping[str, Any]],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Return a service's volumes and the binds to pass as start options.
+
+    singularity-compose 0.1.19 splits each volume into exactly ``src:dst``,
+    so read-only binds go to ``start.options``, which follow the volumes on
+    the command line. Binds nested inside a read-only one go there too, so
+    the read-only parent cannot hide them.
+    """
     volumes = list(service.get("volumes", []))
-    targets = {volume.split(":", 1)[1] for volume in volumes}
+    for volume in volumes:
+        source = volume.split(":")[0]
+        if not Path(source).exists():
+            raise FileNotFoundError(
+                f"Bind mount source on service {service_name!r} does not "
+                f"exist: {source}"
+            )
+    targets = {_volume_target(volume) for volume in volumes}
     if "/staging" in targets:
         raise ValueError("/staging is reserved by the Harbor environment")
     volumes.append(f"{staging_dir}:/staging")
@@ -575,10 +762,6 @@ def _compose_volumes(
                     "Singularity supports only Harbor bind mounts, got "
                     f"{mount.get('type')!r}"
                 )
-            if mount.get("read_only"):
-                raise ValueError(
-                    "singularity-compose cannot preserve read-only Harbor mounts"
-                )
             target = str(mount["target"])
             if target == "/staging":
                 raise ValueError(
@@ -588,10 +771,13 @@ def _compose_volumes(
                 volumes = [
                     volume
                     for volume in volumes
-                    if volume.split(":", 1)[1] != target
+                    if _volume_target(volume) != target
                 ]
             targets.add(target)
-            volumes.append(f"{mount['source']}:{target}")
+            volumes.append(
+                f"{mount['source']}:{target}"
+                + (":ro" if mount.get("read_only") else "")
+            )
     if environment_file is not None:
         target = "/.singularity.d/env/91-ursa-compose.sh"
         if target in targets:
@@ -599,7 +785,85 @@ def _compose_volumes(
                 f"Compose environment mount conflicts on service {service_name!r}"
             )
         volumes.append(f"{environment_file}:{target}")
-    return volumes
+    # Mount parents before the paths nested inside them; a later parent bind
+    # would hide an earlier nested one.
+    volumes.sort(
+        key=lambda volume: len(PurePosixPath(_volume_target(volume)).parts)
+    )
+    read_only_targets = [
+        PurePosixPath(_volume_target(volume))
+        for volume in volumes
+        if volume.endswith(":ro")
+    ]
+
+    def under_read_only(volume: str) -> bool:
+        target = PurePosixPath(_volume_target(volume))
+        return any(
+            target.is_relative_to(parent) for parent in read_only_targets
+        )
+
+    return (
+        [volume for volume in volumes if not under_read_only(volume)],
+        [volume for volume in volumes if under_read_only(volume)],
+    )
+
+
+@cache
+def _runtime_lacks_setuid_starter(runtime: str) -> bool:
+    """Whether ``runtime`` is certainly an unprivileged (non-setuid) install.
+
+    A setuid installation ships a root-owned setuid ``starter-suid`` next to
+    ``starter`` in ``$LIBEXECDIR/{apptainer,singularity}/bin``; SingularityCE
+    and Apptainer both report ``LIBEXECDIR`` from ``buildcfg``. Without that
+    starter, Apptainer runs in a user namespace and gives non-root users only
+    ``--network none``. The answer is ``True`` only when a ``starter`` is
+    found without a setuid ``starter-suid`` beside it, so an unexpected
+    layout or a failing ``buildcfg`` never rejects a setuid installation.
+    """
+    libexec_dirs = []
+    try:
+        result = subprocess.run(
+            [runtime, "buildcfg"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is not None and not result.returncode:
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "LIBEXECDIR" and value.strip():
+                libexec_dirs.append(Path(value.strip()))
+    # Relocated unprivileged installations keep libexec beside bin.
+    with suppress(OSError):
+        libexec_dirs.append(Path(runtime).resolve().parent.parent / "libexec")
+    found_starter = False
+    for libexec in libexec_dirs:
+        for name in ("apptainer", "singularity"):
+            bin_dir = libexec / name / "bin"
+            try:
+                starter_suid = (bin_dir / "starter-suid").stat()
+            except OSError:
+                pass
+            else:
+                if starter_suid.st_uid == 0 and (
+                    starter_suid.st_mode & stat.S_ISUID
+                ):
+                    return False
+            found_starter = found_starter or (bin_dir / "starter").is_file()
+    return found_starter
+
+
+def _compose_uses_host_network(config: Mapping[str, Any]) -> bool:
+    """Whether a Compose project is a lone ``main`` that skips the bridge."""
+    services = config["services"]
+    return (
+        list(services) == ["main"]
+        and not services["main"].get("ports")
+        and services["main"].get("deploy", {}).get("replicas", 1) == 1
+    )
 
 
 async def docker_compose_to_singularity_compose(
@@ -616,8 +880,13 @@ async def docker_compose_to_singularity_compose(
     main_agent_layer: Path | None = None,
     main_overlay: Path | None = None,
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
+    interpolation_environment: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
-    """Convert one or more Docker Compose files into a singularity-compose file."""
+    """Convert one or more Docker Compose files into a singularity-compose file.
+
+    ``interpolation_environment`` supplies the Compose variables and defaults
+    to the host environment.
+    """
     if fakeroot is None:
         fakeroot = (
             Path(DockerfileSingularityEnvironment._runtime()).name
@@ -628,7 +897,11 @@ async def docker_compose_to_singularity_compose(
         if isinstance(docker_compose_paths, Path)
         else list(docker_compose_paths)
     )
-    config = _load_docker_compose(paths)
+    config = _load_docker_compose(paths, interpolation_environment)
+    # A lone main service needs no bridge: host networking matches the
+    # non-Compose path and needs no CNI networking, which unprivileged
+    # runtimes lack.
+    host_network = _compose_uses_host_network(config)
     service_keys = {
         name: _compose_key(identity, name) for name in config["services"]
     }
@@ -668,7 +941,12 @@ async def docker_compose_to_singularity_compose(
             project_dir,
             identity,
             name,
-            _compose_environment(name, service, main_environment or {}),
+            _compose_environment(
+                name,
+                service,
+                main_environment or {},
+                interpolation_environment,
+            ),
         )
         start_options = ["containall", "no-home"]
         if fakeroot:
@@ -681,7 +959,7 @@ async def docker_compose_to_singularity_compose(
             start_options.append("writable-tmpfs")
         network: dict[str, Any] = {
             "allocate_ip": network_mode == NetworkMode.PUBLIC,
-            "enable": True,
+            "enable": network_mode != NetworkMode.PUBLIC or not host_network,
         }
         start: dict[str, Any] = {"options": start_options}
         instance: dict[str, Any] = {
@@ -691,7 +969,7 @@ async def docker_compose_to_singularity_compose(
         }
         if network_mode != NetworkMode.PUBLIC:
             network["type"] = "none"
-        volumes = _compose_volumes(
+        volumes, start_binds = _compose_volumes(
             name,
             service,
             staging_dir=staging_dir,
@@ -700,6 +978,9 @@ async def docker_compose_to_singularity_compose(
         )
         if volumes:
             instance["volumes"] = volumes
+        # singularity-compose passes these through as ``--bind=src:dst[:ro]``
+        # after the volume binds.
+        start_options.extend(f"bind={bind}" for bind in start_binds)
         if depends_on := service.get("depends_on", []):
             instance["depends_on"] = [
                 key
@@ -887,6 +1168,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._compose_file: Path | None = None
         self._compose_instances: dict[str, list[str]] = {}
         self._compose_uses_sudo = False
+        self._compose_host_network = False
         self._sif_use_token = f"{os.getpid()}-{secrets.token_hex(16)}"
         self._sifs_in_use: set[Path] = set()
         self._proxy_temp: tempfile.TemporaryDirectory[str] | None = None
@@ -1019,12 +1301,6 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             raise ValueError(
                 f"{_PROXY_CONTAINER_DIR} is reserved for network access"
             )
-        if self._uses_compose and any(
-            mount.get("read_only") for mount in self._mounts
-        ):
-            raise ValueError(
-                "singularity-compose cannot preserve read-only Harbor mounts"
-            )
         config = None
         if self._uses_compose:
             config = self._load_compose_config()
@@ -1065,8 +1341,40 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         paths.extend(self.extra_docker_compose_paths)
         return paths
 
+    def _compose_interpolation_environment(self) -> dict[str, str]:
+        """Return the variables Harbor's Docker backend gives Compose.
+
+        Harbor's infrastructure variables take precedence over the host
+        environment, the task's ``[environment].env``, and persistent env.
+        """
+        environment = dict(os.environ)
+        if self.task_env_config.env:
+            environment.update(resolve_env_vars(self.task_env_config.env))
+        environment.update(self._persistent_env)
+        main_image_name = getattr(self, "_compose_main_image_name", None)
+        if main_image_name is None:
+            # ``environment_id`` hashes the environment directory.
+            main_image_name = f"hb__{self.environment_id}".lower()
+            self._compose_main_image_name = main_image_name
+        memory_mb = self._effective_memory_mb
+        environment.update(
+            ComposeInfraEnvVars(
+                main_image_name=main_image_name,
+                context_dir=str(self.environment_dir.resolve()),
+                prebuilt_image_name=self.task_env_config.docker_image,
+                cpus=self._effective_cpus,
+                memory=f"{memory_mb}M" if memory_mb else None,
+            ).to_env_dict()
+        )
+        environment.update(
+            legacy_log_mount_env_vars(self._host_mounts, host_value="source")
+        )
+        return environment
+
     def _load_compose_config(self) -> dict[str, Any]:
-        return _load_docker_compose(self._compose_paths())
+        return _load_docker_compose(
+            self._compose_paths(), self._compose_interpolation_environment()
+        )
 
     @property
     def _workdir(self) -> str:
@@ -1372,7 +1680,8 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         failure_log_path: Path | None = None,
-    ) -> None:
+    ) -> str:
+        """Run a host command; return its output unless it goes to a log."""
         captured = (
             tempfile.NamedTemporaryFile(
                 mode="w+b",
@@ -1449,6 +1758,12 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     f"Command failed ({shlex.join(command)}) with exit code "
                     f"{process.returncode}:{detail}{log_note}"
                 )
+            if captured is not None:
+                return ""
+            stdout, stderr = cast(tuple[bytes, bytes], result)
+            return stdout.decode(errors="replace") + stderr.decode(
+                errors="replace"
+            )
         finally:
             if captured is not None:
                 captured.close()
@@ -1659,7 +1974,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             context = Path(build)
             return context / "Dockerfile", context, (), None
         context = Path(build.get("context", "."))
-        resolved_args = _resolve_compose_mapping(build.get("args", {}))
+        resolved_args = _resolve_compose_mapping(
+            build.get("args", {}), self._compose_interpolation_environment()
+        )
         return (
             context / build.get("dockerfile", "Dockerfile"),
             context,
@@ -1860,6 +2177,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             main_agent_layer=self._agent_layer_path,
             main_overlay=self._overlay_path,
             service_workdirs=service_workdirs,
+            interpolation_environment=self._compose_interpolation_environment(),
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -1874,9 +2192,18 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         ):
             raise RuntimeError("Invalid generated singularity-compose file")
         isolated = network_policy.network_mode != NetworkMode.PUBLIC
-        for instance in compose["instances"].values():
+        instances = compose["instances"].values()
+        # As in the conversion, a lone main instance without published ports
+        # uses host networking for public phases.
+        self._compose_host_network = len(instances) == 1 and not any(
+            instance.get("ports") for instance in instances
+        )
+        for instance in instances:
             network = instance.setdefault("network", {})
-            network.update(allocate_ip=not isolated, enable=True)
+            network.update(
+                allocate_ip=not isolated,
+                enable=isolated or not self._compose_host_network,
+            )
             if isolated:
                 network["type"] = "none"
             else:
@@ -1897,7 +2224,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 options.append(f"bind={self._proxy_bind()}")
         self._compose_file.write_text(yaml.safe_dump(compose, sort_keys=False))
 
-    async def _run_compose(self, *arguments: str) -> None:
+    async def _run_compose(self, *arguments: str) -> str:
         if self._compose_file is None or self._compose_project_dir is None:
             raise RuntimeError("Singularity Compose project is not prepared")
         executable = shutil.which("singularity-compose")
@@ -1911,7 +2238,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         environment["PATH"] = os.pathsep.join(
             part for part in (str(runtime_bin), environment.get("PATH")) if part
         )
-        await self._run(
+        return await self._run(
             executable,
             "--file",
             str(self._compose_file),
@@ -1921,6 +2248,80 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             cwd=self._compose_project_dir,
             env=environment,
         )
+
+    async def _verify_compose_instances(self, compose_output: str) -> None:
+        """Fail when ``singularity-compose up`` left an instance unstarted.
+
+        singularity-compose 0.1.19 reports a failed ``instance start`` as an
+        ERROR line and still exits 0, so the first exec would otherwise fail
+        with "no instance found".
+        """
+        expected = [
+            instance
+            for instances in self._compose_instances.values()
+            for instance in instances
+        ]
+        if not expected:
+            return
+        output = compose_output.strip()
+        try:
+            running = await self._list_instances()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}\nsingularity-compose output:\n"
+                + (output or "<no output>")
+            ) from exc
+        missing = [instance for instance in expected if instance not in running]
+        if not missing:
+            return
+        fatal = [
+            line.strip() for line in output.splitlines() if "FATAL" in line
+        ]
+        message = (
+            "singularity-compose up exited successfully but did not start "
+            f"instance(s): {', '.join(missing)}"
+        )
+        if fatal:
+            message += "\n" + "\n".join(fatal)
+        if "--network=none" in output or "network requires root" in output:
+            message += f"\n{_COMPOSE_BRIDGE_REQUIREMENT}"
+        message += "\nsingularity-compose output:\n" + (output or "<no output>")
+        raise RuntimeError(message)
+
+    def _compose_needs_bridge(self) -> bool:
+        """Whether this Compose project starts instances on a bridge."""
+        if _compose_uses_host_network(self._load_compose_config()):
+            return False
+        # Restricted phases start every instance with ``--network none``.
+        return any(
+            policy.network_mode == NetworkMode.PUBLIC
+            for policy in (self._network_policy, *self._phase_network_policies)
+        )
+
+    def _raise_if_compose_bridge_unavailable(self) -> None:
+        """Fail before building when the runtime offers only --network none.
+
+        Detection is conservative: root, ``singularity_fakeroot=false``, and
+        any installation with a setuid starter are never rejected here; an
+        undetected failure is still caught after ``up``.
+        """
+        if not self._uses_compose:
+            return
+        runtime = self._instance_runtime()
+        if not self._fakeroot or os.geteuid() == 0:
+            # Without fakeroot, singularity-compose never asks the runtime for
+            # a bridge: it uses sudo for published ports and otherwise adds
+            # ``--network none``.
+            return
+        if not self._compose_needs_bridge():
+            return
+        if _runtime_lacks_setuid_starter(runtime):
+            raise RuntimeError(
+                "This task's Compose project needs bridge networking for its "
+                f"sidecars or published ports, but {runtime} is an "
+                "unprivileged installation without a setuid starter. "
+                f"{_COMPOSE_BRIDGE_REQUIREMENT}"
+            )
 
     def _add_compose_service_aliases(self) -> None:
         if self._compose_project_dir is None:
@@ -1958,6 +2359,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._compose_file = None
         self._compose_instances = {}
         self._compose_uses_sudo = False
+        self._compose_host_network = False
 
     def _instance_exec_prefix(
         self,
@@ -2088,7 +2490,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         }
         if self._uses_compose:
             configured_targets.update(
-                PurePosixPath(volume.split(":", 1)[1])
+                PurePosixPath(_volume_target(volume))
                 for volume in self._load_compose_config()["services"][
                     "main"
                 ].get("volumes", [])
@@ -2377,9 +2779,22 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 compose_arguments = ["up"]
                 if self._overlay_path is not None:
                     compose_arguments.append("--read_only")
+                if self._compose_host_network:
+                    # Its generated /etc/hosts maps the instance to a bridge
+                    # address it never gets, and its resolv.conf lists only
+                    # public resolvers. Keep the host's files, as without
+                    # Compose.
+                    compose_arguments.append("--no-resolv")
                 self._instance_start_attempted = True
-                await self._run_compose(*compose_arguments)
-            if network_policy.network_mode == NetworkMode.PUBLIC:
+                compose_output = await self._run_compose(*compose_arguments)
+            if not self._compose_uses_sudo:
+                # Instances started through sudo belong to root and are not
+                # listed for the invoking user.
+                await self._verify_compose_instances(compose_output or "")
+            if (
+                network_policy.network_mode == NetworkMode.PUBLIC
+                and not self._compose_host_network
+            ):
                 self._add_compose_service_aliases()
         else:
             self._instance_start_attempted = True
@@ -2616,6 +3031,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         if sys.platform == "win32":
             raise RuntimeError("Singularity is unavailable on Windows")
         try:
+            self._raise_if_compose_bridge_unavailable()
             await self._prepare_workdir(force_build)
             self._sif_path = await self._build_main_sif(force_build)
             if self._sif_path is not None:
