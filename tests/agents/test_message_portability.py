@@ -243,3 +243,111 @@ def test_portable_flag_disables_rewrite(tmp_path):
     finally:
         agent.close()
     assert "encrypted_content" in json.dumps(state["messages"][1].content)
+
+
+def _invalid_call_turn(*, text: str = "", valid: bool = False) -> AIMessage:
+    """A foreign turn whose ``edit_code`` call was cut off at the output limit."""
+    return AIMessage(
+        content=text,
+        tool_calls=(
+            [{"name": "run_command", "args": {"query": "pwd"}, "id": "call_ok"}]
+            if valid
+            else []
+        ),
+        invalid_tool_calls=[
+            {
+                "name": "edit_code",
+                "args": '{"path": "a.py", "new',
+                "id": "call_cut",
+                "error": None,
+                "type": "invalid_tool_call",
+            }
+        ],
+        response_metadata={"model_name": CLAUDE},
+        id="ai-cut",
+    )
+
+
+def _invalid_call_answer() -> ToolMessage:
+    return ToolMessage(
+        "Tool call not run: it was truncated.",
+        tool_call_id="call_cut",
+        status="error",
+        id="t-cut",
+    )
+
+
+def _tool_results_have_calls(messages) -> bool:
+    calls = {
+        call["id"]
+        for m in messages
+        if isinstance(m, AIMessage)
+        for call in [*m.tool_calls, *m.invalid_tool_calls]
+    }
+    return all(
+        m.tool_call_id in calls for m in messages if isinstance(m, ToolMessage)
+    )
+
+
+def test_foreign_invalid_only_turn_drops_its_tool_answer():
+    msgs = [
+        HumanMessage("edit a.py", id="h-1"),
+        _invalid_call_turn(),
+        _invalid_call_answer(),
+        HumanMessage("continue", id="h-2"),
+    ]
+    out, changed = make_portable(msgs, _NamedModel())
+    assert changed
+    assert [m.id for m in out] == ["h-1", "h-2"]
+    assert make_portable(out, _NamedModel()) == (out, False)
+
+
+def test_foreign_invalid_call_beside_valid_call_keeps_valid_pair():
+    msgs = [
+        HumanMessage("edit a.py", id="h-1"),
+        _invalid_call_turn(text="Editing.", valid=True),
+        ToolMessage("/work", tool_call_id="call_ok", id="t-ok"),
+        _invalid_call_answer(),
+    ]
+    out, _ = make_portable(msgs, _NamedModel())
+    assert [m.id for m in out] == ["h-1", "ai-cut", "t-ok"]
+    assert out[1].text == "Editing."
+    assert [c["id"] for c in out[1].tool_calls] == ["call_ok"]
+    assert out[1].invalid_tool_calls == []
+    assert _tool_results_have_calls(out)
+
+
+def test_native_invalid_call_and_answer_are_kept():
+    msgs = [
+        HumanMessage("edit a.py"),
+        _invalid_call_turn(),
+        _invalid_call_answer(),
+    ]
+    out, changed = make_portable(msgs, _NamedModel(model_name=CLAUDE))
+    assert not changed and out == msgs
+
+
+def test_model_switch_after_answered_invalid_call_leaves_no_orphan(tmp_path):
+    agent = BasicChatAgent(llm=_NamedModel(), workspace=tmp_path)
+    try:
+        state, overwrite = agent.prepare_messages_context(
+            {
+                "messages": [
+                    HumanMessage("edit a.py"),
+                    _invalid_call_turn(),
+                    _invalid_call_answer(),
+                ]
+            },
+            summarize=False,
+        )
+    finally:
+        agent.close()
+    assert overwrite
+    assert not any(isinstance(m, ToolMessage) for m in state["messages"])
+    assert _tool_results_have_calls(state["messages"])
+
+
+def test_summary_render_lists_invalid_tool_calls():
+    rendered = _render_for_summary([_invalid_call_turn()])
+    assert "[invalid tool call call_cut] edit_code" in rendered
+    assert '"new' not in rendered

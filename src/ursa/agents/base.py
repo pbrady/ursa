@@ -183,6 +183,12 @@ _SUMMARIZE_INSTRUCTIONS = (
     "results obtained, open questions, and the current step."
 )
 
+_INVALID_TOOL_CALL_RESPONSE = (
+    "Tool call not run: it was truncated (the response hit the output "
+    "limit) or had invalid arguments. Reissue it with complete JSON "
+    "arguments."
+)
+
 
 def _message_text(m: BaseMessage) -> str:
     """Visible content of ``m`` for plain-text transcripts (summaries).
@@ -219,6 +225,11 @@ def _render_for_summary(msgs: Sequence[BaseMessage]) -> str:
         for tc in getattr(m, "tool_calls", None) or []:
             out.append(
                 f"[tool call {tc.get('id')}] {tc.get('name')}({tc.get('args')})"
+            )
+        for tc in getattr(m, "invalid_tool_calls", None) or []:
+            out.append(
+                f"[invalid tool call {tc.get('id')}] {tc.get('name')}"
+                " (truncated or invalid arguments)"
             )
     return "\n\n".join(out)
 
@@ -937,12 +948,28 @@ class BaseAgent(Generic[TState], ABC):
         raise NotImplementedError()
 
     def _message_tool_call_ids(self, msg: Any) -> list[str]:
-        """Return LangChain tool-call IDs requested by a message, if any."""
-        return [
-            call["id"]
-            for call in getattr(msg, "tool_calls", []) or []
-            if "id" in call
+        """Return LangChain tool-call IDs requested by a message, if any.
+
+        Invalid tool calls count too. A call whose arguments are not valid
+        JSON (for example one cut off at the output token limit) lands in
+        ``invalid_tool_calls``, but providers still send it back as a call
+        (OpenAI's Responses API keeps the ``function_call`` item), and the
+        next request is refused unless a tool output answers it.
+        """
+        calls = [
+            *(getattr(msg, "tool_calls", None) or []),
+            *(getattr(msg, "invalid_tool_calls", None) or []),
         ]
+        return [call["id"] for call in calls if call.get("id")]
+
+    @staticmethod
+    def _invalid_tool_call_ids(msg: Any) -> set[str]:
+        """Return the IDs of a message's invalid (unparseable) tool calls."""
+        return {
+            call["id"]
+            for call in getattr(msg, "invalid_tool_calls", None) or []
+            if call.get("id")
+        }
 
     def _sanitize_history(
         self,
@@ -1036,7 +1063,9 @@ class BaseAgent(Generic[TState], ABC):
         timed out, failed, or summarization trimmed it away, later model calls can
         fail with provider-side message validation errors. This utility inserts a
         synthetic response for any dangling tool call ID and truncates extremely
-        large tool messages.
+        large tool messages. An invalid tool call (arguments truncated at the
+        output limit or otherwise not valid JSON) is never run, so it gets an
+        error response asking the model to reissue it.
 
         Args:
             state: A graph state containing a ``messages`` list.
@@ -1058,6 +1087,7 @@ class BaseAgent(Generic[TState], ABC):
         )
 
         pending_tool_ids: list[str] = []
+        invalid_tool_ids: set[str] = set()
         for msg in new_state["messages"]:
             if isinstance(msg, ToolMessage):
                 if (
@@ -1076,6 +1106,7 @@ class BaseAgent(Generic[TState], ABC):
                 continue
 
             pending_tool_ids.extend(self._message_tool_call_ids(msg))
+            invalid_tool_ids.update(self._invalid_tool_call_ids(msg))
 
         if pending_tool_ids:
             summarized = True
@@ -1087,13 +1118,18 @@ class BaseAgent(Generic[TState], ABC):
             for tool_id in pending_tool_ids:
                 for msg_ind, msg in enumerate(new_state["messages"]):
                     if tool_id in self._message_tool_call_ids(msg):
-                        new_state["messages"].insert(
-                            msg_ind + 1,
-                            ToolMessage(
+                        if tool_id in invalid_tool_ids:
+                            tool_message = ToolMessage(
+                                content=_INVALID_TOOL_CALL_RESPONSE,
+                                tool_call_id=tool_id,
+                                status="error",
+                            )
+                        else:
+                            tool_message = ToolMessage(
                                 content=dangling_response,
                                 tool_call_id=tool_id,
-                            ),
-                        )
+                            )
+                        new_state["messages"].insert(msg_ind + 1, tool_message)
                         break
 
         return new_state, summarized

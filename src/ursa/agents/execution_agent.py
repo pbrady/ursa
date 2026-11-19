@@ -108,24 +108,59 @@ class ExecutionState(TypedDict):
     reviews_without_tools: NotRequired[int]
 
 
-def should_continue(state: ExecutionState) -> Literal["review", "continue"]:
-    """Return 'review' if no tool calls in the last message, else 'continue'.
+# Consecutive model turns whose only tool calls are invalid before the executor
+# stops retrying and hands the work to review.
+MAX_INVALID_TOOL_CALL_RETRIES = 3
+
+
+def _invalid_tool_call_turns(messages: list[AnyMessage]) -> int:
+    """Count the trailing AI turns that requested only invalid tool calls.
+
+    The error tool messages that answer those calls are skipped; any other
+    message ends the count.
+    """
+    turns = 0
+    for message in reversed(messages):
+        if isinstance(message, ToolMessage) and message.status == "error":
+            continue
+        if (
+            isinstance(message, AIMessage)
+            and message.invalid_tool_calls
+            and not message.tool_calls
+        ):
+            turns += 1
+            continue
+        break
+    return turns
+
+
+def should_continue(
+    state: ExecutionState,
+) -> Literal["review", "continue", "retry"]:
+    """Return 'continue' for tool calls, 'retry' for only invalid ones, else 'review'.
 
     Args:
         state: The current execution state containing messages.
 
     Returns:
-        A literal "review" if the last message has no tool calls,
-        otherwise "continue".
+        A literal "continue" if the last message has tool calls to run,
+        "retry" if its only tool calls are invalid (arguments truncated at
+        the output limit or not valid JSON), otherwise "review".
     """
     messages = state["messages"]
     last_message = messages[-1]
-    # If there is no tool call, then review the work before finishing.
-    if not last_message.tool_calls:
-        return "review"
-    # Otherwise if there is, we continue.
-    else:
+    if getattr(last_message, "tool_calls", None):
         return "continue"
+    # An invalid call cannot run, but it is not a final answer either: send
+    # the executor back to the model, whose history preparation answers the
+    # call with an error tool message so the model can reissue it.
+    if (
+        getattr(last_message, "invalid_tool_calls", None)
+        and _invalid_tool_call_turns(messages) <= MAX_INVALID_TOOL_CALL_RETRIES
+    ):
+        return "retry"
+    # If there is no tool call, then review the work before finishing.
+    return "review"
 
 
 def _review_is_complete(review: Any) -> bool:
@@ -644,7 +679,7 @@ class ExecutionAgent(AgentWithTools, BaseAgent[ExecutionState]):
         builder.add_conditional_edges(
             "agent",
             self._wrap_cond(should_continue, "should_continue", "executor"),
-            {"continue": "action", "review": "review"},
+            {"continue": "action", "retry": "agent", "review": "review"},
         )
         builder.add_edge("action", "agent")
         builder.add_conditional_edges(

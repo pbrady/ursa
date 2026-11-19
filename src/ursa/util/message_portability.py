@@ -28,6 +28,11 @@ allowlist: visible text + ``tool_calls``). New provider fields or block types
 therefore cannot leak into a foreign request. Messages from the current model,
 and messages of unknown origin, are left untouched, so single-model behavior
 is unchanged.
+
+Invalid tool calls (arguments truncated at the output limit or not valid JSON)
+of a foreign turn are dropped together with the tool messages that answer them:
+their raw argument strings are not portable, and a tool result without its call
+is refused by every provider.
 """
 
 from __future__ import annotations
@@ -119,7 +124,14 @@ def _portable_id(tool_call_id: Any) -> str:
     return "call_" + hashlib.sha256(tid.encode()).hexdigest()[:32]
 
 
-def _portable_ai(msg: AIMessage, id_map: dict[str, str]) -> AIMessage | None:
+def _portable_ai(
+    msg: AIMessage, id_map: dict[str, str], dropped_ids: set[str]
+) -> AIMessage | None:
+    dropped_ids.update(
+        str(call["id"])
+        for call in msg.invalid_tool_calls
+        if call.get("id") is not None
+    )
     calls = []
     for call in msg.tool_calls:
         new_id = _portable_id(call.get("id"))
@@ -155,18 +167,23 @@ def make_portable(
     Returns ``(messages, changed)``. Text and tool calls are kept; reasoning,
     signatures, encrypted content, item ids/status, and provider metadata of
     foreign turns are dropped. Unsafe foreign tool-call ids are rewritten
-    consistently in the matching ``ToolMessage``\\ s. Idempotent.
+    consistently in the matching ``ToolMessage``\\ s. Invalid tool calls of
+    foreign turns are dropped along with the ``ToolMessage``\\ s answering them,
+    so no tool result is left without its call. Idempotent.
     """
     target = model_name(llm)
     out: list[BaseMessage] = []
     id_map: dict[str, str] = {}
+    dropped_ids: set[str] = set()
     changed = False
     for msg in messages:
         if is_foreign(msg, target):
             changed = True
-            rebuilt = _portable_ai(msg, id_map)
+            rebuilt = _portable_ai(msg, id_map, dropped_ids)
             if rebuilt is not None:
                 out.append(rebuilt)
+        elif isinstance(msg, ToolMessage) and msg.tool_call_id in dropped_ids:
+            continue
         elif (
             isinstance(msg, ToolMessage)
             and id_map.get(msg.tool_call_id, msg.tool_call_id)

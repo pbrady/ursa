@@ -367,3 +367,56 @@ async def test_details_file_has_one_section_per_iteration(tmpdir):
         -1
     ].read_text(encoding="utf-8")
     assert text.count("\\subsection") == 2
+
+
+@pytest.mark.asyncio
+async def test_phase_requests_answer_truncated_tool_call(tmpdir):
+    """A phase that ends on an invalid tool call leaves no orphan call."""
+    from langchain_openai.chat_models.base import _convert_message_to_dict
+
+    log: list = []
+
+    class _Recorder(ToolReadyFakeChatModel):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            log.append(list(messages))
+            return super()._generate(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+
+    def stream() -> Iterator[AIMessage]:
+        # langchain-openai keeps a call whose arguments were cut off at
+        # the output limit in invalid_tool_calls and sends it back.
+        yield AIMessage(
+            content="",
+            invalid_tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": " \n" * 50,
+                    "id": "call_truncated",
+                    "error": "Expecting value",
+                    "type": "invalid_tool_call",
+                }
+            ],
+        )
+        yield from _message_stream("ok")
+
+    agent = DeepReviewAgent(llm=_Recorder(messages=stream()), workspace=tmpdir)
+
+    await agent.ainvoke(dict(_DD_QUESTION))
+
+    resent = 0
+    for request in log[1:]:
+        payload = [_convert_message_to_dict(message) for message in request]
+        calls = {
+            call["id"]
+            for message in payload
+            for call in message.get("tool_calls") or []
+        }
+        outputs = {
+            message["tool_call_id"]
+            for message in payload
+            if message["role"] == "tool"
+        }
+        resent += "call_truncated" in calls
+        assert calls <= outputs
+    assert resent
