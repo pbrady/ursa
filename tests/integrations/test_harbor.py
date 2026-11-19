@@ -392,6 +392,32 @@ async def test_host_ca_mount_is_read_only(tmp_path, ubuntu_sif, monkeypatch):
         ).return_code != 0
 
 
+async def test_fakeroot_overlay_provides_a_writable_container_root(
+    tmp_path, ubuntu_sif
+):
+    _require_fakeroot(ubuntu_sif)
+    async with _environment(
+        tmp_path, ubuntu_sif, fakeroot=True, overlay=True
+    ) as env:
+        written = await env.exec(
+            "mkdir /created-at-runtime && printf overlay > "
+            "/created-at-runtime/value"
+        )
+        read_back = await env.exec("cat /created-at-runtime/value")
+        # Apptainer keeps the image's /tmp in the overlay, so a rename across
+        # it, as path-tracing-reverse's verifier does, works as under Docker.
+        # mv would fall back to a copy; perl-base is in every Ubuntu image.
+        renamed = await env.exec(
+            'cd /created-at-runtime && perl -e \'rename("value", '
+            '"/tmp/value") && rename("/tmp/value", "back") or die "$!\\n"\' '
+            "&& cat back"
+        )
+        assert written.return_code == 0, written.stderr
+        assert read_back.stdout == "overlay"
+        if env._keeps_image_tmp:
+            assert renamed.stdout == "overlay", renamed.stderr
+
+
 async def test_compose_overlay_survives_network_transition(
     tmp_path, ubuntu_sif
 ):
@@ -539,6 +565,21 @@ async def test_compose_sidecar_isolation_transfer_and_cleanup(
         _assert_instances_stopped(env, names)
     finally:
         await _cleanup(env, names)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="requires a genuinely unprivileged host user"
+)
+async def test_unprivileged_instance_has_a_writable_home(tmp_path, ubuntu_sif):
+    async with _environment(tmp_path, ubuntu_sif) as env:
+        result = await env.exec(
+            'mkdir -p "$HOME/.local/bin" && touch "$HOME/.local/bin/env" '
+            '&& echo "$HOME"'
+        )
+        override = await env.exec('echo "$HOME"', env={"HOME": "/tmp"})
+        assert result.return_code == 0, result.stderr
+        assert result.stdout.strip() == "/harbor-home"
+        assert override.stdout.strip() == "/tmp"
 
 
 @pytest.mark.parametrize("fakeroot", [None, True, False])

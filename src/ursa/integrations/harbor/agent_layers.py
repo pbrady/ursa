@@ -168,6 +168,11 @@ class _InstallEnvironment(DockerfileSingularityEnvironment):
     def _uses_compose(self) -> bool:
         return False
 
+    @property
+    def _uses_private_home(self) -> bool:
+        # The installation belongs in the layer, below the HOME trials use.
+        return False
+
     def _validate_definition(self) -> None:
         # The caller has already built/validated the task's actual main SIF.
         if not self._base_image.is_file():

@@ -164,8 +164,29 @@ Apptainer may help.
 With Apptainer fakeroot, writable overlays are created by
 `apptainer overlay create --fakeroot --sparse` so their ownership matches the
 container's user namespace. Overlay size follows `[environment].storage_mb`
-(default 1024 MiB); Apptainer requires at least 64 MiB. Singularity and runs
-without fakeroot retain the host-created ext3 overlay.
+(default 10240 MiB; the image is sparse, so this only caps what a task can
+write); Apptainer requires at least 64 MiB. Singularity and runs without
+fakeroot retain the host-created ext3 overlay.
+
+Over an Apptainer overlay the image's `/etc/localtime` is kept
+(`--no-mount /etc/localtime`), so packages such as tzdata can replace it. With
+fakeroot the image's `/tmp` and `/var/tmp` are kept in the overlay too
+(`--no-mount tmp`) and the task's workdir is not bind-mounted, but created in
+the overlay when the image lacks it, so renames between them and the rest of
+the filesystem work as under Docker. Otherwise the workdir is a writable bind,
+and a Harbor or Compose mount nested inside it, such as a data file under the
+workdir, gets a mount point created in the bind's host directory.
+
+Commands run with the image's `/root` as `HOME` when fakeroot has an overlay.
+Without fakeroot, or without an overlay, each instance gets a private writable
+home at `/harbor-home` instead, because the host's home is not mounted under
+`--containall`. A `HOME` passed in a command's environment is exported in the
+container shell, since both runtimes refuse to set `HOME` through
+`APPTAINERENV_`/`SINGULARITYENV_`.
+
+As in Harbor 0.25, trial log directories are bind-mounted to the host only
+with `--environment-kwarg auto_mounting=true`; otherwise they are writable
+directories in the trial's staging area that Harbor downloads.
 
 Validate tasks against URSA's Singularity constraints, or warm the SIF cache,
 without running an agent:

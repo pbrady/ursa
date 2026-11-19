@@ -38,6 +38,7 @@ def builder(monkeypatch):
         assert not self._harbor_writable_binds()
         assert not self._enable_environment_dir_upload
         assert not self._uses_compose
+        assert not self._uses_private_home
         assert self.task_env_config.storage_mb >= 4096
         self._overlay_path = self.trial_paths.trial_dir / "overlay.img"
         self._overlay_path.write_bytes(b"fresh overlay")

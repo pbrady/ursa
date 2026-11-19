@@ -79,6 +79,28 @@ _COMPOSE_SERVICE_FIELDS = frozenset({
 })
 _COMPOSE_BUILD_FIELDS = frozenset({"args", "context", "dockerfile", "target"})
 _HOST_CA_CERTIFICATES_FILENAME = "host-ca-certificates.crt"
+# Without fakeroot, Singularity keeps the host's HOME path but does not mount
+# it under --containall, so commands get a private writable home here instead.
+# Fakeroot without a disk overlay uses it too, since /root is read-only then.
+_CONTAINER_HOME = "/harbor-home"
+# Apptainer binds the host's /etc/localtime by default (a ``bind path`` in
+# apptainer.conf). Over a disk overlay, tzdata's postinst then cannot replace
+# it ("Device or resource busy"), so apt-get install of python3 and other
+# packages that need tzdata fails. Docker leaves the image's file in place.
+_HOST_LOCALTIME = "/etc/localtime"
+# Apptainer also binds the instance's --workdir over /tmp and /var/tmp, a
+# separate filesystem from the overlay, so os.rename between /tmp and the rest
+# of the container fails with EXDEV. Over a disk overlay with fakeroot the
+# adapter keeps the image's directories instead, which the overlay makes
+# writable, as Docker does, and leaves the task's workdir unbound in the
+# overlay with them; see ``_harbor_writable_binds``. Without fakeroot the
+# invoking user cannot write the image's root-owned directories, even /tmp,
+# through the overlay, so only the workdir's and the binds are writable.
+_IMAGE_TMP = "tmp"
+# Overlay size for tasks without storage_mb. The image is sparse, so this only
+# caps what a task can write; 1 GiB was too small for agents that install a
+# toolchain, such as Codex's Node and npm.
+_DEFAULT_OVERLAY_MB = 10240
 _PROXY_CONTAINER_DIR = "/run/ursa-proxy"
 _HARBOR_WRITABLE_BIND_TARGETS = (
     ("installed-agent", PurePosixPath("/installed-agent")),
@@ -1111,6 +1133,16 @@ def _runtime_lacks_setuid_starter(runtime: str) -> bool:
     return found_starter
 
 
+def _add_compose_home(
+    instance: dict[str, Any], home_root: Path | None, key: str
+) -> None:
+    if home_root is None:
+        return
+    home = home_root / key
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    instance["start"]["options"].append(f"home={home}:{_CONTAINER_HOME}")
+
+
 def _compose_uses_host_network(config: Mapping[str, Any]) -> bool:
     """Whether a Compose project is a lone ``main`` that skips the bridge."""
     services = config["services"]
@@ -1137,12 +1169,17 @@ async def docker_compose_to_singularity_compose(
     main_overlay: Path | None = None,
     service_workdirs: Mapping[str, Sequence[Path]] | None = None,
     interpolation_environment: Mapping[str, str] | None = None,
+    home_root: Path | None = None,
+    main_no_mounts: Sequence[str] = (),
 ) -> dict[str, list[str]]:
     """Convert one or more Docker Compose files into a singularity-compose file.
 
     ``interpolation_environment`` supplies the Compose variables and defaults
-    to the host environment. ``ignore_fakeroot_command`` adds
-    ``--ignore-fakeroot-command`` to fakeroot starts.
+    to the host environment. With ``home_root``, each instance gets a private
+    writable home below it instead of ``no-home``. ``main_no_mounts`` lists
+    default runtime mounts that the main service's overlay keeps from the
+    image. ``ignore_fakeroot_command`` adds ``--ignore-fakeroot-command`` to
+    fakeroot starts.
     """
     if fakeroot is None:
         fakeroot = _runtime_is_apptainer(
@@ -1204,7 +1241,9 @@ async def docker_compose_to_singularity_compose(
                 interpolation_environment,
             ),
         )
-        start_options = ["containall", "no-home"]
+        start_options = ["containall"]
+        if home_root is None:
+            start_options.append("no-home")
         if fakeroot:
             start_options.insert(0, "fakeroot")
             if ignore_fakeroot_command:
@@ -1213,6 +1252,7 @@ async def docker_compose_to_singularity_compose(
             start_options.append(f"overlay={main_agent_layer}:ro")
         if name == "main" and main_overlay is not None:
             start_options.append(f"overlay={main_overlay}")
+            start_options.extend(f"no-mount={path}" for path in main_no_mounts)
         elif main_overlay is not None:
             start_options.append("writable-tmpfs")
         network: dict[str, Any] = {
@@ -1255,6 +1295,7 @@ async def docker_compose_to_singularity_compose(
         if service_workdirs is None and replicas != 1:
             instance["deploy"] = {"replicas": replicas}
         if service_workdirs is None:
+            _add_compose_home(instance, home_root, key)
             instances[key] = instance
             instance_names[name] = [
                 f"{key}{replica}" for replica in range(1, replicas + 1)
@@ -1265,6 +1306,7 @@ async def docker_compose_to_singularity_compose(
             ):
                 replica = deepcopy(instance)
                 replica["start"]["options"].append(f"workdir={workdir}")
+                _add_compose_home(replica, home_root, instance_key)
                 instances[instance_key] = replica
             instance_names[name] = [
                 f"{instance_key}1" for instance_key in instance_keys[name]
@@ -2451,7 +2493,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             for name, service in compose_config["services"].items()
         }
         main_mounts = [
-            *self._mounts,
+            *self._host_mounts,
             *(
                 {
                     "type": "bind",
@@ -2478,6 +2520,12 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             main_overlay=self._overlay_path,
             service_workdirs=service_workdirs,
             interpolation_environment=self._compose_interpolation_environment(),
+            home_root=(
+                self._staging / "harbor-home"
+                if self._uses_private_home
+                else None
+            ),
+            main_no_mounts=self._overlay_no_mounts,
         )
         self._instance_name = self._compose_instances["main"][0]
 
@@ -2708,12 +2756,15 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 self._runtime_workdir("main"),
                 network_policy=network_policy,
                 include_overlay=True,
+                home=self._home_options(),
             )
         )
+        for path in self._overlay_no_mounts:
+            command.extend(["--no-mount", path])
         for source, target in self._harbor_writable_binds():
             command.extend(["-B", f"{source}:{target}"])
         command.extend(["-B", f"{self._staging_dir}:/staging"])
-        for mount in self._mounts:
+        for mount in self._host_mounts:
             if mount.get("type") != "bind":
                 raise ValueError("Singularity supports only Harbor bind mounts")
             if mount.get("target") == "/staging":
@@ -2738,9 +2789,10 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         network_policy: NetworkPolicy | None = None,
         include_overlay: bool = False,
         pwd: str | None = None,
+        home: Sequence[str] = ("--no-home",),
     ) -> list[str]:
         """Return the isolation options shared by starts and seed copies."""
-        args = ["--containall", "--no-home", "--workdir", str(workdir)]
+        args = ["--containall", *home, "--workdir", str(workdir)]
         if pwd is not None:
             args.extend(["--pwd", pwd])
         if self._fakeroot:
@@ -2757,6 +2809,42 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 args.append("--userns")
             args.extend(["--net", "--network", "none"])
         return args
+
+    @property
+    def _overlay_no_mounts(self) -> tuple[str, ...]:
+        # See ``_HOST_LOCALTIME`` and ``_IMAGE_TMP``. Only Apptainer drops the
+        # binds; SingularityCE keeps its default binds.
+        if self._overlay_path is None or not _runtime_is_apptainer(
+            self._instance_runtime()
+        ):
+            return ()
+        if not self._fakeroot:
+            return (_HOST_LOCALTIME,)
+        return (_HOST_LOCALTIME, _IMAGE_TMP)
+
+    @property
+    def _keeps_image_tmp(self) -> bool:
+        return _IMAGE_TMP in self._overlay_no_mounts
+
+    @property
+    def _uses_private_home(self) -> bool:
+        # Fakeroot's /root is writable only through the disk overlay; without
+        # one it sits on the read-only image root filesystem. An agent
+        # install layer always has an overlay, so with fakeroot its trials
+        # keep the /root it was installed under.
+        return not self._fakeroot or self._overlay_path is None
+
+    def _home_options(self) -> list[str]:
+        if not self._uses_private_home:
+            return ["--no-home"]
+        home = self._staging / "harbor-home" / "main"
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return ["--home", f"{home}:{_CONTAINER_HOME}"]
+
+    def _exec_home(self, env: Mapping[str, str]) -> str | None:
+        if "HOME" in env:
+            return env["HOME"]
+        return _CONTAINER_HOME if self._uses_private_home else None
 
     def _prepare_host_ca_certificates(self) -> Path | None:
         """Materialize the host OpenSSL trust store in the staging mount."""
@@ -2798,7 +2886,10 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             for name, target in _HARBOR_WRITABLE_BIND_TARGETS
         ]
         workdir = PurePosixPath(self._workdir)
-        if workdir != PurePosixPath("/"):
+        # Over a disk overlay that keeps the image's /tmp, the workdir stays
+        # in the overlay too: a bind there would be a separate mount, so
+        # os.rename between it and /tmp would still fail with EXDEV.
+        if workdir != PurePosixPath("/") and not self._keeps_image_tmp:
             candidates.append((root / "workdir", workdir))
         candidates.extend(
             (root / target.relative_to("/"), target)
@@ -2806,7 +2897,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         )
         configured_targets = {
             PurePosixPath(mount["target"])
-            for mount in self._mounts
+            for mount in self._host_mounts
             if mount.get("type") == "bind"
         }
         if self._uses_compose:
@@ -2832,7 +2923,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         # Harbor 0.25 mirrors /logs/artifacts below artifacts/logs/artifacts.
         # TrialPaths.mkdir() creates only the collection root. Unlike Docker,
         # Singularity requires automatic bind sources to exist at startup.
-        for mount in self._mounts:
+        for mount in self._host_mounts:
             if mount["target"] == str(EnvironmentPaths.artifacts_dir):
                 source = Path(mount["source"])
                 expected = self.trial_paths.host_artifact_path(
@@ -2845,12 +2936,58 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             source.mkdir(parents=True, exist_ok=True)
             source.chmod(0o777)
 
+    def _main_mount_sources(self) -> list[tuple[Path, PurePosixPath]]:
+        mounts = [
+            (Path(mount["source"]), PurePosixPath(mount["target"]))
+            for mount in self._host_mounts
+            if mount.get("type") == "bind"
+        ]
+        if self._uses_compose:
+            mounts.extend(
+                (
+                    Path(volume.split(":")[0]),
+                    PurePosixPath(_volume_target(volume)),
+                )
+                for volume in self._load_compose_config()["services"][
+                    "main"
+                ].get("volumes", [])
+            )
+        return mounts
+
+    def _prepare_nested_mount_points(self) -> None:
+        """Create mount points for mounts nested inside writable binds.
+
+        A mount such as a task's ``/app/data.h5`` under the ``/app`` workdir
+        bind needs a mount point in that bind's host directory, which the
+        runtime cannot create itself. This runs after seeding, so content
+        copied from the image is kept.
+        """
+        binds = self._harbor_writable_binds()
+        for mount_source, mount_target in self._main_mount_sources():
+            parents = [
+                (source, target)
+                for source, target in binds
+                if mount_target != target
+                and mount_target.is_relative_to(target)
+            ]
+            if not parents:
+                continue
+            source, target = max(parents, key=lambda bind: len(bind[1].parts))
+            placeholder = source / mount_target.relative_to(target)
+            if placeholder.exists() or placeholder.is_symlink():
+                continue
+            if mount_source.is_dir():
+                placeholder.mkdir(parents=True)
+            else:
+                placeholder.parent.mkdir(parents=True, exist_ok=True)
+                placeholder.touch()
+
     def _prepare_disk_overlay(self) -> None:
         """Create a sparse overlay with ownership suited to the runtime."""
         if self._scratch_dir is None:
             raise RuntimeError("Singularity scratch directory is not prepared")
         runtime = self._instance_runtime()
-        storage_mb = self.task_env_config.storage_mb or 1024
+        storage_mb = self.task_env_config.storage_mb or _DEFAULT_OVERLAY_MB
         layout = self._scratch_dir / "overlay-layout"
         overlay = self._scratch_dir / "overlay.img"
         try:
@@ -3245,6 +3382,15 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             self._instance_start_attempted = True
             await self._run(*self._instance_start_command(network_policy))
         self._instance_started = True
+        if self._keeps_image_tmp:
+            # Without its bind, the workdir that every exec starts in exists
+            # only if the image has it; Docker creates a missing one.
+            await self._run(
+                *self._instance_exec_prefix(default_cwd="/"),
+                "mkdir",
+                "-p",
+                self._workdir,
+            )
         await self._detect_shared_faked()
         # Also starts the shared faked before any agent command.
         if self._shared_faked:
@@ -3537,6 +3683,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     self._prepare_disk_overlay()
                 self._prepare_harbor_bind_sources()
                 await self._seed_harbor_bind_sources()
+                self._prepare_nested_mount_points()
                 if self._uses_compose:
                     # A forced pull also refreshes the sidecar SIFs.
                     await self._prepare_compose_project(
@@ -3677,8 +3824,13 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         default_cwd: str | None = None,
         resolve_default_user: bool = True,
         environment_file: str | None = None,
+        home: str | None = None,
     ) -> str:
         command = f"cd {shlex.quote(cwd or default_cwd or self._workdir)} && {command}"
+        if home is not None:
+            # Singularity and Apptainer refuse to set HOME through their
+            # environment prefixes, so export it in the container shell.
+            command = f"export HOME={shlex.quote(home)}; {command}"
         requested_user = (
             self._resolve_user(user) if resolve_default_user else user
         )
@@ -3743,7 +3895,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         for key, value in merged.items():
             if not key or "=" in key or "\0" in key or "\0" in value:
                 raise ValueError(f"Invalid environment variable: {key!r}")
-            runtime_env[f"{prefix}{key}"] = value
+            # ``_exec_shell_command`` exports HOME, which the runtime rejects.
+            if key != "HOME":
+                runtime_env[f"{prefix}{key}"] = value
         return runtime_env
 
     @contextmanager
@@ -3835,6 +3989,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             **((self._merge_env(env) if merge_persistent else env) or {}),
             **self._proxy_env,
         }
+        home = self._exec_home(configured_env)
         with self._staged_multiline_environment(command, configured_env) as (
             command,
             env,
@@ -3849,6 +4004,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 default_cwd=default_cwd,
                 resolve_default_user=merge_persistent,
                 environment_file=environment_file,
+                home=home,
             )
             runtime_command = [
                 *self._instance_exec_prefix(

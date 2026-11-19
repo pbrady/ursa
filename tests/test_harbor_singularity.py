@@ -55,6 +55,7 @@ def _environment(
     fakeroot: bool | str | None = False,
     agent: str | None = None,
     separate_verifier: bool = False,
+    auto_mounting: bool = False,
     extra_kwargs: dict[str, object] | None = None,
 ) -> DockerfileSingularityEnvironment:
     environment_dir = tmp_path / "environment"
@@ -105,6 +106,7 @@ def _environment(
         ]
         if separate_verifier
         else None,
+        auto_mounting=auto_mounting,
         **{
             "singularity_agent": agent,
             "singularity_fakeroot": fakeroot,
@@ -261,13 +263,13 @@ def test_overlay_creation_matches_runtime_and_fakeroot(
         if native:
             assert command[:3] == ["/usr/bin/apptainer", "overlay", "create"]
             assert {"--fakeroot", "--sparse"} <= set(command)
-            assert _option_value(command, "--size") == str(storage_mb or 1024)
+            assert _option_value(command, "--size") == str(storage_mb or 10240)
             assert not overlay.exists() and not layout.exists()
             overlay.touch()
         else:
             assert command[0] == formatter.return_value
             assert _option_value(command, "-d") == str(layout)
-            assert overlay.stat().st_size == (storage_mb or 1024) * 1024**2
+            assert overlay.stat().st_size == (storage_mb or 10240) * 1024**2
             for name in ("upper", "work"):
                 assert (layout / name).stat().st_mode & 0o777 == 0o777
 
@@ -3473,3 +3475,353 @@ async def test_fakeroot_command_setup_shadows_only_an_image_sudo(
     else:
         assert not shim.exists()
     assert harbor_singularity._SUDO_SHIM_MARKER in stash.read_text()
+
+
+@pytest.mark.parametrize("auto_mounting", [False, True])
+def test_log_dirs_bind_host_trial_only_with_auto_mounting(
+    tmp_path: Path, auto_mounting: bool
+):
+    environment = _environment(tmp_path, auto_mounting=auto_mounting)
+    environment._prepare_runtime_workdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    environment._staging_dir = staging
+    environment._sif_path = tmp_path / "image.sif"
+    trial_agent_dir = environment.trial_paths.agent_dir
+
+    start = environment._instance_start_command()
+    binds = [start[i + 1] for i, arg in enumerate(start) if arg == "-B"]
+    agent_binds = [bind for bind in binds if bind.endswith(":/logs/agent")]
+
+    assert f"{tmp_path / 'workspace'}:/workspace" in binds
+    if auto_mounting:
+        assert agent_binds == [f"{trial_agent_dir}:/logs/agent"]
+    else:
+        # Harbor downloads unmounted logs; staging keeps /logs writable.
+        assert agent_binds == [
+            f"{staging / 'harbor-writable' / 'logs' / 'agent'}:/logs/agent"
+        ]
+    assert (
+        environment.is_path_mounted("/logs/agent", trial_agent_dir)
+        is auto_mounting
+    )
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize(
+    ("fakeroot", "overlay", "agent"),
+    [
+        (False, False, None),
+        (False, True, None),
+        (True, True, None),
+        (True, False, None),
+        # Without fakeroot an agent layer's trial still needs a writable
+        # HOME; with fakeroot it keeps the layer's /root.
+        (False, True, "goose"),
+        (True, True, "goose"),
+    ],
+)
+def test_instance_home_is_private_unless_fakeroot_has_an_overlay(
+    tmp_path: Path, fakeroot: bool, overlay: bool, agent: str | None
+):
+    environment = _environment(
+        tmp_path, fakeroot=fakeroot, overlay=overlay, agent=agent
+    )
+    environment._prepare_runtime_workdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    environment._staging_dir = staging
+    environment._sif_path = tmp_path / "image.sif"
+    if overlay:
+        environment._overlay_path = tmp_path / "overlay.img"
+
+    start = environment._instance_start_command()
+
+    home = staging / "harbor-home" / "main"
+    if fakeroot and overlay:
+        # Fakeroot runs as root with a writable /root in the overlay.
+        assert "--no-home" in start
+        assert "--home" not in start
+        assert not home.exists()
+    else:
+        assert "--no-home" not in start
+        assert _option_value(start, "--home") == f"{home}:/harbor-home"
+        assert home.is_dir()
+        assert "--containall" in start
+    # Seed copies keep no home at all.
+    assert "--no-home" in environment._isolated_runtime_args(tmp_path)
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "overlay", "fakeroot", "expected"),
+    [
+        ("apptainer", True, True, ["/etc/localtime", "tmp"]),
+        # Without fakeroot the invoking user cannot write the image's
+        # root-owned /tmp or workdir through the overlay.
+        ("apptainer", True, False, ["/etc/localtime"]),
+        ("apptainer", False, True, []),
+        ("singularity", True, True, []),
+    ],
+)
+def test_apptainer_overlay_keeps_the_image_localtime_and_tmp(
+    tmp_path: Path,
+    runtime: str,
+    overlay: bool,
+    fakeroot: bool,
+    expected: list[str],
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    environment._runtime_path = str(tmp_path / runtime)
+    environment._workdir = "/app"
+    environment._prepare_runtime_workdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    environment._staging_dir = staging
+    environment._sif_path = tmp_path / "image.sif"
+    if overlay:
+        environment._overlay_path = tmp_path / "overlay.img"
+
+    start = environment._instance_start_command()
+
+    # tzdata's postinst cannot replace a bind-mounted /etc/localtime, and
+    # os.rename between /app and the workdir's /tmp fails with EXDEV.
+    no_mounts = [
+        start[index + 1]
+        for index, option in enumerate(start)
+        if option == "--no-mount"
+    ]
+    assert no_mounts == expected
+    # A bind over /app would be a mount of its own, and renames from it to
+    # the overlay's /tmp fail with EXDEV too.
+    workdir_bind = f"{staging / 'harbor-writable' / 'workdir'}:/app"
+    assert (workdir_bind in start) is ("tmp" not in expected)
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize("keep", [True, False])
+async def test_compose_main_overlay_keeps_the_image_localtime_and_tmp(
+    tmp_path: Path, keep: bool
+):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  main:\n"
+        "    image: ubuntu:24.04\n"
+        "  helper:\n"
+        "    image: redis:7\n"
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "singularity-compose.yml"
+
+    async def resolve(_name: str, service: dict[str, object]) -> str:
+        return str(service["image"])
+
+    await docker_compose_to_singularity_compose(
+        compose,
+        output,
+        identity="unit",
+        image_resolver=resolve,
+        staging_dir=staging,
+        fakeroot=True,
+        main_overlay=tmp_path / "overlay.img",
+        main_no_mounts=("/etc/localtime", "tmp") if keep else (),
+    )
+
+    instances = yaml.safe_load(output.read_text())["instances"]
+    options = {
+        key.split("-")[1]: instance["start"]["options"]
+        for key, instance in instances.items()
+    }
+    for option in ("no-mount=/etc/localtime", "no-mount=tmp"):
+        assert (option in options["main"]) is keep
+        assert option not in options["helper"]
+
+
+@pytest.mark.parametrize(
+    ("runtime", "fakeroot", "creates"),
+    [
+        ("apptainer", True, True),
+        ("apptainer", False, False),
+        ("singularity", True, False),
+    ],
+)
+async def test_instance_start_creates_an_unbound_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: str,
+    fakeroot: bool,
+    creates: bool,
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
+    environment._runtime_path = str(tmp_path / runtime)
+    commands: list[list[str]] = []
+
+    async def run(*command: str, **_kwargs: object) -> str:
+        commands.append(list(command))
+        return ""
+
+    monkeypatch.setattr(environment, "_run", run)
+    monkeypatch.setattr(
+        environment, "_instance_start_command", lambda _policy: ["start"]
+    )
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    # Over Apptainer's overlay with fakeroot the workdir has no bind, so the
+    # start creates it before the first exec that starts in it.
+    created = [
+        index
+        for index, command in enumerate(commands)
+        if command[-3:] == ["mkdir", "-p", environment._workdir]
+    ]
+    assert created == ([1] if creates else [])
+    for index in created:
+        assert _option_value(commands[index], "--pwd") == "/"
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize(
+    ("fakeroot", "overlay", "env", "expected"),
+    [
+        (False, False, None, "/harbor-home"),
+        (False, False, {"HOME": "/custom"}, "/custom"),
+        (True, True, None, None),
+        (True, True, {"HOME": "/custom"}, "/custom"),
+        (True, False, None, "/harbor-home"),
+    ],
+)
+async def test_exec_exports_home_instead_of_runtime_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fakeroot: bool,
+    overlay: bool,
+    env: dict[str, str] | None,
+    expected: str | None,
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    _prepare_started_environment(environment, tmp_path)
+    if not overlay:
+        environment._overlay_path = None
+    observed: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def spawn(*command: str, **kwargs: object) -> Process:
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        return Process()
+
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+
+    await environment.exec("true", env=env, user="root")
+
+    shell = observed["command"][-1]
+    runtime_env = observed["env"]
+    assert isinstance(shell, str) and isinstance(runtime_env, dict)
+    # Both runtimes refuse HOME through their environment prefixes.
+    assert "SINGULARITYENV_HOME" not in runtime_env
+    assert "APPTAINERENV_HOME" not in runtime_env
+    if expected is None:
+        assert "export HOME" not in shell
+    else:
+        assert f"export HOME={expected}; cd " in shell
+    environment._cleanup_staging()
+
+
+async def test_compose_home_option_replaces_no_home_without_fakeroot(
+    tmp_path: Path,
+):
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  main:\n    image: x\n"
+        "  helper:\n    image: x\n    deploy:\n      replicas: 2\n"
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "singularity-compose.yml"
+
+    async def resolve(_name: str, _service: dict[str, object]) -> str:
+        return "image.sif"
+
+    for fakeroot in (True, False):
+        await docker_compose_to_singularity_compose(
+            compose,
+            output,
+            identity="unit",
+            image_resolver=resolve,
+            staging_dir=staging,
+            fakeroot=fakeroot,
+            service_workdirs={
+                "main": (tmp_path / "main",),
+                "helper": (tmp_path / "helper-1", tmp_path / "helper-2"),
+            },
+            home_root=None if fakeroot else staging / "harbor-home",
+        )
+        instances = yaml.safe_load(output.read_text())["instances"]
+        assert len(instances) == 3
+        for key, instance in instances.items():
+            options = instance["start"]["options"]
+            homes = [option for option in options if option.startswith("home=")]
+            if fakeroot:
+                assert "no-home" in options
+                assert not homes
+            else:
+                assert "no-home" not in options
+                home = staging / "harbor-home" / key
+                assert homes == [f"home={home}:/harbor-home"]
+                assert home.is_dir()
+
+
+def test_nested_mount_gets_a_mount_point(tmp_path: Path):
+    environment = _environment(tmp_path)
+    data = tmp_path / "data"
+    data.mkdir()
+    data_file = tmp_path / "data.h5"
+    data_file.touch()
+    environment._host_mounts.extend([
+        {
+            "type": "bind",
+            "source": str(data),
+            "target": "/logs/agent/data",
+            "read_only": True,
+        },
+        {
+            "type": "bind",
+            "source": str(data_file),
+            "target": "/logs/verifier/data.h5",
+            "read_only": True,
+        },
+        {
+            "type": "bind",
+            "source": str(data_file),
+            "target": "/logs/artifacts/seeded",
+            "read_only": True,
+        },
+    ])
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    environment._staging_dir = staging
+    environment._prepare_harbor_bind_sources()
+    writable = staging / "harbor-writable" / "logs"
+    # Content the seed copied from the image at a mount target is kept.
+    (writable / "artifacts" / "seeded").mkdir()
+
+    environment._prepare_nested_mount_points()
+    environment._prepare_nested_mount_points()
+
+    assert (writable / "agent" / "data").is_dir()
+    assert (writable / "verifier" / "data.h5").is_file()
+    assert (writable / "artifacts" / "seeded").is_dir()
