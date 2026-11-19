@@ -117,8 +117,55 @@ _DEFAULT_OVERLAY_MB = 10240
 # open.
 _EXEC_OUTPUT_DRAIN_SEC = 10
 _PROXY_CONTAINER_DIR = "/run/ursa-proxy"
+# Debugging records go to <trial_dir>/debug; a separate verifier environment
+# uses a subdirectory of it. Live-instance reads are bounded so they cannot
+# hold up a stop; see ``_best_effort``.
+_DEBUG_DIR = "debug"
+_PROCESS_SNAPSHOT_TIMEOUT_SEC = 15
+_DEBUG_COPY_TIMEOUT_SEC = 600
+_DEBUG_LOG_CHOWN_TIMEOUT_SEC = 15
+# One line per process, read from /proc because minimal images have no ps.
+# Never reads /proc/<pid>/environ. Reading cmdline blocks on a process stuck
+# holding its memory lock, the case this exists for, so that read is killed
+# after a second when the image has timeout(1) and comes last on the line.
+# Elapsed seconds assume the usual 100 ticks per second.
+_PROCESS_SNAPSHOT_SCRIPT = r"""exec 2>/dev/null
+t=
+timeout -s KILL 1 true && t='timeout -s KILL 1'
+read -r up _ </proc/uptime
+up=${up%.*}
+echo '# pid ppid state wchan elapsed_sec cmdline'
+for d in /proc/[0-9]*; do
+  p=${d##*/}
+  [ "$p" = "$$" ] && continue
+  read -r s <"$d/stat" || continue
+  comm=${s#*\(}
+  comm=${comm%\)*}
+  set -- ${s##*\) }
+  w=
+  read -r w <"$d/wchan" || :
+  e='?'
+  case $up:${20} in
+    *[!0-9:]*|:*|*:) ;;
+    *) e=$((up - ${20} / 100)) ;;
+  esac
+  c=$($t tr '\000\n' '  ' <"$d/cmdline" | cut -c1-300)
+  printf '%s %s %s %s %s %s\n' "$p" "$2" "$1" "${w:-?}" "$e" "${c:-[$comm]}"
+done
+"""
+# Command lines can carry what the environment was kept out for.
+_SECRET_IN_COMMAND_LINE = re.compile(
+    r"(?i)("
+    r"\b[a-z0-9_]*(?:key|token|secret|password|passwd|credential)[a-z0-9_]*="
+    r"|--[a-z0-9-]*(?:key|token|secret|password)[= ]"
+    r"|\bbearer\s+"
+    r")\S+"
+)
+# The installed agent is thousands of files that say nothing about the trial,
+# so ``--no-delete`` does not copy it.
+_INSTALLED_AGENT_BIND = "installed-agent"
 _HARBOR_WRITABLE_BIND_TARGETS = (
-    ("installed-agent", PurePosixPath("/installed-agent")),
+    (_INSTALLED_AGENT_BIND, PurePosixPath("/installed-agent")),
     ("solution", EnvironmentPaths.solution_dir),
     ("tests", EnvironmentPaths.tests_dir),
     ("skills", EnvironmentPaths.default_skills_dir),
@@ -1518,6 +1565,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._compose_identity = f"{identity[:8]}{secrets.token_hex(4)}"
         self._instance_started = False
         self._instance_start_attempted = False
+        # Network phases restart the instance; each start is appended to
+        # debug/start.sh after the first.
+        self._start_recorded = False
         # Set by the first instance exec when Apptainer wraps execs in the
         # fakeroot command; see ``_SHARED_FAKED_SCRIPT``.
         self._shared_faked = False
@@ -3676,6 +3726,22 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     # Compose.
                     compose_arguments.append("--no-resolv")
                 self._instance_start_attempted = True
+                self._record_start_command(
+                    [
+                        "singularity-compose",
+                        "--file",
+                        str(self._compose_file),
+                        "--project-name",
+                        self._compose_key("project"),
+                        *compose_arguments,
+                    ],
+                    network_policy,
+                    notes=[
+                        f"cwd: {self._compose_project_dir}",
+                        "PATH starts with "
+                        f"{self._compose_project_dir}{os.sep}bin",
+                    ],
+                )
                 compose_output = await self._run_compose(*compose_arguments)
             if not self._compose_uses_sudo:
                 # Instances started through sudo belong to root and are not
@@ -3688,7 +3754,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 self._add_compose_service_aliases()
         else:
             self._instance_start_attempted = True
-            await self._run(*self._instance_start_command(network_policy))
+            command = self._instance_start_command(network_policy)
+            self._record_start_command(command, network_policy)
+            await self._run(*command)
         self._instance_started = True
         if self._keeps_image_tmp:
             # Without its bind, the workdir that every exec starts in exists
@@ -3934,6 +4002,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             not self._uses_compose or self._compose_file is not None
         )
         if needs_stop:
+            await self._save_process_snapshot()
             try:
                 if not await self._stop_prepared_runtime(warn=True):
                     return
@@ -4062,18 +4131,282 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._cleanup_staging()
         await self._release_sifs_in_use()
 
+    @property
+    def _debug_dir(self) -> Path:
+        root = self.trial_paths.trial_dir / _DEBUG_DIR
+        # Harbor names the agent environment's session ``<trial>__env``; a
+        # separate verifier shares the trial directory under its own name.
+        return (
+            root
+            if self.session_id.endswith("__env")
+            else root / self.session_id
+        )
+
+    def _write_debug_file(
+        self, name: str, content: str, *, append: bool = False
+    ) -> bool:
+        try:
+            self._debug_dir.mkdir(parents=True, exist_ok=True)
+            with (self._debug_dir / name).open("a" if append else "w") as file:
+                file.write(content)
+        except OSError as exc:
+            self.logger.warning("Could not write debug %s: %s", name, exc)
+            return False
+        return True
+
+    def _record_start_command(
+        self,
+        command: Sequence[str],
+        network_policy: NetworkPolicy,
+        *,
+        notes: Sequence[str] = (),
+    ) -> None:
+        """Save how the instance is started, before the attempt can fail.
+
+        Only arguments are saved: secrets reach an instance through its
+        environment, which stays out of the file and the log. Each network
+        phase restarts the instance and appends its command.
+        """
+        self.logger.info("Singularity image: %s", self._sif_path)
+        self.logger.info("Singularity start: %s", shlex.join(command))
+        lines = []
+        if not self._start_recorded:
+            lines += [
+                "#!/bin/sh",
+                "# Scratch and staging paths are removed when the trial stops.",
+            ]
+            if self._sif_path is not None:
+                lines.append(f"sif={shlex.quote(str(self._sif_path))}")
+        lines.append(f"# network: {network_policy.network_mode.value}")
+        lines.extend(f"# {note}" for note in notes)
+        lines.append(shlex.join(command))
+        if self._write_debug_file(
+            "start.sh", "\n".join(lines) + "\n", append=self._start_recorded
+        ):
+            self._start_recorded = True
+
+    async def _best_effort(
+        self, step: Awaitable[Any], timeout: float, description: str
+    ) -> bool:
+        """Run a debugging step to a hard deadline, logging any failure.
+
+        ``asyncio.wait`` returns at the deadline even if the step's own
+        cleanup is stuck, as it can be behind a process in D state.
+        """
+        task = asyncio.ensure_future(step)
+        try:
+            await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=1)
+            task.add_done_callback(
+                lambda done: done.cancelled() or done.exception()
+            )
+            self.logger.warning("Timed out after %gs: %s", timeout, description)
+            return False
+        if task.cancelled():
+            return False
+        if (error := task.exception()) is not None:
+            self.logger.warning("Failed: %s: %s", description, error)
+            return False
+        return True
+
+    async def _save_process_snapshot(self) -> None:
+        if not (self._instance_started or self._instance_start_attempted):
+            return
+        # Instances started through sudo belong to root.
+        if self._compose_uses_sudo:
+            return
+        await self._best_effort(
+            self._write_process_snapshot(),
+            _PROCESS_SNAPSHOT_TIMEOUT_SEC,
+            "saving a process snapshot",
+        )
+
+    async def _write_process_snapshot(self) -> None:
+        if not await self._instance_exists():
+            return
+        runtime = self._instance_runtime()
+        # Not ``_instance_exec_prefix``: a wedged shared faked blocks every
+        # preloaded stat, and the fakeroot command Apptainer wraps execs in
+        # needs a faked of its own. Setting FAKEROOTKEY skips that wrapper,
+        # and without ``_SHARED_FAKED_SCRIPT`` nothing preloads libfakeroot,
+        # so this exec talks to no faked.
+        command = [runtime, "exec", "--cleanenv", "--pwd", "/"]
+        if self._fakeroot and _runtime_is_apptainer(runtime):
+            command.extend(["--env", "FAKEROOTKEY=ursa-no-fakeroot"])
+        command.extend([
+            f"instance://{self._instance_name}",
+            "/bin/sh",
+            "-c",
+            _PROCESS_SNAPSHOT_SCRIPT,
+        ])
+        self._debug_dir.mkdir(parents=True, exist_ok=True)
+        path = self._debug_dir / "processes.txt"
+        # Straight to a file: lines survive a kill, and no pipe can be held
+        # open by something the exec left behind.
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=output,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                env=self._clean_host_environment(),
+            )
+        try:
+            await process.wait()
+            if process.returncode:
+                self.logger.warning(
+                    "Process snapshot exited with code %s", process.returncode
+                )
+        finally:
+            if process.returncode is None:
+                with suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=1)
+            self._redact_debug_file(path)
+
+    def _redact_debug_file(self, path: Path) -> None:
+        try:
+            path.write_text(
+                _SECRET_IN_COMMAND_LINE.sub(
+                    r"\1<redacted>", path.read_text(errors="replace")
+                )
+            )
+        except OSError as exc:
+            self.logger.warning("Removing unredacted %s: %s", path.name, exc)
+            path.unlink(missing_ok=True)
+
+    async def _keep_debug_evidence(self, stopped: bool) -> None:
+        """Copy the stopped instance's writable state for ``--no-delete``."""
+        if self._scratch_dir is None:
+            return
+        if not stopped:
+            self._write_debug_file(
+                "kept.txt",
+                f"nothing copied: instance {self._instance_name} did not "
+                f"stop; runtime files remain in {self._scratch_dir}\n",
+            )
+            return
+        records = [
+            f"instance: {self._instance_name}",
+            f"sif: {self._sif_path} (shared cache, not copied)",
+        ]
+        if self._agent_layer_path is not None:
+            records.append(
+                f"agent layer: {self._agent_layer_path} "
+                "(copy of the agent cache, not copied)"
+            )
+        sources = []
+        if self._overlay_path is not None and self._overlay_path.exists():
+            sources.append((self._overlay_path, "overlay.img"))
+        writable = (
+            self._staging_dir / "harbor-writable"
+            if self._staging_dir is not None
+            else None
+        )
+        if writable is not None and writable.is_dir():
+            sources += [
+                (child, f"harbor-writable/{child.name}")
+                for child in sorted(writable.iterdir())
+                if child.name != _INSTALLED_AGENT_BIND
+            ]
+        try:
+            (self._debug_dir / "harbor-writable").mkdir(
+                parents=True, exist_ok=True
+            )
+        except OSError as exc:
+            self.logger.warning("Could not create debug directory: %s", exc)
+            return
+        for source, name in sources:
+            target = self._debug_dir / name
+            with suppress(OSError):
+                self._remove_staging_path(target)
+            # GNU cp keeps a 10 GiB sparse overlay sparse; shutil.copy would
+            # write it out in full.
+            copied = await self._best_effort(
+                self._run(
+                    "cp", "-a", "--sparse=always", str(source), str(target)
+                ),
+                _DEBUG_COPY_TIMEOUT_SEC,
+                f"keeping {name} from {source}",
+            )
+            if copied:
+                detail = ""
+                if target.is_file():
+                    with suppress(OSError):
+                        detail = (
+                            f" ({target.stat().st_blocks * 512} bytes on disk)"
+                        )
+                records.append(f"{name}: kept{detail}")
+            else:
+                with suppress(OSError):
+                    self._remove_staging_path(target)
+                records.append(f"{name}: not kept (see trial.log)")
+        self._write_debug_file("kept.txt", "\n".join(records) + "\n")
+        self.logger.info(
+            "Kept debug evidence in %s: %s", self._debug_dir, "; ".join(records)
+        )
+
+    @override
+    async def prepare_logs_for_host(self) -> None:
+        """Hand log binds back to the host user, as Docker's chown does.
+
+        Only subuid-mapped fakeroot needs this: there container users other
+        than root write as subordinate host ids. Root-mapped fakeroot has
+        only the invoking user's id, and without fakeroot so does everyone.
+        """
+        logs = EnvironmentPaths.logs_dir
+        targets = [
+            str(mount["target"])
+            for mount in self._host_mounts
+            if not mount.get("read_only")
+            and PurePosixPath(mount["target"]).is_relative_to(logs)
+        ]
+        if (
+            not targets
+            or not self._instance_started
+            or not self._fakeroot
+            or self._shared_faked
+        ):
+            return
+        await self._best_effort(
+            self._exec_instance(
+                f"chown -Rh 0:0 -- {shlex.join(targets)}",
+                cwd="/",
+                env=None,
+                timeout_sec=_DEBUG_LOG_CHOWN_TIMEOUT_SEC,
+                user=None,
+                merge_persistent=False,
+            ),
+            _DEBUG_LOG_CHOWN_TIMEOUT_SEC + 1,
+            "handing log directories back to the host user",
+        )
+
     @override
     async def stop(self, delete: bool) -> None:
         async with self._lifecycle_lock:
             await self._stop(delete)
 
     async def _stop(self, delete: bool) -> None:
+        # Both need the live instance, and stopping it ends the network proxy.
+        await self._save_process_snapshot()
+        await self.prepare_logs_for_host()
         needs_stop = (
             self._compose_file is not None
             if self._uses_compose
             else self._instance_started or self._instance_start_attempted
         )
-        if not needs_stop or await self._stop_prepared_runtime(warn=True):
+        stopped = not needs_stop or await self._stop_prepared_runtime(warn=True)
+        if not delete:
+            await self._keep_debug_evidence(stopped)
+        if stopped:
             await self._cleanup_runtime_resources()
         else:
             self.logger.warning(

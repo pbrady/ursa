@@ -518,6 +518,43 @@ HTTP and certificate-verified HTTPS, local services, denied hosts, phase changes
 and cleanup with stalled clients.
 It uses local test servers and requires no model credentials.
 
+### Debug a trial
+
+Every Singularity trial writes `<trial_dir>/debug/`. `start.sh` holds the SIF
+path and each instance-start command, shell-quoted and without environment
+values; a network phase that restarts the instance appends its command. The
+same commands are logged at INFO in `trial.log`. `processes.txt` is a snapshot
+taken just before a live instance stops, including after a failed start: pid,
+ppid, state, wchan, elapsed seconds, and the first 300 characters of the
+command line, read from `/proc` with values that look like secrets redacted.
+Use it to see what a timed-out or hung trial was stuck on. The snapshot gets 15
+seconds, runs outside the fakeroot wrappers so a stuck faked cannot block it,
+and is skipped for an instance that is already gone. A separate verifier
+environment writes to `debug/<session id>/`.
+
+Pass `harbor run --no-delete` to also keep the stopped instance's writable
+state: the overlay as `debug/overlay.img`, and Harbor's writable binds, which
+hold the workdir when it is not in the overlay and the logs when
+`auto_mounting` is off, as `debug/harbor-writable/` (without the installed
+agent, which is large and says nothing about the trial). `debug/kept.txt` lists
+what was kept, and the SIF and agent layer it ran with, which are not copied.
+The overlay stays sparse, which needs GNU `cp`. A copy that fails or passes its
+10 minute limit is logged and recorded there and does not fail the trial. When
+the instance does not stop, nothing is copied and `kept.txt` names the runtime
+files left in place for a later stop. These files can hold anything the agent
+wrote, including credentials it cached under `/root`. A failed start has no
+overlay to keep, since the runtime files are removed before Harbor reports
+whether to delete them; `start.sh` and `processes.txt` still cover it.
+Whole-trial [retention](#artifact-retention) leaves `debug/overlay.img` in
+place rather than compressing it.
+
+Pass `--ek auto_mounting=true` to bind the agent, verifier, and artifact log
+directories to the trial directory, so they can be tailed and survive a timeout
+or a killed job. With subuid-mapped fakeroot, files that non-root container
+users write there belong to subordinate host ids, so the adapter hands them
+back to the invoking user before Harbor reads the logs and before the instance
+stops, as Docker's environment does.
+
 ## Configure other agents
 
 For other Harbor agents, `ursa.integrations.harbor.config` exports `AgentConfig`, `ModelConfig`,
@@ -624,7 +661,9 @@ all files in each trial directory (the parent of `artifacts`) when
 `collections: [trial]` is selected. This includes agent logs and checkpoints,
 configuration, lock files, results, artifact manifests, verifier logs and rewards,
 and all multi-step outputs. Job-level files and retention metadata stay outside
-the archive. Select `trial` on its own.
+the archive. Select `trial` on its own. Overlays that `harbor run --no-delete`
+kept under `debug/` stay in place, since archiving a sparse overlay reads and
+compresses it in full; see [Debug a trial](#debug-a-trial).
 
 The default scope remains `collections: [artifacts]`; `[artifacts, verifier]`
 also includes verifier payloads. These narrower scopes protect collection

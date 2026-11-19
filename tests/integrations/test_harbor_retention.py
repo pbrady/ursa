@@ -272,3 +272,42 @@ def test_missing_trial_result_before_cleanup_is_not_treated_as_archived(
     with pytest.raises(ValueError, match="finished trial"):
         apply_job_retention(tmp_path, config)
     assert (tmp_path / "trial/agent/trace").is_file()
+
+
+def test_whole_trial_leaves_kept_debug_overlays_in_place(tmp_path):
+    config = load_retention_config(whole_trial_job(tmp_path))
+    overlays = {
+        "trial/debug/overlay.img",
+        "trial/debug/trial__verifier__grader/overlay.img",
+    }
+    for name in (*overlays, "trial/debug/kept.txt"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name)
+    planned = plan_job_retention(tmp_path, config)
+    actions = {entry.path: entry.action for entry in planned.entries}
+    assert {name for name, action in actions.items() if action == "keep"} == (
+        overlays
+    )
+    assert actions["trial/debug/kept.txt"] == "archive"
+    assert apply_job_retention(tmp_path, config)["status"] == "complete"
+    assert all((tmp_path / name).is_file() for name in overlays)
+    assert not (tmp_path / "trial/debug/kept.txt").exists()
+    with tarfile.open(tmp_path / "retained-artifacts.tar.xz") as archive:
+        assert not overlays & set(archive.getnames())
+    # The recorded protection is accepted when the completed run is checked.
+    assert apply_job_retention(tmp_path, config)["status"] == "complete"
+
+
+def test_whole_trial_rejects_a_previous_plan_that_protects_other_files(
+    tmp_path,
+):
+    policy = whole_trial_job(tmp_path)
+    config = load_retention_config(policy)
+    apply_job_retention(tmp_path, config)
+    manifest = tmp_path / "retention.json"
+    state = json.loads(manifest.read_text())
+    state["plan"]["protected"] = ["trial/debug/x/y/overlay.img"]
+    manifest.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="policy/inventory differs"):
+        apply_job_retention(tmp_path, config)

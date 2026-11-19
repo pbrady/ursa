@@ -4724,3 +4724,570 @@ async def test_downloads_after_failed_start_are_skipped(
     assert not [
         record for record in caplog.records if record.levelname == "ERROR"
     ]
+
+
+def _debug_runtime(
+    environment: DockerfileSingularityEnvironment,
+    tmp_path: Path,
+    exec_body: str,
+) -> Path:
+    """Install a fake runtime whose ``exec`` runs ``exec_body``; return its log."""
+    log = tmp_path / "runtime.log"
+    runtime = tmp_path / "fake-apptainer"
+    runtime.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {log}\n"
+        'case "$1 $2" in\n'
+        "  'instance list') "
+        f"""echo '{{"instances":[{{"instance":"{environment._instance_name}"}}]}}'"""
+        ";;\n"
+        f"  exec*) env > {tmp_path}/exec.env; {exec_body} ;;\n"
+        "esac\n"
+    )
+    runtime.chmod(0o755)
+    environment._runtime_path = str(runtime)
+    return log
+
+
+@pytest.mark.parametrize("delete", [True, False])
+async def test_stop_keeps_overlay_only_without_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delete: bool
+):
+    environment = _environment(tmp_path, overlay=True)
+    overlay = _prepare_started_environment(environment, tmp_path)
+    writable = environment._staging_dir / "harbor-writable"
+    (writable / "workdir").mkdir(parents=True)
+    (writable / "installed-agent").mkdir()
+    scratch = environment._scratch_dir
+    commands: list[list[str]] = []
+
+    async def missing() -> bool:
+        return False
+
+    async def run(*command: str, **_kwargs: object) -> str:
+        commands.append(list(command))
+        Path(command[-1]).write_bytes(b"copy")
+        return ""
+
+    monkeypatch.setattr(environment, "_instance_exists", missing)
+    monkeypatch.setattr(environment, "_run", run)
+    await environment.stop(delete=delete)
+
+    debug = environment.trial_paths.trial_dir / "debug"
+    if delete:
+        assert commands == []
+        assert not (debug / "kept.txt").exists()
+    else:
+        assert commands[0][:3] == ["cp", "-a", "--sparse=always"]
+        assert commands[0][-2:] == [str(overlay), str(debug / "overlay.img")]
+        assert commands[1][-2:] == [
+            str(writable / "workdir"),
+            str(debug / "harbor-writable" / "workdir"),
+        ]
+        assert len(commands) == 2  # installed-agent is not copied
+        kept = (debug / "kept.txt").read_text()
+        assert "overlay.img: kept" in kept
+        assert "harbor-writable/workdir: kept" in kept
+    assert not scratch.exists()
+
+
+async def test_no_delete_records_the_agent_layer_without_copying_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path, overlay=True)
+    _prepare_started_environment(environment, tmp_path)
+    layer = tmp_path / ".agent-key-token.img"
+    layer.write_bytes(b"layer")
+    environment._agent_layer_path = layer
+    commands: list[list[str]] = []
+
+    async def missing() -> bool:
+        return False
+
+    async def run(*command: str, **_kwargs: object) -> str:
+        commands.append(list(command))
+        Path(command[-1]).write_bytes(b"copy")
+        return ""
+
+    monkeypatch.setattr(environment, "_instance_exists", missing)
+    monkeypatch.setattr(environment, "_run", run)
+    await environment.stop(delete=False)
+
+    assert all(str(layer) not in command for command in commands)
+    kept = (
+        environment.trial_paths.trial_dir / "debug" / "kept.txt"
+    ).read_text()
+    assert f"agent layer: {layer} (" in kept
+    assert not layer.exists()
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+async def test_failed_debug_copy_is_logged_and_never_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+):
+    environment = _environment(tmp_path, overlay=True)
+    _prepare_started_environment(environment, tmp_path)
+    monkeypatch.setattr(harbor_singularity, "_DEBUG_COPY_TIMEOUT_SEC", 0.05)
+
+    async def missing() -> bool:
+        return False
+
+    async def run(*command: str, **_kwargs: object) -> str:
+        Path(command[-1]).write_bytes(b"partial")
+        if failure == "error":
+            raise RuntimeError("no space left")
+        await asyncio.Event().wait()
+        return ""
+
+    monkeypatch.setattr(environment, "_instance_exists", missing)
+    monkeypatch.setattr(environment, "_run", run)
+    with caplog.at_level(logging.WARNING):
+        await asyncio.wait_for(environment.stop(delete=False), timeout=5)
+
+    debug = environment.trial_paths.trial_dir / "debug"
+    assert not (debug / "overlay.img").exists()
+    assert "overlay.img: not kept" in (debug / "kept.txt").read_text()
+    assert "overlay.img" in caplog.text
+    assert environment._scratch_dir is None
+
+
+async def test_failed_stop_records_that_nothing_was_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path, overlay=True)
+    _prepare_started_environment(environment, tmp_path)
+    scratch = environment._scratch_dir
+
+    async def stop_instance(*, warn: bool) -> bool:
+        return False
+
+    async def no_snapshot() -> None:
+        pass
+
+    monkeypatch.setattr(environment, "_stop_instance", stop_instance)
+    monkeypatch.setattr(environment, "_save_process_snapshot", no_snapshot)
+    await environment.stop(delete=False)
+
+    kept = environment.trial_paths.trial_dir / "debug" / "kept.txt"
+    assert "nothing copied" in kept.read_text()
+    assert str(scratch) in kept.read_text()
+    assert scratch.exists()
+    environment._instance_started = False
+    environment._instance_start_attempted = False
+    environment._cleanup_staging()
+
+
+async def test_stop_snapshots_and_hands_back_logs_before_the_proxy_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    order: list[str] = []
+
+    async def snapshot() -> None:
+        order.append("snapshot")
+
+    async def logs() -> None:
+        order.append("logs")
+
+    async def stop_proxy() -> None:
+        order.append("proxy")
+
+    async def stop_instance(*, warn: bool) -> bool:
+        order.append("stop")
+        return True
+
+    monkeypatch.setattr(environment, "_save_process_snapshot", snapshot)
+    monkeypatch.setattr(environment, "prepare_logs_for_host", logs)
+    monkeypatch.setattr(environment, "_stop_network_proxy", stop_proxy)
+    monkeypatch.setattr(environment, "_stop_instance", stop_instance)
+    await environment.stop(delete=True)
+
+    assert order[:4] == ["snapshot", "logs", "proxy", "stop"]
+
+
+@pytest.mark.parametrize("delete", [True, False])
+async def test_stop_saves_a_redacted_process_snapshot_from_a_live_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delete: bool
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    environment._overlay_path = None
+    log = _debug_runtime(
+        environment,
+        tmp_path,
+        "echo '# pid ppid state wchan elapsed_sec cmdline'; "
+        "echo '7 1 S do_wait 3 sh -c OPENAI_API_KEY=sk-secret run --token abc'",
+    )
+    monkeypatch.setenv("APPTAINERENV_TOKEN", "host-secret")
+
+    async def run(*_command: str, **_kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(environment, "_run", run)
+    await environment.stop(delete=delete)
+
+    snapshot = environment.trial_paths.trial_dir / "debug" / "processes.txt"
+    text = snapshot.read_text()
+    assert "7 1 S do_wait 3 sh -c OPENAI_API_KEY=<redacted>" in text
+    assert "--token <redacted>" in text
+    assert "sk-secret" not in text and "abc" not in text
+    assert snapshot.stat().st_mode & 0o777 == 0o600
+    calls = log.read_text().splitlines()
+    assert "/proc" in "".join(calls)
+    assert "environ" not in "".join(calls)
+    assert "APPTAINERENV_" not in (tmp_path / "exec.env").read_text()
+
+
+async def test_hung_process_snapshot_keeps_its_lines_within_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    environment._overlay_path = None
+    monkeypatch.setattr(
+        harbor_singularity, "_PROCESS_SNAPSHOT_TIMEOUT_SEC", 0.05
+    )
+    killed: list[tuple[int, int]] = []
+
+    class Process:
+        returncode = None
+        pid = 4242
+
+        async def wait(self) -> int:
+            # A wedged exec never exits, even after SIGKILL.
+            await asyncio.Event().wait()
+            return 0
+
+    async def spawn(*_command: str, **kwargs: object) -> Process:
+        kwargs["stdout"].write(b"1 0 S do_wait 3 init\n")
+        kwargs["stdout"].flush()
+        return Process()
+
+    async def exists() -> bool:
+        return True
+
+    async def stop_instance(*, warn: bool) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+    monkeypatch.setattr(
+        harbor_singularity.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(environment, "_instance_exists", exists)
+    monkeypatch.setattr(environment, "_stop_instance", stop_instance)
+    await asyncio.wait_for(environment.stop(delete=True), timeout=10)
+
+    snapshot = environment.trial_paths.trial_dir / "debug" / "processes.txt"
+    assert "1 0 S do_wait 3 init" in snapshot.read_text()
+    assert killed == [(4242, harbor_singularity.signal.SIGKILL)]
+    assert environment._scratch_dir is None
+
+
+async def test_stuck_listing_cannot_outlast_the_snapshot_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    environment._instance_started = True
+    monkeypatch.setattr(
+        harbor_singularity, "_PROCESS_SNAPSHOT_TIMEOUT_SEC", 0.05
+    )
+
+    async def stuck() -> bool:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(environment, "_instance_exists", stuck)
+    await asyncio.wait_for(environment._save_process_snapshot(), timeout=5)
+
+
+async def test_dead_instance_gets_no_snapshot_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    environment._instance_started = True
+
+    async def missing() -> bool:
+        return False
+
+    async def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("no exec for a dead instance")
+
+    monkeypatch.setattr(environment, "_instance_exists", missing)
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", unexpected
+    )
+    await environment._save_process_snapshot()
+
+    assert not (environment.trial_paths.trial_dir / "debug").exists()
+
+
+async def test_never_started_instance_is_not_inspected_for_a_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+
+    async def unexpected() -> bool:
+        pytest.fail("nothing to inspect before a start attempt")
+
+    monkeypatch.setattr(environment, "_instance_exists", unexpected)
+    await environment._save_process_snapshot()
+
+
+@pytest.mark.parametrize(
+    ("fakeroot", "skips_wrapper"), [(True, True), (False, False)]
+)
+async def test_snapshot_exec_never_uses_a_faked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fakeroot: bool,
+    skips_wrapper: bool,
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    environment._instance_started = True
+    environment._shared_faked = fakeroot
+    environment._runtime_path = str(tmp_path / "apptainer")
+    captured: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    class Process:
+        returncode = 0
+        pid = 1
+
+        async def wait(self) -> int:
+            return 0
+
+    async def spawn(*command: str, **kwargs: object) -> Process:
+        captured.append((command, kwargs))
+        return Process()
+
+    async def exists() -> bool:
+        return True
+
+    monkeypatch.setattr(environment, "_instance_exists", exists)
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+    monkeypatch.setenv("APPTAINERENV_TOKEN", "secret")
+    await environment._save_process_snapshot()
+
+    command, kwargs = captured[0]
+    assert ("FAKEROOTKEY=ursa-no-fakeroot" in command) is skips_wrapper
+    assert "FAKEROOTKEY=ursa-shared-faked" not in command
+    assert harbor_singularity._SHARED_FAKED_SCRIPT not in command
+    assert command[-1] == harbor_singularity._PROCESS_SNAPSHOT_SCRIPT
+    assert "APPTAINERENV_TOKEN" not in kwargs["env"]
+
+
+def test_process_snapshot_script_reads_only_proc(tmp_path: Path):
+    assert "environ" not in harbor_singularity._PROCESS_SNAPSHOT_SCRIPT
+    proc = tmp_path / "proc"
+    (proc / "42").mkdir(parents=True)
+    (proc / "uptime").write_text("1000.50 2000.00\n")
+    fields = "S 7 " + " ".join(["0"] * 17) + " 50000 " + " ".join(["0"] * 30)
+    (proc / "42" / "stat").write_text(f"42 (odd) (name) {fields}\n")
+    (proc / "42" / "wchan").write_text("pipe_read")
+    (proc / "42" / "cmdline").write_bytes(b"bash\0-c\0line one\nline two\0")
+    (proc / "43").mkdir()
+    (proc / "43" / "stat").write_text(f"43 (kworker) {fields}\n")
+    (proc / "43" / "wchan").write_text("0")
+    (proc / "43" / "cmdline").write_bytes(b"")
+    (proc / "44").mkdir()
+
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            harbor_singularity._PROCESS_SNAPSHOT_SCRIPT.replace(
+                "/proc", str(proc)
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("# pid ppid")
+    assert "42 7 S pipe_read 500 bash -c line one line two" in lines[1]
+    assert lines[2] == "43 7 S 0 500 [kworker]"
+    assert len(lines) == 3
+
+
+async def test_start_records_argv_and_sif_without_environment_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
+    environment._persistent_env = {"OPENAI_API_KEY": "persistent-secret"}
+    environment._sif_path = tmp_path / "an image.sif"
+    monkeypatch.setenv("APPTAINERENV_OPENAI_API_KEY", "host-secret")
+
+    async def run(*_command: str, **_kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(environment, "_run", run)
+    with caplog.at_level(logging.INFO):
+        await environment._start_prepared_runtime(
+            NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+        )
+
+    script = (
+        environment.trial_paths.trial_dir / "debug" / "start.sh"
+    ).read_text()
+    argv = environment._instance_start_command()
+    assert shlex.join(argv) in script
+    assert f"sif={shlex.quote(str(environment._sif_path))}" in script
+    assert "# network: public" in script
+    assert "secret" not in script
+    assert "secret" not in caplog.text
+    assert str(environment._sif_path) in caplog.text
+    assert "instance start" in caplog.text
+    environment._instance_started = False
+    environment._instance_start_attempted = False
+    environment._cleanup_staging()
+
+
+async def test_each_network_phase_appends_its_start_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path, overlay=True)
+    _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
+
+    async def run(*_command: str, **_kwargs: object) -> str:
+        return ""
+
+    monkeypatch.setattr(environment, "_run", run)
+    for mode in (NetworkMode.PUBLIC, NetworkMode.NO_NETWORK):
+        await environment._start_prepared_runtime(
+            NetworkPolicy(network_mode=mode)
+        )
+
+    script = (
+        environment.trial_paths.trial_dir / "debug" / "start.sh"
+    ).read_text()
+    assert script.count("#!/bin/sh") == 1
+    assert script.count("sif=") == 1
+    assert script.count(" instance start ") == 2
+    assert script.index("# network: public") < script.index(
+        f"# network: {NetworkMode.NO_NETWORK.value}"
+    )
+    environment._instance_started = False
+    environment._instance_start_attempted = False
+    environment._cleanup_staging()
+
+
+async def test_start_command_is_recorded_before_the_attempt_can_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
+
+    async def fail(*_command: str, **_kwargs: object) -> str:
+        raise RuntimeError("instance did not start")
+
+    monkeypatch.setattr(environment, "_run", fail)
+    with pytest.raises(RuntimeError, match="did not start"):
+        await environment._start_prepared_runtime(
+            NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+        )
+
+    assert (environment.trial_paths.trial_dir / "debug" / "start.sh").is_file()
+    environment._instance_start_attempted = False
+    environment._cleanup_staging()
+
+
+async def test_failed_start_saves_a_snapshot_of_the_attempted_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path)
+    environment._prepare_runtime_workdir()
+    environment._instance_start_attempted = True
+    order: list[str] = []
+
+    async def snapshot() -> None:
+        order.append("snapshot")
+
+    async def stop_instance(*, warn: bool) -> bool:
+        order.append("stop")
+        return True
+
+    monkeypatch.setattr(environment, "_save_process_snapshot", snapshot)
+    monkeypatch.setattr(environment, "_stop_instance", stop_instance)
+    await environment._cleanup_failed_start()
+
+    assert order == ["snapshot", "stop"]
+
+
+def test_separate_verifier_environment_keeps_its_own_debug_dir(tmp_path: Path):
+    environment = _environment(tmp_path)
+    root = environment.trial_paths.trial_dir / "debug"
+    assert environment._debug_dir == root
+
+    environment.session_id = "trial__verifier__grader"
+    assert environment._debug_dir == root / "trial__verifier__grader"
+
+
+@pytest.mark.parametrize(
+    ("fakeroot", "shared", "started", "expected"),
+    [
+        (True, False, True, True),
+        (True, True, True, False),
+        (False, False, True, False),
+        (True, False, False, False),
+    ],
+)
+async def test_mounted_logs_are_handed_back_only_where_ids_can_differ(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fakeroot: bool,
+    shared: bool,
+    started: bool,
+    expected: bool,
+):
+    environment = _environment(tmp_path, auto_mounting=True, fakeroot=fakeroot)
+    environment._instance_started = started
+    environment._shared_faked = shared
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def exec_instance(command: str, **kwargs: object) -> None:
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr(environment, "_exec_instance", exec_instance)
+    await environment.prepare_logs_for_host()
+
+    assert bool(calls) is expected
+    if expected:
+        command, kwargs = calls[0]
+        assert command.startswith("chown -Rh 0:0 -- ")
+        assert "/logs/agent" in command
+        assert "/workspace" not in command
+        assert kwargs["user"] is None
+        assert kwargs["merge_persistent"] is False
+
+
+async def test_logs_stay_untouched_without_auto_mounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment = _environment(tmp_path, fakeroot=True)
+    environment._instance_started = True
+
+    async def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("no log bind to hand back")
+
+    monkeypatch.setattr(environment, "_exec_instance", unexpected)
+    await environment.prepare_logs_for_host()

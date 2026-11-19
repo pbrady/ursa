@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, Self
 
 import yaml
@@ -32,6 +32,29 @@ _PROTECTED = {
     "test-stderr.txt",
     "manifest.json",
 }
+# ``harbor run --no-delete`` under the Singularity environment keeps each
+# instance's overlay here. It is a sparse image of up to several GiB that an
+# archive would read and compress in full, so whole-trial retention leaves it
+# in place.
+_DEBUG_OVERLAYS = ("debug/overlay.img", "debug/*/overlay.img")
+
+
+def _is_debug_overlay(name: str, trials: list[str]) -> bool:
+    trial, *rest = PurePosixPath(name).parts
+    return trial in trials and any(
+        PurePosixPath(*rest).match(pattern)
+        and len(rest) == len(PurePosixPath(pattern).parts)
+        for pattern in _DEBUG_OVERLAYS
+    )
+
+
+def _debug_overlays(root: Path, trial: Path) -> list[str]:
+    return sorted(
+        path.relative_to(root).as_posix()
+        for pattern in _DEBUG_OVERLAYS
+        for path in trial.glob(pattern)
+        if path.is_file() and not path.is_symlink()
+    )
 
 
 class HarborRetentionConfig(BaseModel):
@@ -79,7 +102,10 @@ def _scope(
         if (
             previous.root != str(root.resolve())
             or previous.policy != config.policy
-            or previous.protected
+            or not all(
+                _is_debug_overlay(name, previous.roots)
+                for name in previous.protected
+            )
             or any(
                 Path(name).name != name
                 or name in {".", "..", ""}
@@ -113,6 +139,7 @@ def _scope(
                 )
         if whole_trial:
             roots.append(trial.relative_to(root).as_posix())
+            protected.extend(_debug_overlays(root, trial))
             continue
         bases = [trial, *sorted((trial / "steps").glob("*"))]
         for base in bases:
