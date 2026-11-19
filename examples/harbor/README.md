@@ -282,6 +282,34 @@ refreshes the SIFs a trial without `--force-build` uses, so a prebuilt
 `prebuild --builder` sets the Dockerfile builder, like `singularity_builder`;
 use the same builder for the run so that it finds the prebuilt SIFs.
 
+### Unprivileged Apptainer hosts
+
+HPC hosts with an unprivileged (non-setuid) Apptainer and no `/etc/subuid`
+can run single-container and main-only Compose tasks. Check that the host has:
+
+- Apptainer 1.1 or later, whose `--fakeroot` falls back to a root-mapped user
+  namespace, and the host's `fakeroot` command, which Apptainer uses so that
+  package managers and switches to non-root container users work. Try an
+  `apt-get install` early.
+- `squashfuse` to mount SIFs; without it Apptainer extracts each image to a
+  temporary sandbox on every start.
+- `fuse2fs` and `fuse-overlayfs` for the writable overlay. Without them, set
+  `--environment-kwarg singularity_overlay=false`: the image root is then
+  read-only, commands get the private `/harbor-home`, and network-policy
+  phases cannot change.
+- A local `APPTAINER_TMPDIR` for `singularity_builder=apptainer`, which `auto`
+  tries first; Buildah and Podman cannot run `RUN` steps without subuid ranges.
+
+Sidecars and published ports need bridge networking, which such hosts refuse,
+so those Compose projects fail before any image is built (see
+[Compose and networking](#compose-and-networking)). For `allowlist` phases see
+[Allowlisted networking](#allowlisted-networking-and-model-access). Apptainer's
+own layer cache defaults to `~/.apptainer/cache`; set `APPTAINER_CACHEDIR` when
+home quotas are small, and `APPTAINER_DOCKER_USERNAME` and
+`APPTAINER_DOCKER_PASSWORD` to avoid Docker Hub's anonymous pull limit on large
+task sets. When compute nodes cannot reach a registry, run `prebuild` on a
+login node into a shared cache.
+
 ### Agent install layers
 
 Prebuild can cache the complete installation, including system packages and

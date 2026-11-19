@@ -8,6 +8,20 @@
 - Added automatic HTTP/HTTPS allowlist proxying for isolated Apptainer/Singularity runs.
 - Fixed proxy shutdown stalls, local service routing, and shared HTTP client state.
 - Made invalid experience filenames and other tool inputs recoverable by agents.
+- Returned invalid or truncated tool calls to the model instead of failing
+  the run, and converted `read_image_tool` images to formats and sizes that
+  models accept.
+- Supported Harbor tasks on unprivileged (non-setuid) Apptainer without
+  `/etc/subuid`: Dockerfiles build from a translated Apptainer definition,
+  one `faked` serves each instance, and the overlay, `HOME`, and mounts stay
+  writable as under Docker.
+- Pulled a task's prebuilt `docker_image` on Singularity, and followed Harbor
+  0.25's model, MCP, web-tool, and separate-verifier image decisions.
+- Supported Compose interpolation, read-only binds, `deploy.resources`, and
+  host networking for main-only projects, failing early where bridge
+  networking is unavailable.
+- Kept Singularity debug evidence under `debug/` and the instance's writable
+  state with `harbor run --no-delete`.
 
 ## v0.17.3
 
