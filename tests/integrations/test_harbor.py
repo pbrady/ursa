@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -599,6 +600,50 @@ async def test_agent_install_unprivileged_instance(
             and "host-only-secret" not in output
             and agent._workspace == "/workspace"
         )
+
+
+async def _drive_background_shell(env):
+    """Drive a shell started by one exec from later execs, as terminus-2
+    drives its tmux shell."""
+    started = await env.exec(
+        "rm -f /tmp/shell.in /tmp/shell.out; mkfifo /tmp/shell.in; "
+        "nohup bash -c 'exec bash <>/tmp/shell.in' >/tmp/shell.out 2>&1 &"
+    )
+    assert started.return_code == 0, started.stderr
+    steps = [
+        ("ls", "ls -la / >/dev/null"),
+        ("stat", "stat -c %U /etc/hostname >/dev/null"),
+        ("write", "cat > /tmp/heredoc.txt <<'EOF'\nwritten\nEOF"),
+        ("chown", "chown 1000 /tmp/heredoc.txt"),
+    ]
+    for name, command in steps:
+        marker = f"{name}-done"
+        # The marker goes on its own line so it cannot end a heredoc.
+        lines = shlex.quote(f"{command}\necho {marker}")
+        sent = await env.exec(
+            f"printf '%s\\n' {lines} > /tmp/shell.in; "
+            "for i in $(seq 100); do "
+            f"grep -qx {marker} /tmp/shell.out && break; sleep 0.1; done; "
+            f"grep -x {marker} /tmp/shell.out",
+            timeout_sec=60,
+        )
+        assert sent.stdout.strip() == marker, (name, sent.stdout, sent.stderr)
+    finished = await env.exec(
+        "cat /tmp/heredoc.txt; stat -c %u /tmp/heredoc.txt"
+    )
+    assert finished.stdout.split() == ["written", "1000"], finished.stderr
+
+
+async def test_fakeroot_background_shell_serves_later_execs(
+    tmp_path, ubuntu_sif
+):
+    # Apptainer's per-exec faked used to exit with the exec that started a
+    # background shell, after which the shell blocked on its first stat.
+    _require_fakeroot(ubuntu_sif)
+    async with _environment(
+        tmp_path, ubuntu_sif, fakeroot=True, overlay=True
+    ) as env:
+        await _drive_background_shell(env)
 
 
 async def test_cancelling_exec_reaps_process(environment, tmp_path):

@@ -119,6 +119,223 @@ _FAKEROOT_COMMAND_FAILURE_MARKERS = (
     "error while starting the `faked' daemon",
     "required by /.singularity.d/libs/libfakeroot",
 )
+# Without /etc/subuid, Apptainer's fakeroot wraps every instance exec in the
+# fakeroot(1) command, whose faked daemon exits with that exec. Processes the
+# exec left running, such as a tmux server or a ``nohup`` job, keep the
+# preloaded libfakeroot and then block forever on their next stat or chown.
+# An exec under that wrapper sees FAKEROOTKEY, which the first instance exec
+# checks for; subuid-mapped fakeroot sets none. Apptainer skips its wrapper
+# when FAKEROOTKEY is already set, so in that mode instance execs set it and
+# run this script, which shares one faked per instance, started on first use
+# and replaced if it has died, and preloads libfakeroot for that daemon.
+# Without the fakeroot command's files it only clears FAKEROOTKEY.
+_FAKEROOT_COMMAND_MARKER = "ursa-fakeroot-command"
+# Records the shared faked's ``key:pid`` in the instance's own /dev/shm,
+# which --containall makes a fresh tmpfs per instance. /tmp, in the --workdir
+# or the overlay, outlives an instance restart while the daemon does not, so
+# the probe that runs first in every new instance also removes the record.
+_SHARED_FAKED_STATE = "/dev/shm/.ursa-faked"
+_FAKEROOT_COMMAND_PROBE = (
+    f"rm -f {_SHARED_FAKED_STATE}; "
+    f'if [ -n "${{FAKEROOTKEY-}}" ]; then echo {_FAKEROOT_COMMAND_MARKER}; fi'
+)
+_SHARED_FAKED_SCRIPT = (
+    "unset FAKEROOTKEY; "
+    f"libs=/.singularity.d/libs; state={_SHARED_FAKED_STATE}; "
+    'if [ -x "$libs/faked" ] && [ -r "$libs/libfakeroot.so" ]; then '
+    'key_pid=$(cat "$state" 2>/dev/null); '
+    "case $key_pid in "
+    '*:*) [ "$(cat "/proc/${key_pid#*:}/comm" 2>/dev/null)" = faked ] '
+    "|| key_pid= ;; "
+    "*) key_pid= ;; esac; "
+    'if [ -z "$key_pid" ]; then '
+    'key_pid=$("$libs/faked" </dev/null 2>/dev/null) && '
+    'echo "$key_pid" > "$state.$$" && mv -f "$state.$$" "$state"; fi; '
+    "case $key_pid in *:*) "
+    "FAKEROOTKEY=${key_pid%%:*}; "
+    "LD_PRELOAD=$libs/libfakeroot.so${LD_PRELOAD:+:$LD_PRELOAD}; "
+    "FAKED_MODE=unknown-is-root; FAKEROOTDONTTRYCHOWN=1; "
+    "export FAKEROOTKEY LD_PRELOAD FAKED_MODE FAKEROOTDONTTRYCHOWN;; "
+    "esac; fi; "
+    'exec "$@"'
+)
+# Commands that sanitize their environment drop the preloaded libfakeroot and
+# its FAKEROOTKEY, so they and their children run as the real, root-mapped
+# uid: chown to any other id fails with "Invalid argument", and apt's drop to
+# _apt fails with "setgroups 65534 failed". The shared faked cannot reach them
+# (``/etc/ld.so.preload`` would load libfakeroot, but not its key), so under
+# the fakeroot command the instance start runs ``_FAKEROOT_COMMAND_SETUP``,
+# which keeps apt as root and shadows the image's sudo with this shim: inside
+# the instance a root caller needs no sudo to become root, and its commands
+# keep the environment, or switch users through su as Harbor's user switching
+# does. Non-root callers and sudo's other modes get the image's sudo.
+# The same apt file retries a failed fetch at once and times out a stalled
+# connection after 20 s: after a transient fetch failure apt 2.8 can wait
+# indefinitely on its delayed retry, which stalled installs past Harbor's
+# setup timeout in this mode.
+_SUDO_SHIM_MARKER = "ursa-sudo-shim"
+_SUDO_SHIM_PATH = "/usr/local/sbin/sudo"
+_SUDO_SHIM_STASH = "/usr/local/lib/ursa/sudo"
+_APT_FAKEROOT_CONFIG = "/etc/apt/apt.conf.d/00ursa-fakeroot"
+_SUDO_SHIM = r"""#!/bin/sh
+# ursa-sudo-shim: written by URSA's Harbor Apptainer environment. Under
+# Apptainer's fakeroot command every process already runs as (fake) root,
+# and sudo would strip the fakeroot preload from the command's environment.
+# For a root caller this runs the command with its environment kept, or as
+# another user through su, like Harbor's user switching. Other callers, and
+# sudo's other modes, get the image's sudo.
+real=
+IFS=:
+for dir in $PATH:/usr/bin:/bin:/usr/sbin:/sbin; do
+    if [ -x "$dir/sudo" ] && ! grep -q ursa-sudo-shim "$dir/sudo" 2>/dev/null
+    then
+        real=$dir/sudo
+        break
+    fi
+done
+unset IFS
+if [ -z "$real" ]; then
+    echo "sudo: command not found" >&2
+    exit 127
+fi
+[ "$(id -u)" = 0 ] || exec "$real" "$@"
+parse() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --) count=$((count + 1)); return ;;
+            --user=*) user=${1#*=} ;;
+            --chdir=*) dir=${1#*=} ;;
+            --group=* | --close-from=* | --prompt=* | --role=* | --type=* | \
+                --command-timeout=* | --preserve-env=*) ;;
+            --user | --chdir | --group | --close-from | --prompt | --role | \
+                --type | --command-timeout)
+                [ $# -ge 2 ] || { delegate=1; return; }
+                case $1 in
+                    --user) user=$2 ;;
+                    --chdir) dir=$2 ;;
+                esac
+                count=$((count + 1))
+                shift
+                ;;
+            --login) login=1 ;;
+            --shell) shell=1 ;;
+            --set-home) home=1 ;;
+            --background) background=1 ;;
+            --preserve-env | --non-interactive | --stdin | --askpass | \
+                --bell | --preserve-groups | --reset-timestamp) ;;
+            -[!-]*)
+                flags=${1#-}
+                while [ -n "$flags" ]; do
+                    flag=${flags%"${flags#?}"}
+                    flags=${flags#?}
+                    case $flag in
+                        u | D | g | C | p | r | t | T)
+                            if [ -n "$flags" ]; then
+                                value=$flags
+                                flags=
+                            else
+                                [ $# -ge 2 ] || { delegate=1; return; }
+                                value=$2
+                                count=$((count + 1))
+                                shift
+                            fi
+                            case $flag in
+                                u) user=$value ;;
+                                D) dir=$value ;;
+                            esac
+                            ;;
+                        i) login=1 ;;
+                        s) shell=1 ;;
+                        H) home=1 ;;
+                        b) background=1 ;;
+                        A | B | E | k | n | N | P | S) ;;
+                        *) delegate=1; return ;;
+                    esac
+                done
+                ;;
+            -*) delegate=1; return ;;
+            *) return ;;
+        esac
+        count=$((count + 1))
+        shift
+    done
+}
+quote() {
+    for arg; do
+        arg=$(printf '%sx' "$arg" | sed "s/'/'\\\\''/g")
+        printf "'%s' " "${arg%x}"
+    done
+}
+user= dir= login= shell= home= background= delegate= count=0
+parse "$@"
+[ -z "$delegate" ] || exec "$real" "$@"
+shift "$count"
+[ $# -gt 0 ] || [ -n "$login$shell" ] || exec "$real"
+case $user in
+    \#*) user=$(getent passwd "${user#?}" | cut -d: -f1) ;;
+esac
+entry=$(getent passwd "${user:-root}")
+if [ -z "$entry" ]; then
+    echo "sudo: unknown user ${user:-root}" >&2
+    exit 1
+fi
+target=${entry%%:*}
+target_home=$(printf '%s' "$entry" | cut -d: -f6)
+target_shell=$(printf '%s' "$entry" | cut -d: -f7)
+target_shell=${target_shell:-/bin/sh}
+export SUDO_USER="$(id -un)" SUDO_UID="$(id -u)" SUDO_GID="$(id -g)"
+export SUDO_COMMAND="$*"
+if [ -n "$dir" ]; then
+    cd "$dir" || exit 1
+fi
+if [ -n "$login" ]; then
+    command="cd $(quote "$target_home") 2>/dev/null; exec $(quote "$target_shell") -l"
+    [ $# -eq 0 ] || command="$command -c $(quote "$(quote "$@")")"
+elif [ -n "$shell" ]; then
+    command="exec $(quote "${SHELL:-$target_shell}")"
+    [ $# -eq 0 ] || command="$command -c $(quote "$(quote "$@")")"
+else
+    command="exec env -- $(quote "$@")"
+fi
+if [ "$target" = "$(id -un)" ]; then
+    [ -z "$home$login" ] || export HOME="$target_home"
+    set -- /bin/sh -c "$command"
+else
+    set -- su "$target" -s /bin/sh -c "$command"
+fi
+if [ -n "$background" ]; then
+    "$@" &
+    exit 0
+fi
+exec "$@"
+"""
+# Installs the shim only over an image's /usr/bin/sudo, and later when an apt
+# install adds sudo, so ``command -v sudo`` still fails where the image has
+# none, as under Docker. Without a writable overlay every write just fails.
+_FAKEROOT_COMMAND_SETUP = (
+    "if [ -d /etc/apt ]; then "
+    "mkdir -p /etc/apt/apt.conf.d 2>/dev/null; "
+    "printf '%s\\n' "
+    "'// Written by URSA: under the fakeroot command apt cannot drop to _apt.' "
+    "'APT::Sandbox::User \"root\";' "
+    "'// Written by URSA: retry a failed fetch at once, and time out a stall.' "
+    "'Acquire::Retries \"5\";' "
+    "'Acquire::Retries::Delay \"false\";' "
+    "'Acquire::http::Timeout \"20\";' "
+    "'Acquire::https::Timeout \"20\";' "
+    f"'DPkg::Post-Invoke {{ \"[ -e {_SUDO_SHIM_PATH} ] || "
+    f"! [ -x /usr/bin/sudo ] || cp {_SUDO_SHIM_STASH} {_SUDO_SHIM_PATH} || "
+    "true\"; };' "
+    f"> {_APT_FAKEROOT_CONFIG} 2>/dev/null; fi; "
+    f"if mkdir -p {PurePosixPath(_SUDO_SHIM_STASH).parent} "
+    f"{PurePosixPath(_SUDO_SHIM_PATH).parent} 2>/dev/null && "
+    f"printf '%s\\n' \"$1\" > {_SUDO_SHIM_STASH} 2>/dev/null && "
+    f"chmod 755 {_SUDO_SHIM_STASH} && [ -x /usr/bin/sudo ] && "
+    f"{{ ! [ -e {_SUDO_SHIM_PATH} ] || "
+    f"grep -q {_SUDO_SHIM_MARKER} {_SUDO_SHIM_PATH}; }}; then "
+    f"cp {_SUDO_SHIM_STASH} {_SUDO_SHIM_PATH}; fi; true"
+)
+
 _warned_unset_compose_variables: set[str] = set()
 _logger = logging.getLogger(__name__)
 
@@ -1220,6 +1437,9 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._compose_identity = f"{identity[:8]}{secrets.token_hex(4)}"
         self._instance_started = False
         self._instance_start_attempted = False
+        # Set by the first instance exec when Apptainer wraps execs in the
+        # fakeroot command; see ``_SHARED_FAKED_SCRIPT``.
+        self._shared_faked = False
         # Set by the fakeroot probe when the host's fakeroot command cannot
         # run in this image; see ``_FAKEROOT_COMMAND_FAILURE_MARKERS``.
         self._ignore_fakeroot_command = False
@@ -2447,16 +2667,35 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         *,
         instance_name: str | None = None,
         default_cwd: str | None = None,
+        shared_faked: bool = True,
     ) -> list[str]:
-        return [
+        """Return an instance exec, under the shared faked when one is used.
+
+        ``shared_faked=False`` is for long-lived helpers that need no fake
+        root, such as the proxy bridge: they must not depend on a faked that
+        an agent command can kill, which would block their next file
+        operation. Setting FAKEROOTKEY still skips Apptainer's own wrapper.
+        """
+        command = [
             self._instance_runtime(),
             "exec",
             "--cleanenv",
             *self._fakeroot_command_options(),
             "--pwd",
             cwd or default_cwd or self._workdir,
-            f"instance://{instance_name or self._instance_name}",
         ]
+        if self._shared_faked:
+            key = "ursa-shared-faked" if shared_faked else "ursa-no-fakeroot"
+            command.extend(["--env", f"FAKEROOTKEY={key}"])
+        command.append(f"instance://{instance_name or self._instance_name}")
+        if self._shared_faked and shared_faked:
+            command.extend([
+                "/bin/sh",
+                "-c",
+                _SHARED_FAKED_SCRIPT,
+                "ursa-shared-faked",
+            ])
+        return command
 
     def _instance_start_command(
         self, network_policy: NetworkPolicy | None = None
@@ -2905,6 +3144,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             raise
         self._instance_started = False
         self._instance_start_attempted = False
+        self._shared_faked = False
         return True
 
     async def _stop_compose(self, *, warn: bool) -> bool:
@@ -2963,6 +3203,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 raise
         self._instance_started = False
         self._instance_start_attempted = False
+        self._shared_faked = False
         return True
 
     async def _stop_prepared_runtime(self, *, warn: bool) -> bool:
@@ -3004,9 +3245,41 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             self._instance_start_attempted = True
             await self._run(*self._instance_start_command(network_policy))
         self._instance_started = True
-        await self._run(*self._instance_exec_prefix(), "true")
+        await self._detect_shared_faked()
+        # Also starts the shared faked before any agent command.
+        if self._shared_faked:
+            await self._run(
+                *self._instance_exec_prefix(),
+                "/bin/sh",
+                "-c",
+                _FAKEROOT_COMMAND_SETUP,
+                "sh",
+                _SUDO_SHIM,
+            )
+        else:
+            await self._run(*self._instance_exec_prefix(), "true")
         if network_policy.network_mode == NetworkMode.ALLOWLIST:
             await self._start_proxy_bridge()
+
+    async def _detect_shared_faked(self) -> None:
+        """Share one faked per instance under Apptainer's fakeroot command.
+
+        Only Apptainer's root-mapped fakeroot, used without /etc/subuid
+        entries, wraps each exec in fakeroot(1); its execs see FAKEROOTKEY.
+        Subuid-mapped fakeroot and SingularityCE keep their own exec path.
+        """
+        self._shared_faked = False
+        if not (
+            self._fakeroot and _runtime_is_apptainer(self._instance_runtime())
+        ):
+            return
+        output = await self._run(
+            *self._instance_exec_prefix(),
+            "/bin/sh",
+            "-c",
+            _FAKEROOT_COMMAND_PROBE,
+        )
+        self._shared_faked = _FAKEROOT_COMMAND_MARKER in output.split()
 
     def _proxy_bind(self) -> str:
         if self._proxy_temp is None:
@@ -3065,7 +3338,7 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         )
         log = self._proxy_stack.enter_context(log_path.open("wb"))
         process = await asyncio.create_subprocess_exec(
-            *self._instance_exec_prefix(cwd="/"),
+            *self._instance_exec_prefix(cwd="/", shared_faked=False),
             "sh",
             "-c",
             command,
@@ -3370,6 +3643,14 @@ class DockerfileSingularityEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             self._workdir,
             f"instance://{self._instance_name}",
         ]
+        if self._shared_faked:
+            # Run the image's shell action under the shared faked, so the
+            # shell sees the ownership agent commands set and what it leaves
+            # running keeps working after it exits.
+            command = [
+                *self._instance_exec_prefix(),
+                "/.singularity.d/actions/shell",
+            ]
         if self._proxy_process is not None:
             process = await asyncio.create_subprocess_exec(
                 *command, env=self._runtime_environment(None)

@@ -142,6 +142,21 @@ created, with the runtime's reason; later trials in the same process then fail
 before building. Disabling fakeroot explicitly logs one warning: commands run
 as the invoking host user, root-owned image files stay read-only, and tasks that
 install system packages fail.
+
+On HPC hosts with an unprivileged (non-setuid) Apptainer and no `/etc/subuid`,
+Apptainer's fakeroot maps the invoking user to root and wraps each exec in the
+`fakeroot(1)` command, whose `faked` daemon exits with that exec; a tmux server
+or background job left behind would then hang on its next file operation. The
+first exec in each instance detects this mode, and later execs share one
+`faked` per instance instead. In this mode only, the start also writes
+`/etc/apt/apt.conf.d/00ursa-fakeroot`, which keeps apt as root
+(`APT::Sandbox::User "root"`, since apt cannot drop to `_apt`) and sets 5
+immediate `Acquire` retries with a 20 s timeout, because apt 2.8 can otherwise
+wait indefinitely on a delayed retry after a transient fetch failure. Where
+the image has `/usr/bin/sudo`, a shim in `/usr/local/sbin` runs a root
+caller's `sudo` command directly, or through `su` for another user, keeping
+the fakeroot environment that sudo would strip; other callers and modes use
+the image's sudo. Subuid-mapped fakeroot and SingularityCE keep the plain exec path.
 Apptainer is preferred when both runtimes are installed. A failed build or task
 command that reports requiring root under Singularity warns that switching to
 Apptainer may help.

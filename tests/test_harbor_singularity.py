@@ -4,6 +4,8 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
+from contextlib import AsyncExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -3087,3 +3089,387 @@ async def test_start_resolves_fakeroot_before_overlay_seed_and_compose(
         ("seed", True),
         ("compose", True),
     ]
+
+
+@pytest.mark.parametrize(
+    ("runtime", "fakeroot", "wrapped", "shared"),
+    [
+        # Root-mapped fakeroot: Apptainer's fakeroot command wraps execs.
+        ("apptainer", True, True, True),
+        # Subuid-mapped fakeroot: no wrapper, so no FAKEROOTKEY.
+        ("apptainer", True, False, False),
+        ("apptainer", False, True, False),
+        ("singularity", True, True, False),
+    ],
+)
+async def test_instance_start_detects_apptainer_fakeroot_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: str,
+    fakeroot: bool,
+    wrapped: bool,
+    shared: bool,
+):
+    environment = _environment(tmp_path, fakeroot=fakeroot)
+    _prepare_started_environment(environment, tmp_path)
+    environment._instance_started = False
+    environment._runtime_path = str(tmp_path / runtime)
+    commands: list[list[str]] = []
+
+    async def run(*command: str, **_kwargs: object) -> str:
+        commands.append(list(command))
+        if command[-1] == harbor_singularity._FAKEROOT_COMMAND_PROBE:
+            # Apptainer's own warnings share the captured output.
+            output = "WARNING: Skipping mount /etc/localtime\n"
+            if wrapped:
+                output += harbor_singularity._FAKEROOT_COMMAND_MARKER + "\n"
+            return output
+        return ""
+
+    monkeypatch.setattr(environment, "_run", run)
+    monkeypatch.setattr(
+        environment, "_instance_start_command", lambda _policy: ["start"]
+    )
+
+    await environment._start_prepared_runtime(
+        NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    )
+
+    instance = f"instance://{environment._instance_name}"
+    probed = [
+        command
+        for command in commands
+        if command[-1] == harbor_singularity._FAKEROOT_COMMAND_PROBE
+    ]
+    assert len(probed) == (runtime == "apptainer" and fakeroot)
+    for command in probed:
+        assert "--env" not in command
+        assert command[command.index(instance) + 1] == "/bin/sh"
+    assert environment._shared_faked is shared
+    # The startup exec that follows starts the shared faked, and under it
+    # sets up apt and the sudo shim.
+    if shared:
+        assert commands[-1][-4:] == [
+            "-c",
+            harbor_singularity._FAKEROOT_COMMAND_SETUP,
+            "sh",
+            harbor_singularity._SUDO_SHIM,
+        ]
+    else:
+        assert commands[-1][-1] == "true"
+    assert ("--env" in commands[-1]) is shared
+
+    # A stop forgets the faked; the next start probes the new instance.
+    monkeypatch.setattr(environment, "_instance_exists", lambda: _await(True))
+    assert await environment._stop_instance(warn=False)
+    assert environment._shared_faked is False
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize("shared", [True, False])
+async def test_exec_shares_one_faked_only_when_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool
+):
+    environment = _environment(tmp_path, fakeroot=True)
+    _prepare_started_environment(environment, tmp_path)
+    environment._runtime_path = str(tmp_path / "apptainer")
+    environment._shared_faked = shared
+    observed: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def spawn(*command: str, **kwargs: object) -> Process:
+        observed["command"] = list(command)
+        return Process()
+
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+
+    await environment.exec("true")
+
+    command = observed["command"]
+    assert isinstance(command, list)
+    instance = command.index(f"instance://{environment._instance_name}")
+    assert command[instance + 1 : instance + 3] == (
+        ["/bin/sh", "-c"] if shared else ["bash", "-c"]
+    )
+    if shared:
+        assert command[instance - 2 : instance] == [
+            "--env",
+            "FAKEROOTKEY=ursa-shared-faked",
+        ]
+        assert command[instance + 3] == harbor_singularity._SHARED_FAKED_SCRIPT
+        assert command[instance + 5 : instance + 7] == ["bash", "-c"]
+    else:
+        assert "--env" not in command
+    environment._cleanup_staging()
+
+
+@pytest.mark.parametrize("shared", [True, False])
+async def test_proxy_bridge_does_not_depend_on_the_shared_faked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool
+):
+    # A bridge under the shared faked would block once an agent kills it.
+    environment = _environment(tmp_path, fakeroot=True)
+    environment._runtime_path = str(tmp_path / "apptainer")
+    environment._shared_faked = shared
+
+    command = environment._instance_exec_prefix(cwd="/", shared_faked=False)
+
+    instance = command.index(f"instance://{environment._instance_name}")
+    assert command[instance + 1 :] == []
+    assert "FAKEROOTKEY=ursa-shared-faked" not in command
+    assert ("FAKEROOTKEY=ursa-no-fakeroot" in command) is shared
+
+    observed: dict[str, list[str]] = {}
+
+    async def spawn(*command: str, **_kwargs: object) -> None:
+        observed["command"] = list(command)
+        raise RuntimeError("stop after spawning the bridge")
+
+    environment._proxy_stack = AsyncExitStack()
+    environment._proxy_temp = tempfile.TemporaryDirectory()
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+    try:
+        with pytest.raises(RuntimeError, match="stop after spawning"):
+            await environment._launch_proxy_bridge()
+    finally:
+        await environment._proxy_stack.aclose()
+        environment._proxy_temp.cleanup()
+
+    assert harbor_singularity._SHARED_FAKED_SCRIPT not in observed["command"]
+    assert "FAKEROOTKEY=ursa-shared-faked" not in observed["command"]
+
+
+@pytest.mark.parametrize("key", ["1151152171", "", None])
+async def test_fakeroot_command_probe_reports_only_a_wrapped_exec(
+    tmp_path: Path, key: str | None
+):
+    env = {"PATH": "/usr/bin:/bin"}
+    if key is not None:
+        env["FAKEROOTKEY"] = key
+    # A record left by the faked of an instance that was restarted.
+    state = tmp_path / "ursa-faked"
+    state.write_text("1151152171:68\n")
+    process = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        "-c",
+        harbor_singularity._FAKEROOT_COMMAND_PROBE.replace(
+            harbor_singularity._SHARED_FAKED_STATE, str(state)
+        ),
+        stdout=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, _ = await process.communicate()
+
+    assert process.returncode == 0
+    assert stdout.decode().split() == (
+        [harbor_singularity._FAKEROOT_COMMAND_MARKER] if key else []
+    )
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("shared", [True, False])
+@pytest.mark.parametrize("proxy", [True, False])
+async def test_attach_shell_uses_the_shared_faked_when_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool, proxy: bool
+):
+    environment = _environment(tmp_path, fakeroot=True)
+    _prepare_started_environment(environment, tmp_path)
+    environment._runtime_path = str(tmp_path / "apptainer")
+    environment._shared_faked = shared
+    if proxy:
+        environment._proxy_process = Mock(returncode=None)
+    observed: list[list[str]] = []
+
+    def execvpe(_file: str, args: list[str], _env: dict[str, str]) -> None:
+        observed.append(list(args))
+
+    class Process:
+        async def wait(self) -> int:
+            return 0
+
+    async def spawn(*command: str, **_kwargs: object) -> Process:
+        observed.append(list(command))
+        return Process()
+
+    monkeypatch.setattr(harbor_singularity.os, "execvpe", execvpe)
+    monkeypatch.setattr(
+        harbor_singularity.asyncio, "create_subprocess_exec", spawn
+    )
+
+    await environment.attach()
+
+    [command] = observed
+    instance = command.index(f"instance://{environment._instance_name}")
+    if shared:
+        assert command == [
+            *environment._instance_exec_prefix(),
+            "/.singularity.d/actions/shell",
+        ]
+    else:
+        assert command[1] == "shell"
+        assert command[instance + 1 :] == []
+    environment._proxy_process = None
+    environment._cleanup_staging()
+
+
+async def test_shared_faked_script_runs_the_command_without_fakeroot():
+    # Outside Apptainer's fakeroot command there is no faked to share: the
+    # script clears the key that stopped Apptainer's wrapper and runs as is.
+    process = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        "-c",
+        harbor_singularity._SHARED_FAKED_SCRIPT,
+        "ursa-shared-faked",
+        "sh",
+        "-c",
+        'echo "${FAKEROOTKEY-unset} ${LD_PRELOAD-unset} $1"',
+        "sh",
+        "argument with spaces",
+        stdout=asyncio.subprocess.PIPE,
+        env={"FAKEROOTKEY": "ursa-shared-faked", "PATH": "/usr/bin:/bin"},
+    )
+    stdout, _ = await process.communicate()
+
+    assert process.returncode == 0
+    assert stdout.decode().strip() == "unset unset argument with spaces"
+
+
+def _sudo_shim_bin(tmp_path: Path) -> dict[str, str]:
+    """Stub the image's sudo, id, getent, and su around the sudo shim."""
+    shim_dir = tmp_path / "sbin"
+    stub_dir = tmp_path / "bin"
+    home = tmp_path / "home" / "bob"
+    for directory in (shim_dir, stub_dir, home):
+        directory.mkdir(parents=True)
+    scripts = {
+        shim_dir / "sudo": harbor_singularity._SUDO_SHIM,
+        stub_dir / "sudo": '#!/bin/sh\necho "image sudo: $*"\n',
+        stub_dir / "id": (
+            "#!/bin/sh\n"
+            'case $1 in -un) [ "$TEST_UID" = 0 ] && echo root || echo bob ;;'
+            ' *) echo "$TEST_UID" ;; esac\n'
+        ),
+        stub_dir / "getent": (
+            "#!/bin/sh\n"
+            "case $2 in root | 0) echo root:x:0:0:root:/root:/bin/sh ;;"
+            f" bob | 1000) echo bob:x:1000:1000::{home}:/bin/sh ;;"
+            " *) exit 2 ;; esac\n"
+        ),
+        # su runs the command as the shim built it and reports the user.
+        stub_dir / "su": (
+            '#!/bin/sh\necho "su $1 $2 $3 $4"\nexec /bin/sh -c "$5"\n'
+        ),
+    }
+    for path, script in scripts.items():
+        path.write_text(script)
+        path.chmod(0o755)
+    return {"PATH": f"{shim_dir}:{stub_dir}:/usr/bin:/bin", "TEST_UID": "0"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "uid", "expected"),
+    [
+        # Root keeps its environment and needs no sudo to stay root.
+        (
+            ["-E", "MODE=kept", "sh", "-c", 'echo "$MODE $SUDO_USER $PRELOAD"'],
+            "0",
+            ["kept root fakeroot"],
+        ),
+        (["-nH", "--", "sh", "-c", 'echo "$HOME"'], "0", ["/root"]),
+        (
+            ["-u", "bob", "printf", "[%s]", "a b", "c'd", "$x"],
+            "0",
+            ["su bob -s /bin/sh -c", "[a b][c'd][$x]"],
+        ),
+        (
+            ["-Eu#1000", "sh", "-c", 'echo "$PRELOAD"'],
+            "0",
+            ["su bob -s /bin/sh -c", "fakeroot"],
+        ),
+        (["--user=bob", "-i", "pwd"], "0", ["su bob -s /bin/sh -c", "{home}"]),
+        # Other modes and non-root callers get the image's sudo.
+        (["-l"], "0", ["image sudo: -l"]),
+        (["-u", "bob", "-V"], "0", ["image sudo: -u bob -V"]),
+        ([], "0", ["image sudo:"]),
+        (["-n", "true"], "1000", ["image sudo: -n true"]),
+    ],
+)
+async def test_sudo_shim_keeps_the_environment_of_root_commands(
+    tmp_path: Path, arguments: list[str], uid: str, expected: list[str]
+):
+    env = {**_sudo_shim_bin(tmp_path), "TEST_UID": uid, "PRELOAD": "fakeroot"}
+    process = await asyncio.create_subprocess_exec(
+        str(tmp_path / "sbin" / "sudo"),
+        *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    stdout, _ = await process.communicate()
+
+    assert process.returncode == 0, stdout.decode()
+    home = str(tmp_path / "home" / "bob")
+    assert [line.rstrip() for line in stdout.decode().splitlines()] == [
+        line.format(home=home) for line in expected
+    ]
+
+
+@pytest.mark.parametrize(
+    ("image_sudo", "other_sudo"),
+    [(True, False), (False, False), (True, True)],
+)
+async def test_fakeroot_command_setup_shadows_only_an_image_sudo(
+    tmp_path: Path, image_sudo: bool, other_sudo: bool
+):
+    root = tmp_path / "root"
+    (root / "etc" / "apt").mkdir(parents=True)
+    (root / "usr" / "bin").mkdir(parents=True)
+    if image_sudo:
+        (root / "usr" / "bin" / "sudo").write_text("#!/bin/sh\n")
+        (root / "usr" / "bin" / "sudo").chmod(0o755)
+    shim = root / harbor_singularity._SUDO_SHIM_PATH.lstrip("/")
+    if other_sudo:
+        shim.parent.mkdir(parents=True)
+        shim.write_text("#!/bin/sh\necho another sudo\n")
+    script = (
+        harbor_singularity._FAKEROOT_COMMAND_SETUP.replace(
+            "/etc/apt", f"{root}/etc/apt"
+        )
+        .replace("/usr/local", f"{root}/usr/local")
+        .replace("/usr/bin/sudo", f"{root}/usr/bin/sudo")
+    )
+    for _ in range(2):  # An instance restart runs it again.
+        process = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", script, "sh", harbor_singularity._SUDO_SHIM
+        )
+        assert await process.wait() == 0
+
+    config = root / harbor_singularity._APT_FAKEROOT_CONFIG.lstrip("/")
+    lines = config.read_text().splitlines()
+    assert 'APT::Sandbox::User "root";' in lines
+    # Immediate retries and timeouts, since apt 2.8 can wait forever on a
+    # delayed retry after a transient fetch failure; no address-family pin.
+    assert 'Acquire::Retries "5";' in lines
+    assert 'Acquire::Retries::Delay "false";' in lines
+    assert 'Acquire::http::Timeout "20";' in lines
+    assert 'Acquire::https::Timeout "20";' in lines
+    assert not any("ForceIPv4" in line for line in lines)
+    stash = root / harbor_singularity._SUDO_SHIM_STASH.lstrip("/")
+    assert stash.read_text() == harbor_singularity._SUDO_SHIM + "\n"
+    if other_sudo:
+        assert shim.read_text() == "#!/bin/sh\necho another sudo\n"
+    elif image_sudo:
+        assert shim.read_text() == stash.read_text()
+        assert shim.stat().st_mode & 0o111
+    else:
+        assert not shim.exists()
+    assert harbor_singularity._SUDO_SHIM_MARKER in stash.read_text()
