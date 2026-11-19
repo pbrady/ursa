@@ -49,9 +49,18 @@ authoring and sharing tasks.
 Harbor models use `<inference-provider>/<model-provider>:<model-name>`, such
 as `ollama/ollama:gemma4:latest`. The inference provider must exist in
 `ursa.yaml`; its `model_provider` allows omitting the model-provider prefix.
-`--model` replaces the configured model, and Harbor
-`[[environment.mcp_servers]]` entries are attached automatically. See the
+`--model` replaces the configured model, and Harbor resolves the endpoint of a
+custom inference provider from `<PROVIDER>_BASE_URL` (for example
+`RESEARCH_BASE_URL` for `research/...`). Harbor
+`[[environment.mcp_servers]]` entries are attached automatically; MCP HTTP
+`headers` are not forwarded, so Harbor rejects tasks that set them. See the
 [MCP task tutorial](https://www.harborframework.com/docs/tutorials/mcp-server-task).
+
+Web tools follow Harbor's decision for each agent phase: they are on only on a
+`public` network and off under `allowlist` and `no-network`. A `use_web` set in
+the URSA config is kept on a `public` network, and the
+`--agent-kwarg disable_web_search=true|false` kwarg replaces the network
+decision, as for Harbor's own agents.
 
 ### Advanced installation
 

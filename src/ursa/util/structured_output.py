@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables.config import ensure_config, merge_configs
 from pydantic import BaseModel, ValidationError
 
 _MISSING = object()
@@ -88,6 +89,13 @@ def invoke_structured(
 
     normalized_methods = tuple(methods) or (None,)
     repair_attempts = _repair_count(repair)
+    if config is not None:
+        # ``with_structured_output`` on the RunnableBinding that wraps URSA's
+        # chat models returns the bound model's runnable, which does not merge
+        # the running graph's config into an explicit one as the binding does.
+        # Merge it here so the run's callbacks, such as the JSONL log that
+        # counts token usage, still see structured calls.
+        config = merge_configs(ensure_config(), config)
     attempts: list[StructuredOutputAttempt] = []
 
     result = _try_methods(

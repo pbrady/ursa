@@ -1,3 +1,5 @@
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, Field
 
 from ursa.util.structured_output import (
@@ -121,3 +123,25 @@ def test_invoke_structured_accepts_integer_repair_attempts():
     assert isinstance(result, ExampleSchema)
     assert result.reason == "second repair worked"
     assert len(llm.calls) == 3
+
+
+def test_invoke_structured_keeps_the_running_callbacks_with_a_config():
+    handler = BaseCallbackHandler()
+    llm = FakeLLM([{"ok": True, "reason": "inside a run"}])
+
+    def node(_input):
+        return invoke_structured(
+            llm,
+            ExampleSchema,
+            "prompt",
+            config={"tags": ["review"], "callbacks": []},
+            context="callback test",
+        )
+
+    RunnableLambda(node).invoke(None, config={"callbacks": [handler]})
+
+    [(_input, kwargs)] = llm.invocations
+    # An explicit config used to replace the run's callbacks, so a run-level
+    # logger never saw the structured call.
+    assert handler in kwargs["config"]["callbacks"].handlers
+    assert "review" in kwargs["config"]["tags"]

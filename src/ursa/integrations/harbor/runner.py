@@ -49,11 +49,17 @@ def _agent_config(
     options = dict(
         config.agent_config.get(key, config.agent_config.get(snake, {}))
     )
-    if use_web is not None and (
-        "use_web" in options
-        or any(
-            "use_web" in inspect.signature(base).parameters
-            for base in agent_class.__mro__
+    # The phase decision turns web tools on only where the agent config leaves
+    # use_web unset or true; it can always turn them off.
+    if (
+        use_web is not None
+        and options.get("use_web", True)
+        and (
+            "use_web" in options
+            or any(
+                "use_web" in inspect.signature(base).parameters
+                for base in agent_class.__mro__
+            )
         )
     ):
         options["use_web"] = use_web
