@@ -6,16 +6,13 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 
-from harbor.models.task.config import (
-    EnvironmentConfig,
-    StepConfig,
-    VerifierEnvironmentMode,
-)
+from harbor.models.task.config import StepConfig, VerifierEnvironmentMode
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import (
-    resolve_effective_verifier_env_config,
+    VerifierEnvironmentDefinition,
     resolve_step_verifier_mode,
     resolve_task_verifier_mode,
+    resolve_verifier_environment_definition,
 )
 from harbor.models.trial.config import AgentConfig, VerifierConfig
 from harbor.models.trial.config import (
@@ -96,17 +93,18 @@ def _task_environments(
     steps: list[StepConfig | None] = list(task.config.steps or [None])
     plans: list[
         tuple[
-            StepConfig | None,
             VerifierEnvironmentMode,
-            EnvironmentConfig | None,
+            VerifierEnvironmentDefinition | None,
             TrialNetworkPlan,
         ]
     ] = []
 
     for step in steps:
         mode = _verifier_mode(task, step)
-        verifier_environment = resolve_effective_verifier_env_config(
-            task.config, step
+        # Use a trial's image precedence: a step or task tests image when one
+        # is declared, otherwise the task environment.
+        verifier_definition = resolve_verifier_environment_definition(
+            task.config, task.paths, step
         )
         plan = resolve_trial_network_plan(
             task.config,
@@ -115,13 +113,15 @@ def _task_environments(
             VerifierConfig(),
             step,
             verifier_mode=mode,
-            env_config=verifier_environment,
+            env_config=(
+                verifier_definition.config if verifier_definition else None
+            ),
         )
-        plans.append((step, mode, verifier_environment, plan))
+        plans.append((mode, verifier_definition, plan))
 
     agent_phases = [
         policy
-        for _, mode, _, plan in plans
+        for mode, _, plan in plans
         for policy in (
             [plan.agent_phase, plan.verifier_phase]
             if mode == VerifierEnvironmentMode.SHARED
@@ -133,7 +133,7 @@ def _task_environments(
             task,
             environment_dir=task.paths.environment_dir,
             task_env_config=task.config.environment,
-            network_policy=plans[0][3].agent_env_baseline,
+            network_policy=plans[0][2].agent_env_baseline,
             phase_network_policies=agent_phases,
             suffix="agent",
             purpose=purpose,
@@ -141,21 +141,17 @@ def _task_environments(
         )
     ]
 
-    def verifier_dir(step: StepConfig | None) -> Path:
-        tests = task.paths.step_tests_dir(step.name) if step else None
-        return tests if tests and tests.exists() else task.paths.tests_dir
-
-    for index, (step, mode, config, plan) in enumerate(plans):
+    for index, (mode, definition, plan) in enumerate(plans):
         if mode == VerifierEnvironmentMode.SEPARATE:
-            if config is None or plan.verifier_env_baseline is None:
+            if definition is None or plan.verifier_env_baseline is None:
                 raise RuntimeError(
                     "Separate verifier environment did not resolve"
                 )
             environments.append(
                 _make_environment(
                     task,
-                    environment_dir=verifier_dir(step),
-                    task_env_config=config,
+                    environment_dir=definition.directory,
+                    task_env_config=definition.config,
                     network_policy=plan.verifier_env_baseline,
                     phase_network_policies=[plan.verifier_phase],
                     suffix=f"verifier-{index}",

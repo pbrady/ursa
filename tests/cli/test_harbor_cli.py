@@ -126,6 +126,25 @@ async def test_prebuild_harbor_task_builds_agent_and_verifier_sifs(
     assert paths == [cache / "environment.sif", cache / "tests.sif"]
 
 
+def test_separate_verifier_without_tests_image_uses_task_environment(
+    tmp_path,
+):
+    task_dir = _task(tmp_path)
+    (task_dir / "tests" / "Dockerfile").unlink()
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\n")
+
+    environments = _task_environments(Task(task_dir), purpose="validate")
+
+    # A Harbor trial falls back to the task environment's image when tests/
+    # declares no image of its own.
+    assert [environment.environment_dir for environment in environments] == [
+        task_dir / "environment",
+        task_dir / "environment",
+    ]
+    verifier = environments[1]
+    assert verifier.network_policy.network_mode == NetworkMode.NO_NETWORK
+
+
 @pytest.mark.parametrize("force", [False, True])
 async def test_prebuild_includes_image_only_agent_and_verifier_services(
     tmp_path, monkeypatch, force
